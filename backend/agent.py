@@ -1,4 +1,9 @@
+"""Agent graph and tool definitions."""
+
+from __future__ import annotations
+
 import asyncio
+from typing import Any
 
 import httpx
 import vercel_ai_sdk as ai
@@ -67,23 +72,22 @@ async def web_fetch(
 
 SYSTEM = """You are a helpful assistant with access to a bash shell and the internet."""
 
-
-async def agent(llm: ai.LanguageModel, query: str) -> ai.StreamResult:
-    return await ai.stream_loop(
-        llm,
-        messages=ai.make_messages(system=SYSTEM, user=query),
-        tools=[bash, web_fetch],
-    )
+TOOLS: list[ai.Tool[..., Any]] = [bash, web_fetch]
 
 
-async def main() -> None:
-    llm = ai.ai_gateway.GatewayModel(model="anthropic/claude-sonnet-4")
-    result = ai.run(agent, llm, "Hello! What tools do you have?")
-    async for msg in result:
-        if msg.text_delta:
-            print(msg.text_delta, end="", flush=True)
-    print()
+def get_llm() -> ai.LanguageModel:
+    """Create the LLM instance."""
+    return ai.ai_gateway.GatewayModel(model="anthropic/claude-opus-4.6")
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+async def graph(
+    llm: ai.LanguageModel,
+    messages: list[ai.Message],
+    tools: list[ai.Tool[..., Any]],
+) -> ai.StreamResult:
+    """Agent graph: stream_loop with no approval gates.
+
+    Tools execute immediately. Loops until the model stops
+    issuing tool calls.
+    """
+    return await ai.stream_loop(llm, messages, tools)

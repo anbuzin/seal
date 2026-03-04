@@ -1,9 +1,7 @@
 [project]
 name = "seal"
 version = "0.1.0"
-description = "Add your description here"
+description = "Personal AI assistant with web UI"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = [
-    "vercel-ai-sdk>=0.0.1.dev5",
-]
+dependencies = []
