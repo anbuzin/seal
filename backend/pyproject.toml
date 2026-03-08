@@ -7,3 +7,21 @@ dependencies = [
     "fastapi[standard]>=0.115.0",
     "vercel-ai-sdk>=0.0.1.dev5",
 ]
+
+[tool.mypy]
+python_version = "3.13"
+strict = true
+plugins = ["pydantic.mypy"]
+
+[tool.pyright]
+pythonVersion = "3.13"
+typeCheckingMode = "standard"
+reportMissingTypeStubs = false
+reportUnusedCallResult = false
+
+[tool.ruff]
+target-version = "py313"
+src = ["src"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
