@@ -25,7 +25,7 @@ jobs:
       - run: uv run ruff check .
       - run: uv run mypy .
 
-      - run: uv run pytest
+      - run: uv run pytest || test $? -eq 5  # allow "no tests collected"
 
   frontend:
     runs-on: ubuntu-latest
@@ -36,6 +36,8 @@ jobs:
       - uses: actions/checkout@v4
 
       - uses: pnpm/action-setup@v4
+        with:
+          package_json_file: frontend/package.json
 
       - uses: actions/setup-node@v4
         with:
