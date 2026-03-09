@@ -8,11 +8,10 @@ import fastapi
 import fastapi.middleware.cors
 import fastapi.responses
 import pydantic
-
-from backend import agent
-
 import vercel_ai_sdk as ai
 import vercel_ai_sdk.ai_sdk_ui
+
+from backend import agent
 
 app = fastapi.FastAPI(
     title="seal",

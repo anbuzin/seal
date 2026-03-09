@@ -25,3 +25,11 @@ src = ["src"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[dependency-groups]
+dev = [
+    "mypy>=1.19.1",
+    "pydantic>=2.12.5",
+    "pytest>=9.0.2",
+    "ruff>=0.15.5",
+]
