@@ -84,7 +84,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", extras = ["standard"], specifier = ">=0.115.0" },
-    { name = "vercel-ai-sdk", specifier = ">=0.0.1.dev5" },
+    { name = "vercel-ai-sdk", specifier = ">=0.0.1.dev7" },
 ]
 
 [package.metadata.requires-dev]
@@ -1391,7 +1391,7 @@ wheels = [
 
 [[package]]
 name = "vercel-ai-sdk"
-version = "0.0.1.dev6"
+version = "0.0.1.dev7"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anthropic" },
@@ -1402,9 +1402,9 @@ dependencies = [
     { name = "pydantic" },
     { name = "vercel" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/46/f0/59065bbab28120eb0b70178b109d376f10d1856042596797b67b6654db55/vercel_ai_sdk-0.0.1.dev6.tar.gz", hash = "sha256:eccad1be7951bf6d8d7f4185067bd58808c0ba309716f8d20d7453b34acac923", size = 45182, upload-time = "2026-03-03T23:07:10.779Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/c5/a1/be41da0fd252d286ff0ddc32e77ed369820c4c55b975529c5ceb9f85e571/vercel_ai_sdk-0.0.1.dev7.tar.gz", hash = "sha256:f32753e0cd87689db30b376c3a026cc4f66e62bf308869f39a60e08a8933e605", size = 62772, upload-time = "2026-03-13T18:16:54.293Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/16/f2/209a696c65193af5ed1676d4f2228a2ab6ea978cc2bfb61d0db33ea33f7f/vercel_ai_sdk-0.0.1.dev6-py3-none-any.whl", hash = "sha256:35acc2edf6942fc2fd905143d32f5763246d592374d5da67bc6ae6545d49f009", size = 59425, upload-time = "2026-03-03T23:04:00.424Z" },
+    { url = "https://files.pythonhosted.org/packages/4e/26/67396f292ae4aa11543e4ca446e48f2407225ca632bcc0fb12222ee9ad79/vercel_ai_sdk-0.0.1.dev7-py3-none-any.whl", hash = "sha256:6df3eba80cb2bde7f84f775c35605cf13eb17465c51eef231f4cf9efd3d2181a", size = 79806, upload-time = "2026-03-13T18:16:55.439Z" },
 ]
 
 [[package]]
