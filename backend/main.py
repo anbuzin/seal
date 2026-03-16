@@ -173,9 +173,11 @@ async def chat(request: ChatRequest) -> fastapi.responses.StreamingResponse:
     logger.info(f"[v0] Request: {request.model_dump_json()[:500]}")
     
     messages = ai.ai_sdk_ui.to_messages(request.messages)
+    logger.info(f"[v0] Converted messages: {len(messages)}")
 
     # Inline any proxy-URL file parts so the LLM receives base64 data.
     messages = await _inline_file_parts(messages)
+    logger.info("[v0] Inlined file parts")
 
     # Prepend the system prompt
     system = ai.Message(
@@ -183,8 +185,10 @@ async def chat(request: ChatRequest) -> fastapi.responses.StreamingResponse:
         parts=[ai.TextPart(text=agent.SYSTEM)],
     )
     all_messages = [system, *messages]
+    logger.info(f"[v0] Total messages with system: {len(all_messages)}")
 
     llm = agent.get_llm()
+    logger.info(f"[v0] Got LLM: {llm}")
 
     result = ai.run(
         agent.graph,
@@ -192,10 +196,20 @@ async def chat(request: ChatRequest) -> fastapi.responses.StreamingResponse:
         all_messages,
         agent.TOOLS,
     )
+    logger.info("[v0] ai.run started, beginning stream")
 
     async def stream_response() -> AsyncGenerator[str]:
-        async for chunk in ai.ai_sdk_ui.to_sse_stream(result):
-            yield chunk
+        try:
+            chunk_count = 0
+            async for chunk in ai.ai_sdk_ui.to_sse_stream(result):
+                chunk_count += 1
+                if chunk_count <= 3:
+                    logger.info(f"[v0] Stream chunk {chunk_count}: {chunk[:100]}")
+                yield chunk
+            logger.info(f"[v0] Stream complete, total chunks: {chunk_count}")
+        except Exception as e:
+            logger.error(f"[v0] Stream error: {type(e).__name__}: {e}")
+            raise
 
     return fastapi.responses.StreamingResponse(
         stream_response(),
