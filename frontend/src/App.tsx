@@ -97,18 +97,28 @@ function InputAttachments() {
 // ---------------------------------------------------------------------------
 
 export default function App() {
-  const { messages, sendMessage, status, stop } = useChat({
+  const { messages, sendMessage, status, stop, error } = useChat({
     transport: new DefaultChatTransport({
       api: "/api/chat",
     }),
+    onError: (err) => {
+      console.log("[v0] useChat onError:", err);
+    },
   });
+
+  // Debug: log status and error changes
+  console.log("[v0] Chat status:", status, "error:", error, "messages:", messages.length);
 
   const isLoading = status === "submitted" || status === "streaming";
   const [isUploading, setIsUploading] = useState(false);
 
   const handleSubmit = useCallback(
     async ({ text, files }: { text: string; files: FileUIPart[] }) => {
-      if (!text.trim() && files.length === 0) return;
+      console.log("[v0] handleSubmit called with:", { text, filesCount: files.length });
+      if (!text.trim() && files.length === 0) {
+        console.log("[v0] handleSubmit: empty input, returning early");
+        return;
+      }
 
       // Upload files to Vercel Blob, replacing data URLs with permanent URLs
       let uploaded: FileUIPart[] = [];
@@ -121,10 +131,12 @@ export default function App() {
         }
       }
 
+      console.log("[v0] Calling sendMessage with:", { text, uploadedFiles: uploaded.length });
       sendMessage({
         text,
         ...(uploaded.length > 0 ? { files: uploaded } : {}),
       });
+      console.log("[v0] sendMessage called");
     },
     [sendMessage],
   );
