@@ -5,6 +5,7 @@ description = "Seal – personal AI assistant backend"
 requires-python = ">=3.13"
 dependencies = [
     "fastapi[standard]>=0.115.0",
+    "vercel>=0.5.1",
     "vercel-ai-sdk>=0.0.1.dev7",
 ]
 
@@ -21,7 +22,7 @@ reportUnusedCallResult = false
 
 [tool.ruff]
 target-version = "py313"
-src = ["src"]
+src = ["."]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
@@ -30,6 +31,7 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 dev = [
     "mypy>=1.19.1",
     "pydantic>=2.12.5",
+    "pyright>=1.1.400",
     "pytest>=9.0.2",
     "ruff>=0.15.5",
 ]
