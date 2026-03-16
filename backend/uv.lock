@@ -70,6 +70,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "fastapi", extra = ["standard"] },
+    { name = "vercel" },
     { name = "vercel-ai-sdk" },
 ]
 
@@ -84,6 +85,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", extras = ["standard"], specifier = ">=0.115.0" },
+    { name = "vercel", specifier = ">=0.5.1" },
     { name = "vercel-ai-sdk", specifier = ">=0.0.1.dev7" },
 ]
 
