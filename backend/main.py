@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import logging
 from collections.abc import AsyncGenerator
 
 import fastapi
@@ -15,6 +16,10 @@ from vercel.blob import AsyncBlobClient
 
 import agent
 
+# Configure logging
+logging.basicConfig(level=logging.DEBUG)
+logger = logging.getLogger(__name__)
+
 # Prefix used by proxy URLs returned from the upload endpoint.
 # Includes /api so the browser can fetch directly (Vercel routes /api/* to
 # the backend and strips the prefix before forwarding).
@@ -24,6 +29,11 @@ app = fastapi.FastAPI(
     title="seal",
     description="Seal – personal AI assistant",
 )
+
+@app.on_event("startup")
+async def startup_event():
+    logger.info("[v0] FastAPI backend starting up...")
+    logger.info("[v0] Available endpoints: /health, /upload, /files/{pathname}, /chat")
 
 app.add_middleware(
     fastapi.middleware.cors.CORSMiddleware,
@@ -37,6 +47,7 @@ app.add_middleware(
 @app.get("/health")
 async def health() -> dict[str, str]:
     """Health check endpoint."""
+    logger.info("[v0] Health check called")
     return {"status": "ok"}
 
 
@@ -157,6 +168,10 @@ async def _inline_file_parts(
 @app.post("/chat")
 async def chat(request: ChatRequest) -> fastapi.responses.StreamingResponse:
     """Handle chat requests and stream responses."""
+    logger.info("[v0] Chat endpoint called")
+    logger.info(f"[v0] Request messages count: {len(request.messages)}")
+    logger.info(f"[v0] Request: {request.model_dump_json()[:500]}")
+    
     messages = ai.ai_sdk_ui.to_messages(request.messages)
 
     # Inline any proxy-URL file parts so the LLM receives base64 data.
