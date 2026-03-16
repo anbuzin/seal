@@ -108,6 +108,7 @@ export default function App() {
 
   const handleSubmit = useCallback(
     async ({ text, files }: { text: string; files: FileUIPart[] }) => {
+      console.log("[v0] handleSubmit called with:", { text, filesCount: files.length });
       if (!text.trim() && files.length === 0) return;
 
       // Upload files to Vercel Blob, replacing data URLs with permanent URLs
@@ -121,10 +122,12 @@ export default function App() {
         }
       }
 
+      console.log("[v0] Calling sendMessage with:", { text, uploadedCount: uploaded.length });
       sendMessage({
         text,
         ...(uploaded.length > 0 ? { files: uploaded } : {}),
       });
+      console.log("[v0] sendMessage called");
     },
     [sendMessage],
   );
