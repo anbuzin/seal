@@ -79,10 +79,11 @@ function InputAttachments() {
         {attachments.files.map((file) => (
           <Attachment
             key={file.id}
+            className="h-14 gap-2 px-2"
             data={file}
             onRemove={() => attachments.remove(file.id)}
           >
-            <AttachmentPreview />
+            <AttachmentPreview className="size-10" />
             <AttachmentRemove />
           </Attachment>
         ))}

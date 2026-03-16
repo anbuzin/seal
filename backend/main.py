@@ -13,11 +13,12 @@ import vercel_ai_sdk as ai
 import vercel_ai_sdk.ai_sdk_ui
 from vercel.blob import AsyncBlobClient
 
-from backend import agent
+import agent
 
 # Prefix used by proxy URLs returned from the upload endpoint.
-# These are relative to the backend service (no /api prefix).
-FILES_PREFIX = "/files/"
+# Includes /api so the browser can fetch directly (Vercel routes /api/* to
+# the backend and strips the prefix before forwarding).
+FILES_PREFIX = "/api/files/"
 
 app = fastapi.FastAPI(
     title="seal",
@@ -48,10 +49,8 @@ class UploadResponse(pydantic.BaseModel):
     """Response from the file upload endpoint."""
 
     url: str
-    media_type: str = pydantic.Field(alias="mediaType")
+    media_type: str = pydantic.Field(serialization_alias="mediaType")
     filename: str
-
-    model_config = pydantic.ConfigDict(populate_by_name=True)
 
 
 @app.post("/upload")
@@ -74,7 +73,7 @@ async def upload(file: fastapi.UploadFile) -> UploadResponse:
     # keeping the blob private.
     return UploadResponse(
         url=f"{FILES_PREFIX}{result.pathname}",
-        mediaType=media_type,
+        media_type=media_type,
         filename=filename,
     )
 
@@ -108,9 +107,11 @@ class ChatRequest(pydantic.BaseModel):
     session_id: str | None = None
 
 
-def _is_proxy_url(url: str) -> bool:
-    """Check if a URL is one of our file proxy URLs."""
-    return url.startswith(FILES_PREFIX) or url.startswith(f"/api{FILES_PREFIX}")
+def _extract_blob_pathname(url: str) -> str | None:
+    """Extract the blob pathname from a proxy URL, or return None."""
+    if url.startswith(FILES_PREFIX):
+        return url[len(FILES_PREFIX) :]
+    return None
 
 
 async def _inline_file_parts(
@@ -119,25 +120,19 @@ async def _inline_file_parts(
     """Replace proxy-URL file parts with inline base64 data URLs.
 
     The AI Gateway requires file content as data URLs (not raw HTTP URLs).
-    Our proxy URLs (``/files/...``) aren't even reachable from the gateway,
+    Our proxy URLs (``/api/files/...``) aren't reachable from the gateway,
     so we fetch the blob content here and inline it before sending.
     """
     result: list[ai.Message] = []
     for msg in messages:
         new_parts: list[ai.core.messages.Part] = []
         for part in msg.parts:
-            if (
-                isinstance(part, ai.FilePart)
-                and isinstance(part.data, str)
-                and _is_proxy_url(part.data)
-            ):
-                # Strip the /api prefix if present (Vercel strips it for
-                # the backend, but the frontend sends it).
-                pathname = part.data
-                if pathname.startswith(f"/api{FILES_PREFIX}"):
-                    pathname = pathname[len("/api") :]
-                pathname = pathname[len(FILES_PREFIX) :]
-
+            pathname = (
+                _extract_blob_pathname(part.data)
+                if isinstance(part, ai.FilePart) and isinstance(part.data, str)
+                else None
+            )
+            if isinstance(part, ai.FilePart) and pathname is not None:
                 async with AsyncBlobClient() as client:
                     blob = await client.get(pathname, access="private")
 

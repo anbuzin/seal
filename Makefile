@@ -1,5 +1,5 @@
 .PHONY: ci ci-backend ci-frontend \
-       backend-sync backend-format backend-lint backend-typecheck backend-test \
+       backend-sync backend-format backend-lint backend-typecheck backend-pyright backend-test \
        frontend-install frontend-format frontend-lint frontend-typecheck frontend-build
 
 # Run all CI checks
@@ -7,7 +7,7 @@ ci: ci-backend ci-frontend
 
 # --- Backend --------------------------------------------------------------- #
 
-ci-backend: backend-sync backend-format backend-lint backend-typecheck backend-test
+ci-backend: backend-sync backend-format backend-lint backend-typecheck backend-pyright backend-test
 
 backend-sync:
 	cd backend && uv sync
@@ -20,6 +20,9 @@ backend-lint:
 
 backend-typecheck:
 	cd backend && uv run mypy .
+
+backend-pyright:
+	cd backend && uv run pyright .
 
 backend-test:
 	cd backend && uv run pytest || test $$? -eq 5
