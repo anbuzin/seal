@@ -75,9 +75,29 @@ SYSTEM = """You are a helpful assistant with access to a bash shell and the inte
 TOOLS: list[ai.Tool[..., Any]] = [bash, web_fetch]
 
 
+_TITLE_PROMPT = (
+    "Generate a concise 3-6 word title for a conversation that starts with "
+    "the following message. Reply with ONLY the title, no quotes or punctuation."
+)
+
+
 def get_llm() -> ai.LanguageModel:
     """Create the LLM instance."""
     return ai.ai_gateway.GatewayModel(model="anthropic/claude-opus-4.6")
+
+
+def _get_fast_llm() -> ai.LanguageModel:
+    """Cheap / fast model for lightweight tasks like title generation."""
+    return ai.ai_gateway.GatewayModel(model="anthropic/claude-sonnet-4-20250514")
+
+
+async def generate_title(first_message: str) -> str:
+    """Generate a short title for a session using a cheap LLM call."""
+    llm = _get_fast_llm()
+    msg = await llm.buffer(
+        messages=ai.make_messages(system=_TITLE_PROMPT, user=first_message),
+    )
+    return msg.text.strip()
 
 
 async def graph(
