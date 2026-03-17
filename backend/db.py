@@ -13,7 +13,7 @@ import os
 import pathlib
 from typing import Any
 
-import asyncpg
+import asyncpg  # type: ignore[import-untyped]
 import pydantic
 
 # ---------------------------------------------------------------------------
@@ -124,7 +124,7 @@ async def create_session(session_id: str, title: str | None = None) -> Session:
         session_id,
         title,
     )
-    return _row_to_session(row)  # type: ignore[arg-type]
+    return _row_to_session(row)
 
 
 async def list_sessions() -> list[Session]:
@@ -162,7 +162,7 @@ async def delete_session(session_id: str) -> bool:
     """Delete a session (messages + checkpoint cascade). Return True if found."""
     pool = await get_pool()
     result = await pool.execute("DELETE FROM sessions WHERE id = $1", session_id)
-    return result == "DELETE 1"
+    return bool(result == "DELETE 1")
 
 
 async def touch_session(session_id: str) -> None:

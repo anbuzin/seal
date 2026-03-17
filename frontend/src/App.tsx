@@ -40,7 +40,11 @@ import {
   ToolOutput,
 } from "@/components/ai-elements/tool";
 import { SessionSidebar } from "@/components/session-sidebar";
-import { SidebarInset, SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
+import {
+  SidebarInset,
+  SidebarProvider,
+  SidebarTrigger,
+} from "@/components/ui/sidebar";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useSessionManager } from "@/hooks/use-session-manager";
 
@@ -168,8 +172,7 @@ function ChatView({
                       part.type.startsWith("tool-")
                     ) {
                       const toolPart = part as ToolUIPart;
-                      const isComplete =
-                        toolPart.state === "output-available";
+                      const isComplete = toolPart.state === "output-available";
 
                       return (
                         <Tool

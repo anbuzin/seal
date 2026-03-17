@@ -52,7 +52,9 @@ export function useSessionManager() {
   const qc = useQueryClient();
 
   // ---- Current session ID ------------------------------------------------
-  const [sessionId, setSessionId] = useState<string | null>(readStoredSessionId);
+  const [sessionId, setSessionId] = useState<string | null>(
+    readStoredSessionId,
+  );
 
   // ---- Messages for the active session -----------------------------------
   const [initialMessages, setInitialMessages] = useState<UIMessage[]>([]);
