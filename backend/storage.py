@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import json
 import pathlib
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable, TYPE_CHECKING
 
-import db
+if TYPE_CHECKING:
+    import db
 
 
 @runtime_checkable
@@ -69,13 +70,18 @@ class NeonStorage:
     Uses asyncpg with parameterized queries for security and performance.
     """
 
+    async def _get_pool(self):
+        """Lazily import db module and get pool."""
+        import db
+        return await db.get_pool()
+
     # -------------------------------------------------------------------------
     # User Management
     # -------------------------------------------------------------------------
 
     async def get_user(self, user_id: str) -> dict[str, Any] | None:
         """Get a user by ID."""
-        pool = await db.get_pool()
+        pool = await self._get_pool()
         row = await pool.fetchrow(
             "SELECT id, external_id, display_name, created_at, updated_at FROM users WHERE id = $1",
             user_id,
@@ -84,7 +90,7 @@ class NeonStorage:
 
     async def create_user(self, user_id: str | None = None, display_name: str | None = None) -> dict[str, Any]:
         """Create a new user. If user_id is provided, use it; otherwise generate."""
-        pool = await db.get_pool()
+        pool = await self._get_pool()
         if user_id:
             row = await pool.fetchrow(
                 """INSERT INTO users (id, display_name) VALUES ($1, $2) 
@@ -114,7 +120,7 @@ class NeonStorage:
 
     async def get_sessions(self, user_id: str) -> list[dict[str, Any]]:
         """Get all sessions for a user, ordered by most recent first."""
-        pool = await db.get_pool()
+        pool = await self._get_pool()
         rows = await pool.fetch(
             """SELECT id, user_id, title, created_at, updated_at 
                FROM sessions WHERE user_id = $1 
@@ -125,7 +131,7 @@ class NeonStorage:
 
     async def create_session(self, user_id: str, title: str | None = None) -> dict[str, Any]:
         """Create a new session for a user."""
-        pool = await db.get_pool()
+        pool = await self._get_pool()
         row = await pool.fetchrow(
             """INSERT INTO sessions (user_id, title) VALUES ($1, $2) 
                RETURNING id, user_id, title, created_at, updated_at""",
@@ -136,7 +142,7 @@ class NeonStorage:
 
     async def get_session(self, session_id: str) -> dict[str, Any] | None:
         """Get a session by ID."""
-        pool = await db.get_pool()
+        pool = await self._get_pool()
         row = await pool.fetchrow(
             "SELECT id, user_id, title, created_at, updated_at FROM sessions WHERE id = $1",
             session_id,
@@ -145,7 +151,7 @@ class NeonStorage:
 
     async def update_session(self, session_id: str, title: str | None = None) -> dict[str, Any] | None:
         """Update a session's title and updated_at timestamp."""
-        pool = await db.get_pool()
+        pool = await self._get_pool()
         row = await pool.fetchrow(
             """UPDATE sessions SET title = COALESCE($2, title), updated_at = now() 
                WHERE id = $1 
@@ -157,12 +163,12 @@ class NeonStorage:
 
     async def delete_session(self, session_id: str) -> None:
         """Delete a session and all its messages/checkpoints (CASCADE)."""
-        pool = await db.get_pool()
+        pool = await self._get_pool()
         await pool.execute("DELETE FROM sessions WHERE id = $1", session_id)
 
     async def touch_session(self, session_id: str) -> None:
         """Update the session's updated_at timestamp."""
-        pool = await db.get_pool()
+        pool = await self._get_pool()
         await pool.execute(
             "UPDATE sessions SET updated_at = now() WHERE id = $1",
             session_id,
@@ -174,7 +180,7 @@ class NeonStorage:
 
     async def get_messages(self, session_id: str) -> list[dict[str, Any]]:
         """Get all messages in a session, ordered by creation time."""
-        pool = await db.get_pool()
+        pool = await self._get_pool()
         rows = await pool.fetch(
             """SELECT id, session_id, role, content, created_at 
                FROM messages WHERE session_id = $1 
@@ -187,7 +193,7 @@ class NeonStorage:
         self, session_id: str, role: str, content: dict[str, Any]
     ) -> dict[str, Any]:
         """Add a message to a session."""
-        pool = await db.get_pool()
+        pool = await self._get_pool()
         row = await pool.fetchrow(
             """INSERT INTO messages (session_id, role, content) VALUES ($1, $2, $3) 
                RETURNING id, session_id, role, content, created_at""",
@@ -205,7 +211,7 @@ class NeonStorage:
         self, session_id: str, messages: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
         """Add multiple messages to a session in a single transaction."""
-        pool = await db.get_pool()
+        pool = await self._get_pool()
         results = []
         async with pool.acquire() as conn:
             async with conn.transaction():
@@ -229,7 +235,7 @@ class NeonStorage:
 
     async def get_checkpoint(self, session_id: str) -> dict[str, Any] | None:
         """Get the latest checkpoint for a session."""
-        pool = await db.get_pool()
+        pool = await self._get_pool()
         row = await pool.fetchrow(
             """SELECT id, session_id, checkpoint_data, created_at 
                FROM checkpoints WHERE session_id = $1 
@@ -245,7 +251,7 @@ class NeonStorage:
 
     async def save_checkpoint(self, session_id: str, data: dict[str, Any]) -> dict[str, Any]:
         """Save a checkpoint for a session (creates new, keeps history)."""
-        pool = await db.get_pool()
+        pool = await self._get_pool()
         row = await pool.fetchrow(
             """INSERT INTO checkpoints (session_id, checkpoint_data) VALUES ($1, $2) 
                RETURNING id, session_id, checkpoint_data, created_at""",
@@ -259,7 +265,7 @@ class NeonStorage:
 
     async def delete_checkpoints(self, session_id: str) -> None:
         """Delete all checkpoints for a session."""
-        pool = await db.get_pool()
+        pool = await self._get_pool()
         await pool.execute("DELETE FROM checkpoints WHERE session_id = $1", session_id)
 
     # -------------------------------------------------------------------------
