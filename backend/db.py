@@ -10,17 +10,44 @@ from __future__ import annotations
 
 import json
 import os
-import pathlib
 from typing import Any
 
 import asyncpg  # type: ignore[import-untyped]
 import pydantic
 
 # ---------------------------------------------------------------------------
-# Models
+# Schema (inlined so the backend has no runtime dependency on repo layout)
 # ---------------------------------------------------------------------------
 
-_REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+_SCHEMA = """\
+CREATE TABLE IF NOT EXISTS sessions (
+    id          TEXT PRIMARY KEY,
+    title       TEXT,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS messages (
+    id          TEXT PRIMARY KEY,
+    session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    role        TEXT NOT NULL,
+    parts       JSONB NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_messages_session
+    ON messages(session_id, created_at);
+
+CREATE TABLE IF NOT EXISTS checkpoints (
+    session_id  TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
+    data        JSONB NOT NULL,
+    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"""
+
+# ---------------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------------
 
 
 class Session(pydantic.BaseModel):
@@ -48,11 +75,6 @@ class StoredMessage(pydantic.BaseModel):
 _pool: asyncpg.Pool | None = None
 
 
-def _read_schema() -> str:
-    """Read the canonical schema from scripts/001_create_tables.sql."""
-    return (_REPO_ROOT / "scripts" / "001_create_tables.sql").read_text()
-
-
 async def get_pool() -> asyncpg.Pool:
     """Return the shared pool, creating it on first call."""
     global _pool
@@ -64,7 +86,7 @@ async def get_pool() -> asyncpg.Pool:
 async def ensure_schema() -> None:
     """Run ``CREATE TABLE IF NOT EXISTS`` for every table."""
     pool = await get_pool()
-    await pool.execute(_read_schema())
+    await pool.execute(_SCHEMA)
 
 
 async def close_pool() -> None:
