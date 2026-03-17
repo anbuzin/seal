@@ -86,9 +86,14 @@ def get_llm() -> ai.LanguageModel:
     return ai.ai_gateway.GatewayModel(model="anthropic/claude-opus-4.6")
 
 
+def _get_fast_llm() -> ai.LanguageModel:
+    """Cheap / fast model for lightweight tasks like title generation."""
+    return ai.ai_gateway.GatewayModel(model="anthropic/claude-sonnet-4-20250514")
+
+
 async def generate_title(first_message: str) -> str:
     """Generate a short title for a session using a cheap LLM call."""
-    llm = get_llm()
+    llm = _get_fast_llm()
     msg = await llm.buffer(
         messages=ai.make_messages(system=_TITLE_PROMPT, user=first_message),
     )

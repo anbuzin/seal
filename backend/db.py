@@ -10,9 +10,36 @@ from __future__ import annotations
 
 import json
 import os
+import pathlib
 from typing import Any
 
 import asyncpg
+import pydantic
+
+# ---------------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------------
+
+_REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+
+class Session(pydantic.BaseModel):
+    """Serialisable session record."""
+
+    id: str
+    title: str | None = None
+    created_at: str
+    updated_at: str
+
+
+class StoredMessage(pydantic.BaseModel):
+    """A message as stored in the DB (parts already parsed)."""
+
+    id: str
+    role: str
+    parts: list[dict[str, Any]]
+    created_at: str
+
 
 # ---------------------------------------------------------------------------
 # Connection pool
@@ -20,31 +47,10 @@ import asyncpg
 
 _pool: asyncpg.Pool | None = None
 
-_SCHEMA = """\
-CREATE TABLE IF NOT EXISTS sessions (
-    id          TEXT PRIMARY KEY,
-    title       TEXT,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-);
 
-CREATE TABLE IF NOT EXISTS messages (
-    id          TEXT PRIMARY KEY,
-    session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-    role        TEXT NOT NULL,
-    parts       JSONB NOT NULL,
-    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-
-CREATE INDEX IF NOT EXISTS idx_messages_session
-    ON messages(session_id, created_at);
-
-CREATE TABLE IF NOT EXISTS checkpoints (
-    session_id  TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
-    data        JSONB NOT NULL,
-    updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-);
-"""
+def _read_schema() -> str:
+    """Read the canonical schema from scripts/001_create_tables.sql."""
+    return (_REPO_ROOT / "scripts" / "001_create_tables.sql").read_text()
 
 
 async def get_pool() -> asyncpg.Pool:
@@ -58,7 +64,7 @@ async def get_pool() -> asyncpg.Pool:
 async def ensure_schema() -> None:
     """Run ``CREATE TABLE IF NOT EXISTS`` for every table."""
     pool = await get_pool()
-    await pool.execute(_SCHEMA)
+    await pool.execute(_read_schema())
 
 
 async def close_pool() -> None:
@@ -70,59 +76,86 @@ async def close_pool() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Sessions
+# Internal helpers
 # ---------------------------------------------------------------------------
 
 
-async def create_session(session_id: str, title: str | None = None) -> dict[str, Any]:
+def _row_to_session(row: asyncpg.Record) -> Session:
+    """Convert an asyncpg row to a Session model."""
+    return Session(
+        id=row["id"],
+        title=row["title"],
+        created_at=row["created_at"].isoformat(),
+        updated_at=row["updated_at"].isoformat(),
+    )
+
+
+def _parse_jsonb(val: Any) -> Any:
+    """Ensure a JSONB value is a Python object, not a raw JSON string."""
+    if isinstance(val, str):
+        return json.loads(val)
+    return val
+
+
+def _row_to_message(row: asyncpg.Record) -> StoredMessage:
+    """Convert an asyncpg row to a StoredMessage model."""
+    return StoredMessage(
+        id=row["id"],
+        role=row["role"],
+        parts=_parse_jsonb(row["parts"]),
+        created_at=row["created_at"].isoformat(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Sessions
+# ---------------------------------------------------------------------------
+
+_SESSION_COLS = "id, title, created_at, updated_at"
+
+
+async def create_session(session_id: str, title: str | None = None) -> Session:
     """Insert a new session and return it.  No-ops if the ID exists."""
     pool = await get_pool()
     row = await pool.fetchrow(
-        "INSERT INTO sessions (id, title) VALUES ($1, $2) "
-        "ON CONFLICT (id) DO NOTHING "
-        "RETURNING id, title, created_at, updated_at",
+        f"INSERT INTO sessions (id, title) VALUES ($1, $2) "
+        f"ON CONFLICT (id) DO UPDATE SET id = EXCLUDED.id "
+        f"RETURNING {_SESSION_COLS}",
         session_id,
         title,
     )
-    if row is None:
-        # Already existed -- just fetch it.
-        row = await pool.fetchrow(
-            "SELECT id, title, created_at, updated_at FROM sessions WHERE id = $1",
-            session_id,
-        )
-    return dict(row)  # type: ignore[arg-type]
+    return _row_to_session(row)  # type: ignore[arg-type]
 
 
-async def list_sessions() -> list[dict[str, Any]]:
+async def list_sessions() -> list[Session]:
     """Return all sessions ordered by most-recently-updated first."""
     pool = await get_pool()
     rows = await pool.fetch(
-        "SELECT id, title, created_at, updated_at "
-        "FROM sessions ORDER BY updated_at DESC",
+        f"SELECT {_SESSION_COLS} FROM sessions ORDER BY updated_at DESC",
     )
-    return [dict(r) for r in rows]
+    return [_row_to_session(r) for r in rows]
 
 
-async def get_session(session_id: str) -> dict[str, Any] | None:
+async def get_session(session_id: str) -> Session | None:
     """Return a single session or ``None``."""
     pool = await get_pool()
     row = await pool.fetchrow(
-        "SELECT id, title, created_at, updated_at FROM sessions WHERE id = $1",
+        f"SELECT {_SESSION_COLS} FROM sessions WHERE id = $1",
         session_id,
     )
-    return dict(row) if row else None
+    return _row_to_session(row) if row else None
 
 
-async def update_session_title(session_id: str, title: str) -> dict[str, Any] | None:
+async def update_session_title(session_id: str, title: str) -> Session | None:
     """Set the title (and bump ``updated_at``)."""
     pool = await get_pool()
     row = await pool.fetchrow(
-        "UPDATE sessions SET title = $2, updated_at = now() WHERE id = $1 "
-        "RETURNING id, title, created_at, updated_at",
+        f"UPDATE sessions SET title = $2, updated_at = now() WHERE id = $1 "
+        f"RETURNING {_SESSION_COLS}",
         session_id,
         title,
     )
-    return dict(row) if row else None
+    return _row_to_session(row) if row else None
 
 
 async def delete_session(session_id: str) -> bool:
@@ -145,27 +178,15 @@ async def touch_session(session_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _parse_jsonb(val: Any) -> Any:
-    """Ensure a JSONB value is a Python object, not a raw JSON string."""
-    if isinstance(val, str):
-        return json.loads(val)
-    return val
-
-
-async def get_messages(session_id: str) -> list[dict[str, Any]]:
+async def get_messages(session_id: str) -> list[StoredMessage]:
     """Return all messages for a session in chronological order."""
     pool = await get_pool()
     rows = await pool.fetch(
-        "SELECT id, session_id, role, parts, created_at "
+        "SELECT id, role, parts, created_at "
         "FROM messages WHERE session_id = $1 ORDER BY created_at",
         session_id,
     )
-    result = []
-    for r in rows:
-        d = dict(r)
-        d["parts"] = _parse_jsonb(d["parts"])
-        result.append(d)
-    return result
+    return [_row_to_message(r) for r in rows]
 
 
 async def save_message(
@@ -174,7 +195,7 @@ async def save_message(
     role: str,
     parts: list[dict[str, Any]],
 ) -> None:
-    """Insert or update a message (upsert on id)."""
+    """Insert or update a single message (upsert on id)."""
     pool = await get_pool()
     await pool.execute(
         "INSERT INTO messages (id, session_id, role, parts) "
@@ -185,6 +206,41 @@ async def save_message(
         role,
         json.dumps(parts),
     )
+
+
+async def save_messages_batch(
+    messages: list[tuple[str, str, str, list[dict[str, Any]]]],
+) -> None:
+    """Batch-upsert messages.  Each tuple is (id, session_id, role, parts).
+
+    Duplicates by message ID are deduplicated (last occurrence wins)
+    because PostgreSQL's ON CONFLICT DO UPDATE cannot touch the same
+    row twice in a single statement.
+    """
+    if not messages:
+        return
+    # Deduplicate: keep last occurrence per message ID.
+    seen: dict[str, tuple[str, str, str, list[dict[str, Any]]]] = {}
+    for row in messages:
+        seen[row[0]] = row
+    deduped = list(seen.values())
+
+    pool = await get_pool()
+    # Build a single VALUES clause for all messages.
+    args: list[Any] = []
+    placeholders: list[str] = []
+    for i, (mid, sid, role, parts) in enumerate(deduped):
+        base = i * 4
+        placeholders.append(
+            f"(${base + 1}, ${base + 2}, ${base + 3}, ${base + 4}::jsonb)"
+        )
+        args.extend([mid, sid, role, json.dumps(parts)])
+    sql = (
+        "INSERT INTO messages (id, session_id, role, parts) VALUES "
+        + ", ".join(placeholders)
+        + " ON CONFLICT (id) DO UPDATE SET parts = EXCLUDED.parts"
+    )
+    await pool.execute(sql, *args)
 
 
 # ---------------------------------------------------------------------------

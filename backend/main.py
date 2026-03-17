@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import base64
-import logging
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
@@ -17,8 +16,6 @@ from vercel.blob import AsyncBlobClient
 
 import agent
 import db
-
-logger = logging.getLogger(__name__)
 
 # Prefix used by proxy URLs returned from the upload endpoint.
 # Includes /api so the browser can fetch directly (Vercel routes /api/* to
@@ -120,16 +117,6 @@ async def get_file(pathname: str) -> fastapi.responses.Response:
 # ---------------------------------------------------------------------------
 
 
-def _serialize_session(row: dict) -> dict:  # type: ignore[type-arg]
-    """Convert asyncpg datetimes to ISO strings."""
-    return {
-        "id": row["id"],
-        "title": row["title"],
-        "created_at": row["created_at"].isoformat(),
-        "updated_at": row["updated_at"].isoformat(),
-    }
-
-
 class CreateSessionRequest(pydantic.BaseModel):
     """Body for ``POST /sessions``."""
 
@@ -138,17 +125,15 @@ class CreateSessionRequest(pydantic.BaseModel):
 
 
 @app.get("/sessions")
-async def list_sessions() -> list[dict]:  # type: ignore[type-arg]
+async def list_sessions() -> list[db.Session]:
     """Return all sessions, most recent first."""
-    rows = await db.list_sessions()
-    return [_serialize_session(r) for r in rows]
+    return await db.list_sessions()
 
 
 @app.post("/sessions", status_code=201)
-async def create_session(body: CreateSessionRequest) -> dict:  # type: ignore[type-arg]
+async def create_session(body: CreateSessionRequest) -> db.Session:
     """Create a new session with a client-generated ID."""
-    row = await db.create_session(body.id, body.title)
-    return _serialize_session(row)
+    return await db.create_session(body.id, body.title)
 
 
 @app.get("/sessions/{session_id}")
@@ -159,13 +144,13 @@ async def get_session(session_id: str) -> dict:  # type: ignore[type-arg]
         raise fastapi.HTTPException(status_code=404, detail="Session not found")
 
     messages = await db.get_messages(session_id)
-    result = _serialize_session(session)
+    result = session.model_dump()
     result["messages"] = [
         {
-            "id": m["id"],
-            "role": m["role"],
-            "parts": m["parts"],
-            "createdAt": m["created_at"].isoformat(),
+            "id": m.id,
+            "role": m.role,
+            "parts": m.parts,
+            "createdAt": m.created_at,
         }
         for m in messages
     ]
@@ -181,49 +166,29 @@ async def delete_session(session_id: str) -> dict[str, str]:
     return {"status": "deleted"}
 
 
+def _extract_first_user_text(messages: list[db.StoredMessage]) -> str | None:
+    """Return the text of the first user text-part, or None."""
+    for msg in messages:
+        if msg.role != "user":
+            continue
+        for part in msg.parts:
+            if part.get("type") == "text" and part.get("text"):
+                return part["text"]
+    return None
+
+
 @app.post("/sessions/{session_id}/title")
-async def generate_title(session_id: str) -> dict:  # type: ignore[type-arg]
+async def generate_title(session_id: str) -> db.Session:
     """Generate an LLM title for a session from its first message."""
     session = await db.get_session(session_id)
     if not session:
         raise fastapi.HTTPException(status_code=404, detail="Session not found")
 
-    # If the session already has a title, return it immediately.
-    if session["title"]:
-        return _serialize_session(session)
+    if session.title:
+        return session
 
     messages = await db.get_messages(session_id)
-    logger.info(
-        "Title: session %s has %d messages, roles=%s",
-        session_id,
-        len(messages),
-        [m["role"] for m in messages],
-    )
-    if messages:
-        p = messages[0].get("parts")
-        logger.info("First message parts (type=%s): %s", type(p).__name__, p)
-
-    # Find the first user message text.  Try the standard ``type: text``
-    # shape first, then fall back to any dict with a ``text`` key (in case
-    # parts were stored in a non-standard format).
-    first_text = ""
-    for msg in messages:
-        if msg["role"] != "user":
-            continue
-        parts = msg["parts"]
-        if not isinstance(parts, list):
-            continue
-        for part in parts:
-            if not isinstance(part, dict):
-                continue
-            if part.get("type") == "text" and part.get("text"):
-                first_text = part["text"]
-                break
-            if not first_text and isinstance(part.get("text"), str):
-                first_text = part["text"]
-        if first_text:
-            break
-
+    first_text = _extract_first_user_text(messages)
     if not first_text:
         raise fastapi.HTTPException(
             status_code=400, detail="No user message to generate title from"
@@ -231,7 +196,7 @@ async def generate_title(session_id: str) -> dict:  # type: ignore[type-arg]
 
     title = await agent.generate_title(first_text)
     row = await db.update_session_title(session_id, title)
-    return _serialize_session(row)  # type: ignore[arg-type]
+    return row  # type: ignore[return-value]
 
 
 # ---------------------------------------------------------------------------
@@ -293,6 +258,11 @@ async def _inline_file_parts(
     return result
 
 
+# ---------------------------------------------------------------------------
+# Message serialisation (UI <-> SDK <-> DB)
+# ---------------------------------------------------------------------------
+
+
 def _ui_parts_to_dicts(
     parts: list,  # type: ignore[type-arg]
 ) -> list[dict]:  # type: ignore[type-arg]
@@ -336,63 +306,66 @@ def _sdk_parts_to_ui_dicts(
     return result
 
 
+# ---------------------------------------------------------------------------
+# Persistence helpers
+# ---------------------------------------------------------------------------
+
+
+async def _persist_request_messages(
+    session_id: str, ui_messages: list[ai.ai_sdk_ui.UIMessage]
+) -> None:
+    """Batch-upsert all incoming UI messages into the DB."""
+    rows = [
+        (msg.id, session_id, msg.role, _ui_parts_to_dicts(msg.parts))
+        for msg in ui_messages
+    ]
+    await db.save_messages_batch(rows)
+
+
+async def _persist_assistant_messages(
+    session_id: str, messages: list[ai.Message]
+) -> None:
+    """Save completed assistant messages to the DB."""
+    rows: list[tuple[str, str, str, list[dict]]] = []  # type: ignore[type-arg]
+    for msg in messages:
+        ui_parts = _sdk_parts_to_ui_dicts(msg.parts)
+        if ui_parts:
+            rows.append((msg.id, session_id, "assistant", ui_parts))
+    await db.save_messages_batch(rows)
+
+
+# ---------------------------------------------------------------------------
+# Chat endpoint
+# ---------------------------------------------------------------------------
+
+
 @app.post("/chat")
 async def chat(request: ChatRequest) -> fastapi.responses.StreamingResponse:
     """Handle chat requests and stream responses."""
     session_id = request.session_id
 
-    # Ensure the session exists (create if somehow missing)
+    # Ensure the session exists (create if somehow missing).
     session = await db.get_session(session_id)
     if not session:
         await db.create_session(session_id)
 
-    # Upsert every message from the request so that prior assistant
-    # messages (which the frontend replays) get persisted too.
-    for ui_msg in request.messages:
-        parts_dicts = _ui_parts_to_dicts(ui_msg.parts)
-        logger.info(
-            "Saving message %s (role=%s, %d parts) to session %s",
-            ui_msg.id,
-            ui_msg.role,
-            len(parts_dicts),
-            session_id,
-        )
-        await db.save_message(
-            message_id=ui_msg.id,
-            session_id=session_id,
-            role=ui_msg.role,
-            parts=parts_dicts,
-        )
+    # Batch-upsert all incoming messages.
+    await _persist_request_messages(session_id, request.messages)
 
-    # Convert UI messages to SDK messages
+    # Convert UI messages to SDK messages and inline file parts.
     messages = ai.ai_sdk_ui.to_messages(request.messages)
-
-    # Inline any proxy-URL file parts so the LLM receives base64 data.
     messages = await _inline_file_parts(messages)
 
-    # Prepend the system prompt
+    # Prepend the system prompt.
     system = ai.Message(
         role="system",
         parts=[ai.TextPart(text=agent.SYSTEM)],
     )
-    all_messages = [system, *messages]
 
     llm = agent.get_llm()
+    run_result = ai.run(agent.graph, llm, [system, *messages], agent.TOOLS)
 
-    # Note: checkpoints are saved for potential future hook-resume
-    # support but NOT loaded for normal chat turns.  Loading a
-    # checkpoint replays completed steps, which is wrong when the
-    # user is simply sending a follow-up message.
-    run_result = ai.run(
-        agent.graph,
-        llm,
-        all_messages,
-        agent.TOOLS,
-    )
-
-    # Collect the final "done" assistant messages while streaming.
-    # RunResult is an async iterator consumed by to_sse_stream;
-    # we tap it to capture completed assistant messages for persistence.
+    # Tap the stream to capture completed assistant messages for persistence.
     assistant_messages: list[ai.Message] = []
 
     async def _tap_messages() -> AsyncGenerator[ai.Message]:
@@ -405,27 +378,13 @@ async def chat(request: ChatRequest) -> fastapi.responses.StreamingResponse:
         async for chunk in ai.ai_sdk_ui.to_sse_stream(_tap_messages()):
             yield chunk
 
-        # Persist the assistant messages collected during streaming.
-        for msg in assistant_messages:
-            ui_parts = _sdk_parts_to_ui_dicts(msg.parts)
-            if ui_parts:
-                await db.save_message(
-                    message_id=msg.id,
-                    session_id=session_id,
-                    role="assistant",
-                    parts=ui_parts,
-                )
-
-        # Save checkpoint for future resume.
+        # Post-stream persistence.
+        await _persist_assistant_messages(session_id, assistant_messages)
         if run_result.checkpoint:
             await db.save_checkpoint(session_id, run_result.checkpoint.model_dump())
-
         await db.touch_session(session_id)
 
     return fastapi.responses.StreamingResponse(
         stream_response(),
-        headers={
-            **ai.ai_sdk_ui.UI_MESSAGE_STREAM_HEADERS,
-            "X-Session-ID": session_id,
-        },
+        headers=ai.ai_sdk_ui.UI_MESSAGE_STREAM_HEADERS,
     )

@@ -1,7 +1,7 @@
 import { useChat } from "@ai-sdk/react";
 import { DefaultChatTransport } from "ai";
 import type { FileUIPart, ToolUIPart, UIMessage } from "ai";
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
 
 import {
   Attachment,
@@ -12,6 +12,7 @@ import {
 import {
   Conversation,
   ConversationContent,
+  ConversationEmptyState,
   ConversationScrollButton,
 } from "@/components/ai-elements/conversation";
 import {
@@ -41,9 +42,7 @@ import {
 import { SessionSidebar } from "@/components/session-sidebar";
 import { SidebarInset, SidebarProvider, SidebarTrigger } from "@/components/ui/sidebar";
 import { TooltipProvider } from "@/components/ui/tooltip";
-import { useCurrentSession } from "@/hooks/use-current-session";
-import { fetchSessionMessages } from "@/hooks/use-session-messages";
-import { useSessions } from "@/hooks/use-sessions";
+import { useSessionManager } from "@/hooks/use-session-manager";
 
 // ---------------------------------------------------------------------------
 // Upload helper
@@ -156,9 +155,10 @@ function ChatView({
         <ConversationContent>
           <div className="mx-auto w-full max-w-3xl space-y-4 px-4 py-4">
             {messages.length === 0 ? (
-              <div className="flex h-full items-center justify-center text-muted-foreground">
-                <p>Send a message to start chatting</p>
-              </div>
+              <ConversationEmptyState
+                title="Start a conversation"
+                description="Send a message to start chatting"
+              />
             ) : (
               messages.map((message) => (
                 <Fragment key={message.id}>
@@ -236,7 +236,7 @@ function ChatView({
         <ConversationScrollButton />
       </Conversation>
 
-      <div className="border-t p-4">
+      <div className="border-t px-4 py-3">
         <div className="mx-auto w-full max-w-3xl">
           <PromptInput
             accept="image/*,video/*,audio/*,application/pdf,text/*"
@@ -269,108 +269,24 @@ function ChatView({
 // ---------------------------------------------------------------------------
 
 export default function App() {
-  const session = useCurrentSession();
-  const {
-    sessions,
-    isLoading: sessionsLoading,
-    create,
-    remove,
-    generateTitle,
-    invalidate,
-  } = useSessions();
+  const mgr = useSessionManager();
 
-  const [initialMessages, setInitialMessages] = useState<UIMessage[]>([]);
-  const [isReady, setIsReady] = useState(false);
-  const titleTriggeredRef = useRef<string | null>(null);
-
-  // ---- Bootstrap ---------------------------------------------------------
-  // On mount: if we have a saved sessionId, load its messages.
-  // If not, create a new session eagerly.
-
+  // Bootstrap on mount.
   useEffect(() => {
-    (async () => {
-      if (session.sessionId) {
-        try {
-          const msgs = await fetchSessionMessages(session.sessionId);
-          setInitialMessages(msgs);
-        } catch {
-          // Session no longer exists; create a fresh one.
-          const sid = session.create();
-          await create(sid);
-          setInitialMessages([]);
-        }
-      } else {
-        const sid = session.create();
-        await create(sid);
-        setInitialMessages([]);
-      }
-      setIsReady(true);
-    })();
-    // Only on mount.
+    mgr.bootstrap();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-
-  // ---- Session switching -------------------------------------------------
-
-  const handleSelectSession = useCallback(
-    async (id: string) => {
-      if (id === session.sessionId) return;
-      setIsReady(false);
-      try {
-        const msgs = await fetchSessionMessages(id);
-        setInitialMessages(msgs);
-        session.select(id);
-      } catch {
-        // ignore
-      } finally {
-        setIsReady(true);
-      }
-    },
-    [session],
-  );
-
-  const handleNewSession = useCallback(async () => {
-    setIsReady(false);
-    const sid = session.create();
-    await create(sid);
-    setInitialMessages([]);
-    titleTriggeredRef.current = null;
-    setIsReady(true);
-  }, [session, create]);
-
-  // ---- Title generation --------------------------------------------------
-
-  const handleFinishReply = useCallback(() => {
-    const sid = session.sessionId;
-    if (!sid) return;
-    if (titleTriggeredRef.current === sid) return;
-
-    const existing = sessions.find((s) => s.id === sid);
-    if (existing?.title) {
-      titleTriggeredRef.current = sid;
-      return;
-    }
-
-    titleTriggeredRef.current = sid;
-    generateTitle(sid);
-    invalidate();
-  }, [session.sessionId, sessions, generateTitle, invalidate]);
-
-  // ---- Render ------------------------------------------------------------
 
   return (
     <TooltipProvider>
       <SidebarProvider>
         <SessionSidebar
-          sessions={sessions}
-          isLoading={sessionsLoading}
-          currentSessionId={session.sessionId}
-          onSelect={handleSelectSession}
-          onNew={handleNewSession}
-          onDelete={(id) => {
-            remove(id);
-            if (id === session.sessionId) handleNewSession();
-          }}
+          sessions={mgr.sessions}
+          isLoading={mgr.sessionsLoading}
+          currentSessionId={mgr.sessionId}
+          onSelect={mgr.selectSession}
+          onNew={mgr.newSession}
+          onDelete={mgr.deleteSession}
         />
 
         <SidebarInset>
@@ -381,16 +297,16 @@ export default function App() {
             </div>
           </header>
 
-          {!isReady || !session.sessionId ? (
+          {!mgr.isReady || !mgr.sessionId ? (
             <div className="flex flex-1 items-center justify-center text-muted-foreground">
               <p>Loading...</p>
             </div>
           ) : (
             <ChatView
-              key={session.sessionId}
-              sessionId={session.sessionId}
-              initialMessages={initialMessages}
-              onFinishReply={handleFinishReply}
+              key={mgr.sessionId}
+              sessionId={mgr.sessionId}
+              initialMessages={mgr.initialMessages}
+              onFinishReply={mgr.triggerTitle}
             />
           )}
         </SidebarInset>

@@ -1,6 +1,6 @@
 import { PlusIcon, Trash2Icon } from "lucide-react";
 
-import type { Session } from "@/hooks/use-sessions";
+import type { Session } from "@/hooks/session-api";
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import {
@@ -92,7 +92,7 @@ export function SessionSidebar({
                 <SidebarMenu>
                   {Array.from({ length: 5 }).map((_, i) => (
                     <SidebarMenuItem key={i}>
-                      <SidebarMenuSkeleton showIcon />
+                      <SidebarMenuSkeleton />
                     </SidebarMenuItem>
                   ))}
                 </SidebarMenu>
