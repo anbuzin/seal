@@ -1,180 +1,145 @@
-import { cn } from "@/lib/utils";
-import { MessageSquarePlus, Trash2, PanelLeftClose, PanelLeft } from "lucide-react";
-import { useCallback, useEffect, useState } from "react";
+import { PlusIcon, Trash2Icon } from "lucide-react";
 
-export interface Session {
-  id: string;
-  user_id: string;
-  title: string | null;
-  created_at: string;
-  updated_at: string;
+import type { Session } from "@/hooks/use-sessions";
+import { Button } from "@/components/ui/button";
+import { ScrollArea } from "@/components/ui/scroll-area";
+import {
+  Sidebar,
+  SidebarContent,
+  SidebarGroup,
+  SidebarGroupContent,
+  SidebarGroupLabel,
+  SidebarHeader,
+  SidebarMenu,
+  SidebarMenuAction,
+  SidebarMenuButton,
+  SidebarMenuItem,
+  SidebarMenuSkeleton,
+  SidebarRail,
+} from "@/components/ui/sidebar";
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function groupByDate(sessions: Session[]) {
+  const today = new Date();
+  const yesterday = new Date(today);
+  yesterday.setDate(yesterday.getDate() - 1);
+  const weekAgo = new Date(today);
+  weekAgo.setDate(weekAgo.getDate() - 7);
+
+  const groups: { label: string; items: Session[] }[] = [
+    { label: "Today", items: [] },
+    { label: "Yesterday", items: [] },
+    { label: "Previous 7 days", items: [] },
+    { label: "Older", items: [] },
+  ];
+
+  for (const s of sessions) {
+    const d = new Date(s.updated_at);
+    if (d.toDateString() === today.toDateString()) groups[0].items.push(s);
+    else if (d.toDateString() === yesterday.toDateString())
+      groups[1].items.push(s);
+    else if (d >= weekAgo) groups[2].items.push(s);
+    else groups[3].items.push(s);
+  }
+
+  return groups.filter((g) => g.items.length > 0);
 }
 
+// ---------------------------------------------------------------------------
+// Component
+// ---------------------------------------------------------------------------
+
 interface SessionSidebarProps {
+  sessions: Session[];
+  isLoading: boolean;
   currentSessionId: string | null;
-  onSelectSession: (sessionId: string) => void;
-  onNewSession: () => void;
-  className?: string;
+  onSelect: (id: string) => void;
+  onNew: () => void;
+  onDelete: (id: string) => void;
 }
 
 export function SessionSidebar({
+  sessions,
+  isLoading,
   currentSessionId,
-  onSelectSession,
-  onNewSession,
-  className,
+  onSelect,
+  onNew,
+  onDelete,
 }: SessionSidebarProps) {
-  const [sessions, setSessions] = useState<Session[]>([]);
-  const [isLoading, setIsLoading] = useState(true);
-  const [isCollapsed, setIsCollapsed] = useState(false);
-
-  const fetchSessions = useCallback(async () => {
-    try {
-      const res = await fetch("/api/sessions", { credentials: "include" });
-      if (res.ok) {
-        const data = await res.json();
-        setSessions(data.sessions);
-      }
-    } catch (error) {
-      console.error("Failed to fetch sessions:", error);
-    } finally {
-      setIsLoading(false);
-    }
-  }, []);
-
-  useEffect(() => {
-    fetchSessions();
-  }, [fetchSessions]);
-
-  // Refresh sessions when currentSessionId changes (new session created)
-  useEffect(() => {
-    if (currentSessionId) {
-      fetchSessions();
-    }
-  }, [currentSessionId, fetchSessions]);
-
-  const handleDeleteSession = useCallback(
-    async (e: React.MouseEvent, sessionId: string) => {
-      e.stopPropagation();
-      try {
-        const res = await fetch(`/api/sessions/${sessionId}`, {
-          method: "DELETE",
-          credentials: "include",
-        });
-        if (res.ok) {
-          setSessions((prev) => prev.filter((s) => s.id !== sessionId));
-          if (currentSessionId === sessionId) {
-            onNewSession();
-          }
-        }
-      } catch (error) {
-        console.error("Failed to delete session:", error);
-      }
-    },
-    [currentSessionId, onNewSession]
-  );
-
-  const formatDate = (dateStr: string) => {
-    const date = new Date(dateStr);
-    const now = new Date();
-    const diffMs = now.getTime() - date.getTime();
-    const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
-
-    if (diffDays === 0) return "Today";
-    if (diffDays === 1) return "Yesterday";
-    if (diffDays < 7) return `${diffDays} days ago`;
-    return date.toLocaleDateString();
-  };
-
-  if (isCollapsed) {
-    return (
-      <div className={cn("flex flex-col border-r bg-card w-12", className)}>
-        <div className="p-2 border-b">
-          <button
-            onClick={() => setIsCollapsed(false)}
-            className="p-2 hover:bg-accent transition-colors w-full flex justify-center"
-            title="Expand sidebar"
-          >
-            <PanelLeft className="size-4" />
-          </button>
-        </div>
-        <div className="p-2">
-          <button
-            onClick={onNewSession}
-            className="p-2 hover:bg-accent transition-colors w-full flex justify-center"
-            title="New chat"
-          >
-            <MessageSquarePlus className="size-4" />
-          </button>
-        </div>
-      </div>
-    );
-  }
+  const groups = groupByDate(sessions);
 
   return (
-    <div className={cn("flex flex-col border-r bg-card w-64", className)}>
-      <div className="flex items-center justify-between p-3 border-b">
-        <span className="text-sm font-medium text-muted-foreground uppercase tracking-wider">
-          Sessions
-        </span>
-        <button
-          onClick={() => setIsCollapsed(true)}
-          className="p-1 hover:bg-accent transition-colors"
-          title="Collapse sidebar"
+    <Sidebar>
+      <SidebarHeader>
+        <Button
+          variant="ghost"
+          className="w-full justify-start gap-2"
+          onClick={onNew}
         >
-          <PanelLeftClose className="size-4" />
-        </button>
-      </div>
+          <PlusIcon className="size-4" />
+          New chat
+        </Button>
+      </SidebarHeader>
 
-      <div className="p-2">
-        <button
-          onClick={onNewSession}
-          className="flex items-center gap-2 w-full p-2 text-sm hover:bg-accent transition-colors border border-dashed border-border"
-        >
-          <MessageSquarePlus className="size-4" />
-          <span>New chat</span>
-        </button>
-      </div>
+      <SidebarContent>
+        <ScrollArea className="flex-1">
+          {isLoading ? (
+            <SidebarGroup>
+              <SidebarGroupContent>
+                <SidebarMenu>
+                  {Array.from({ length: 5 }).map((_, i) => (
+                    <SidebarMenuItem key={i}>
+                      <SidebarMenuSkeleton showIcon />
+                    </SidebarMenuItem>
+                  ))}
+                </SidebarMenu>
+              </SidebarGroupContent>
+            </SidebarGroup>
+          ) : sessions.length === 0 ? (
+            <div className="px-4 py-8 text-center text-sm text-muted-foreground">
+              No conversations yet
+            </div>
+          ) : (
+            groups.map((group) => (
+              <SidebarGroup key={group.label}>
+                <SidebarGroupLabel>{group.label}</SidebarGroupLabel>
+                <SidebarGroupContent>
+                  <SidebarMenu>
+                    {group.items.map((session) => (
+                      <SidebarMenuItem key={session.id}>
+                        <SidebarMenuButton
+                          isActive={session.id === currentSessionId}
+                          onClick={() => onSelect(session.id)}
+                          tooltip={session.title || "New conversation"}
+                        >
+                          <span className="truncate">
+                            {session.title || "New conversation"}
+                          </span>
+                        </SidebarMenuButton>
+                        <SidebarMenuAction
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onDelete(session.id);
+                          }}
+                          showOnHover
+                        >
+                          <Trash2Icon className="size-4" />
+                          <span className="sr-only">Delete</span>
+                        </SidebarMenuAction>
+                      </SidebarMenuItem>
+                    ))}
+                  </SidebarMenu>
+                </SidebarGroupContent>
+              </SidebarGroup>
+            ))
+          )}
+        </ScrollArea>
+      </SidebarContent>
 
-      <div className="flex-1 overflow-y-auto">
-        {isLoading ? (
-          <div className="p-3 text-sm text-muted-foreground">Loading...</div>
-        ) : sessions.length === 0 ? (
-          <div className="p-3 text-sm text-muted-foreground">
-            No sessions yet
-          </div>
-        ) : (
-          <div className="space-y-1 p-2">
-            {sessions.map((session) => (
-              <div
-                key={session.id}
-                onClick={() => onSelectSession(session.id)}
-                className={cn(
-                  "group flex items-center justify-between p-2 text-sm cursor-pointer transition-colors",
-                  currentSessionId === session.id
-                    ? "bg-accent text-accent-foreground"
-                    : "hover:bg-accent/50"
-                )}
-              >
-                <div className="flex-1 min-w-0">
-                  <div className="truncate">
-                    {session.title || "New conversation"}
-                  </div>
-                  <div className="text-xs text-muted-foreground">
-                    {formatDate(session.updated_at)}
-                  </div>
-                </div>
-                <button
-                  onClick={(e) => handleDeleteSession(e, session.id)}
-                  className="opacity-0 group-hover:opacity-100 p-1 hover:bg-destructive/20 hover:text-destructive transition-all"
-                  title="Delete session"
-                >
-                  <Trash2 className="size-3" />
-                </button>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-    </div>
+      <SidebarRail />
+    </Sidebar>
   );
 }
