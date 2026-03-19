@@ -43,6 +43,17 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     data        JSONB NOT NULL,
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS steering_queue (
+    id          TEXT PRIMARY KEY,
+    session_id  TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+    role        TEXT NOT NULL DEFAULT 'user',
+    parts       JSONB NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS idx_steering_session
+    ON steering_queue(session_id, created_at);
 """
 
 # ---------------------------------------------------------------------------
@@ -299,3 +310,78 @@ async def delete_checkpoint(session_id: str) -> None:
     """Remove the checkpoint for a session."""
     pool = await get_pool()
     await pool.execute("DELETE FROM checkpoints WHERE session_id = $1", session_id)
+
+
+# ---------------------------------------------------------------------------
+# Steering queue
+# ---------------------------------------------------------------------------
+
+
+class SteeringItem(pydantic.BaseModel):
+    """A pending steering message waiting to be consumed by the agent loop."""
+
+    id: str
+    session_id: str
+    role: str
+    parts: list[dict[str, Any]]
+    created_at: str
+
+
+def _row_to_steering(row: asyncpg.Record) -> SteeringItem:
+    return SteeringItem(
+        id=row["id"],
+        session_id=row["session_id"],
+        role=row["role"],
+        parts=_parse_jsonb(row["parts"]),
+        created_at=row["created_at"].isoformat(),
+    )
+
+
+async def push_steering(
+    items: list[tuple[str, str, str, list[dict[str, Any]]]],
+) -> None:
+    """Insert steering messages.  Each tuple is (id, session_id, role, parts)."""
+    if not items:
+        return
+    pool = await get_pool()
+    args: list[Any] = []
+    placeholders: list[str] = []
+    for i, (mid, sid, role, parts) in enumerate(items):
+        base = i * 4
+        placeholders.append(
+            f"(${base + 1}, ${base + 2}, ${base + 3}, ${base + 4}::jsonb)"
+        )
+        args.extend([mid, sid, role, json.dumps(parts)])
+    sql = (
+        "INSERT INTO steering_queue (id, session_id, role, parts) VALUES "
+        + ", ".join(placeholders)
+    )
+    await pool.execute(sql, *args)
+
+
+async def get_steering(session_id: str) -> list[SteeringItem]:
+    """Return all pending steering items for a session (read-only)."""
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "SELECT id, session_id, role, parts, created_at "
+        "FROM steering_queue WHERE session_id = $1 ORDER BY created_at",
+        session_id,
+    )
+    return [_row_to_steering(r) for r in rows]
+
+
+async def pop_steering(session_id: str) -> list[SteeringItem]:
+    """Atomically pop all pending steering items for a session.
+
+    Returns the items and deletes them from the queue in one statement.
+    """
+    pool = await get_pool()
+    rows = await pool.fetch(
+        "DELETE FROM steering_queue WHERE session_id = $1 "
+        "RETURNING id, session_id, role, parts, created_at",
+        session_id,
+    )
+    # Sort by created_at to preserve insertion order (DELETE RETURNING
+    # does not guarantee order).
+    rows = sorted(rows, key=lambda r: r["created_at"])
+    return [_row_to_steering(r) for r in rows]

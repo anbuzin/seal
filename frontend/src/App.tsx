@@ -44,6 +44,13 @@ import {
   ConfirmationRequest,
 } from "@/components/ai-elements/confirmation";
 import {
+  Queue,
+  QueueItem,
+  QueueItemContent,
+  QueueItemIndicator,
+  QueueList,
+} from "@/components/ai-elements/queue";
+import {
   Tool,
   ToolContent,
   ToolHeader,
@@ -58,6 +65,7 @@ import {
 } from "@/components/ui/sidebar";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { useSessionManager } from "@/hooks/use-session-manager";
+import { useSteeringQueue } from "@/hooks/use-steering-queue";
 
 // ---------------------------------------------------------------------------
 // Upload helper
@@ -145,6 +153,22 @@ function ChatView({
 
   const isStreaming = status === "submitted" || status === "streaming";
 
+  // Detect pending tool approvals (stream ended, waiting for user).
+  const hasPendingApprovals = useMemo(() => {
+    const lastMsg = messages[messages.length - 1];
+    if (!lastMsg || lastMsg.role !== "assistant") return false;
+    return lastMsg.parts.some(
+      (p) =>
+        typeof p.type === "string" &&
+        p.type.startsWith("tool-") &&
+        (p as ToolUIPart).state === "approval-requested",
+    );
+  }, [messages]);
+
+  // Steering is active when the agent is busy (streaming or awaiting approval).
+  const shouldSteer = isStreaming || hasPendingApprovals;
+  const steeringQueue = useSteeringQueue(sessionId, shouldSteer);
+
   const handleSubmit = useCallback(
     async ({ text, files }: { text: string; files: FileUIPart[] }) => {
       if (!text.trim() && files.length === 0) return;
@@ -159,12 +183,17 @@ function ChatView({
         }
       }
 
-      sendMessage({
-        text,
-        ...(uploaded.length > 0 ? { files: uploaded } : {}),
-      });
+      if (shouldSteer) {
+        // Steering: push to the DB queue (consumed at next loop iteration).
+        steeringQueue.enqueue(text, uploaded.length > 0 ? uploaded : undefined);
+      } else {
+        sendMessage({
+          text,
+          ...(uploaded.length > 0 ? { files: uploaded } : {}),
+        });
+      }
     },
-    [sendMessage],
+    [sendMessage, shouldSteer, steeringQueue],
   );
 
   return (
@@ -297,7 +326,25 @@ function ChatView({
       </Conversation>
 
       <div className="border-t px-4 py-3">
-        <div className="mx-auto w-full max-w-3xl">
+        <div className="mx-auto flex w-full max-w-3xl flex-col gap-2">
+          {steeringQueue.hasItems && (
+            <Queue>
+              <QueueList>
+                {steeringQueue.queue.map((item) => {
+                  const text =
+                    item.parts.find((p) => p.type === "text")?.text ?? "";
+                  return (
+                    <QueueItem key={item.id}>
+                      <div className="flex items-center gap-2">
+                        <QueueItemIndicator />
+                        <QueueItemContent>{text as string}</QueueItemContent>
+                      </div>
+                    </QueueItem>
+                  );
+                })}
+              </QueueList>
+            </Queue>
+          )}
           <PromptInput
             accept="image/*,video/*,audio/*,application/pdf,text/*"
             multiple
@@ -305,8 +352,12 @@ function ChatView({
           >
             <InputAttachments />
             <PromptInputTextarea
-              placeholder="Ask me anything..."
-              disabled={isStreaming || isUploading}
+              placeholder={
+                shouldSteer
+                  ? "Steer the conversation..."
+                  : "Ask me anything..."
+              }
+              disabled={isUploading}
             />
             <PromptInputFooter>
               <PromptInputActionMenu>

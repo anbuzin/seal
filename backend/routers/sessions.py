@@ -71,6 +71,12 @@ def _extract_first_user_text(messages: list[db.StoredMessage]) -> str | None:
     return None
 
 
+@router.get("/sessions/{session_id}/steering")
+async def get_steering_queue(session_id: str) -> list[db.SteeringItem]:
+    """Return all pending steering messages for a session."""
+    return await db.get_steering(session_id)
+
+
 @router.post("/sessions/{session_id}/title")
 async def generate_title(session_id: str) -> db.Session:
     """Generate an LLM title for a session from its first message."""

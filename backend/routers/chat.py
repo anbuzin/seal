@@ -91,6 +91,28 @@ class ChatRequest(pydantic.BaseModel):
     session_id: str
 
 
+class SteerRequest(pydantic.BaseModel):
+    """Request body for the steering endpoint."""
+
+    messages: list[ai.ai_sdk_ui.UIMessage]
+    session_id: str
+
+
+@router.post("/chat/steer")
+async def steer(request: SteerRequest) -> dict[str, Any]:
+    """Inject steering messages into the DB-backed queue.
+
+    The agent graph's ``Steering`` hook pops these at the next loop
+    iteration (or at the start of the next turn if the stream is idle).
+    """
+    items: list[tuple[str, str, str, list[dict[str, Any]]]] = [
+        (msg.id, request.session_id, msg.role, _ui_parts_to_dicts(msg.parts))
+        for msg in request.messages
+    ]
+    await db.push_steering(items)
+    return {"ok": True, "queued": len(items)}
+
+
 def _extract_blob_pathname(url: str) -> str | None:
     """Extract the blob pathname from a proxy URL, or return None."""
     if url.startswith(FILES_PREFIX):
