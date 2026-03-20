@@ -11,6 +11,8 @@ import fastapi.responses
 import pydantic
 import vercel_ai_sdk as ai
 import vercel_ai_sdk.ai_sdk_ui
+import vercel_ai_sdk.ai_sdk_ui.adapter as sse_adapter
+import vercel_ai_sdk.ai_sdk_ui.protocol as protocol
 from vercel.blob import AsyncBlobClient
 
 import agent
@@ -110,6 +112,7 @@ async def steer(request: SteerRequest) -> dict[str, Any]:
         for msg in request.messages
     ]
     await db.push_steering(items)
+    await db.save_messages_batch(items)
     return {"ok": True, "queued": len(items)}
 
 
@@ -236,6 +239,15 @@ async def _persist_assistant_messages(
     await db.save_messages_batch(rows)
 
 
+def _is_steering_hook(msg: ai.Message) -> bool:
+    """True if *msg* is a single pending Steering HookPart."""
+    return (
+        len(msg.parts) == 1
+        and isinstance(msg.parts[0], ai.HookPart)
+        and msg.parts[0].hook_type == "Steering"
+    )
+
+
 # ---------------------------------------------------------------------------
 # Chat endpoint
 # ---------------------------------------------------------------------------
@@ -289,15 +301,53 @@ async def chat(request: ChatRequest) -> fastapi.responses.StreamingResponse:
         [system, *messages],
         agent.TOOLS,
         checkpoint=checkpoint,
-        cancel_on_hooks=True,
     )
 
     # Tap the stream to capture completed assistant messages for persistence.
     assistant_messages: list[ai.Message] = []
+    # Buffer of steering items consumed during the current stream.
+    consumed_steering: list[dict[str, Any]] = []
 
     async def _tap_messages() -> AsyncGenerator[ai.Message]:
         pinned = False
+        segment = 0
         async for msg in run_result:
+            # Auto-resolve Steering hooks: pop any queued steering
+            # messages from the DB and pass them through the hook so
+            # the graph can inject them into the conversation.
+            if _is_steering_hook(msg):
+                hook_part: ai.HookPart = msg.parts[0]  # type: ignore[assignment]
+                items = await db.pop_steering(session_id)
+                agent.Steering.resolve(  # type: ignore[attr-defined]
+                    hook_part.hook_id,
+                    {"messages": [item.model_dump() for item in items]},
+                )
+                if items:
+                    # Persist assistant messages accumulated so far so their
+                    # created_at precedes the steering user message.
+                    if assistant_messages:
+                        await _persist_assistant_messages(
+                            session_id, assistant_messages
+                        )
+                        assistant_messages.clear()
+                    segment += 1
+                    # Buffer consumed items so stream_response can emit a
+                    # DataPart before the next assistant chunk.
+                    consumed_steering.extend(
+                        {
+                            "id": item.id,
+                            "role": item.role,
+                            "parts": item.parts,
+                        }
+                        for item in items
+                    )
+                continue
+
+            # Force a message boundary after steering: a label change
+            # triggers FinishPart + StartPart in the SSE stream.
+            if segment > 0 and msg.role == "assistant":
+                msg = msg.model_copy(update={"label": f"s{segment}"})
+
             # Pin the first yielded message to the original assistant ID so
             # the SSE StartPart carries the same ID the frontend already has.
             if not pinned and resume_message_id and msg.role == "assistant":
@@ -309,12 +359,29 @@ async def chat(request: ChatRequest) -> fastapi.responses.StreamingResponse:
 
     async def stream_response() -> AsyncGenerator[str]:
         async for chunk in ai.ai_sdk_ui.to_sse_stream(_tap_messages()):
+            # Emit a transient DataPart for any steering items consumed
+            # since the last chunk.  The frontend's onData handler picks
+            # this up and appends the user messages inline.
+            if consumed_steering:
+                part = protocol.DataPart(
+                    data_type="steering-consumed",
+                    data={"messages": list(consumed_steering)},
+                    transient=True,
+                )
+                yield sse_adapter.format_sse(part)
+                consumed_steering.clear()
             yield chunk
 
         # Post-stream persistence.
         await _persist_assistant_messages(session_id, assistant_messages)
-        if run_result.checkpoint.pending_hooks:
-            await db.save_checkpoint(session_id, run_result.checkpoint.model_dump())
+
+        # Filter out Steering hooks from the checkpoint — they are
+        # auto-resolved and must not persist across requests.
+        cp = run_result.checkpoint
+        real_pending = [h for h in cp.pending_hooks if h.hook_type != "Steering"]
+        if real_pending:
+            cleaned = cp.model_copy(update={"pending_hooks": real_pending})
+            await db.save_checkpoint(session_id, cleaned.model_dump())
         else:
             await db.delete_checkpoint(session_id)
         await db.touch_session(session_id)

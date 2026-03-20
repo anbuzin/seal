@@ -1,10 +1,5 @@
 import type { FileUIPart } from "ai";
-import { useCallback } from "react";
-import {
-  useMutation,
-  useQuery,
-  useQueryClient,
-} from "@tanstack/react-query";
+import { useCallback, useState } from "react";
 import { nanoid } from "nanoid";
 
 // ---------------------------------------------------------------------------
@@ -13,100 +8,22 @@ import { nanoid } from "nanoid";
 
 export interface SteeringItem {
   id: string;
-  session_id: string;
   role: string;
   parts: Record<string, unknown>[];
-  created_at: string;
-}
-
-// ---------------------------------------------------------------------------
-// API helpers
-// ---------------------------------------------------------------------------
-
-async function fetchSteeringQueue(
-  sessionId: string,
-): Promise<SteeringItem[]> {
-  const res = await fetch(`/api/sessions/${sessionId}/steering`);
-  if (!res.ok) return [];
-  return res.json();
-}
-
-async function postSteer(
-  sessionId: string,
-  id: string,
-  parts: Record<string, unknown>[],
-): Promise<void> {
-  const res = await fetch("/api/chat/steer", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      session_id: sessionId,
-      messages: [{ id, role: "user", parts }],
-    }),
-  });
-  if (!res.ok) throw new Error("Steer request failed");
 }
 
 // ---------------------------------------------------------------------------
 // Hook
 // ---------------------------------------------------------------------------
 
-const STEERING_KEY = (id: string) => ["steering", id] as const;
-
 /**
- * Manages a DB-backed steering queue with optimistic updates.
+ * Manages a local steering queue with fire-and-forget POST to the backend.
  *
- * Polls the backend while `shouldSteer` is true so the UI stays
- * in sync as the agent consumes items.
+ * Items are removed when the backend emits a `data-steering-consumed`
+ * DataPart via SSE (consumed from `onData` in App.tsx).
  */
-export function useSteeringQueue(
-  sessionId: string,
-  shouldSteer: boolean,
-) {
-  const qc = useQueryClient();
-  const key = STEERING_KEY(sessionId);
-
-  // Poll the backend queue while we're in steering mode.
-  const { data: queue = [] } = useQuery({
-    queryKey: key,
-    queryFn: () => fetchSteeringQueue(sessionId),
-    refetchInterval: shouldSteer ? 1000 : false,
-    enabled: shouldSteer,
-  });
-
-  const mutation = useMutation({
-    mutationFn: ({
-      id,
-      parts,
-    }: {
-      id: string;
-      parts: Record<string, unknown>[];
-    }) => postSteer(sessionId, id, parts),
-
-    // Optimistic update: append immediately.
-    onMutate: async ({ id, parts }) => {
-      await qc.cancelQueries({ queryKey: key });
-      const previous = qc.getQueryData<SteeringItem[]>(key) ?? [];
-      const optimistic: SteeringItem = {
-        id,
-        session_id: sessionId,
-        role: "user",
-        parts,
-        created_at: new Date().toISOString(),
-      };
-      qc.setQueryData<SteeringItem[]>(key, [...previous, optimistic]);
-      return { previous };
-    },
-    onError: (_err, _vars, context) => {
-      // Rollback on failure.
-      if (context?.previous) {
-        qc.setQueryData<SteeringItem[]>(key, context.previous);
-      }
-    },
-    onSettled: () => {
-      qc.invalidateQueries({ queryKey: key });
-    },
-  });
+export function useSteeringQueue(sessionId: string) {
+  const [queue, setQueue] = useState<SteeringItem[]>([]);
 
   const enqueue = useCallback(
     (text: string, files?: FileUIPart[]) => {
@@ -122,14 +39,34 @@ export function useSteeringQueue(
           });
         }
       }
-      mutation.mutate({ id, parts });
+
+      const item: SteeringItem = { id, role: "user", parts };
+      setQueue((prev) => [...prev, item]);
+
+      // Fire-and-forget POST; remove on failure.
+      fetch("/api/chat/steer", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_id: sessionId,
+          messages: [{ id, role: "user", parts }],
+        }),
+      }).catch(() => {
+        setQueue((prev) => prev.filter((i) => i.id !== id));
+      });
     },
-    [mutation],
+    [sessionId],
   );
+
+  const consume = useCallback((ids: string[]) => {
+    const idSet = new Set(ids);
+    setQueue((prev) => prev.filter((i) => !idSet.has(i.id)));
+  }, []);
 
   return {
     queue,
     enqueue,
+    consume,
     hasItems: queue.length > 0,
   };
 }

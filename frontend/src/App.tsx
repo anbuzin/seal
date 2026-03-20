@@ -4,7 +4,13 @@ import {
   lastAssistantMessageIsCompleteWithApprovalResponses,
 } from "ai";
 import type { FileUIPart, ToolUIPart, UIMessage } from "ai";
-import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useMemo,
+  useState,
+} from "react";
 
 import {
   Attachment,
@@ -142,13 +148,30 @@ function ChatView({
     [sessionId],
   );
 
-  const { messages, sendMessage, status, stop, addToolApprovalResponse } =
+  const steeringQueue = useSteeringQueue(sessionId);
+
+  const { messages, sendMessage, setMessages, status, stop, addToolApprovalResponse } =
     useChat({
       transport,
       messages: initialMessages,
       onFinish: onFinishReply,
       sendAutomaticallyWhen:
         lastAssistantMessageIsCompleteWithApprovalResponses,
+      onData: (dataPart) => {
+        if (dataPart.type === "data-steering-consumed") {
+          const consumed = (dataPart as { type: string; data: { messages: { id: string; role: string; parts: Record<string, unknown>[] }[] } }).data.messages;
+          steeringQueue.consume(consumed.map((m) => m.id));
+          setMessages((prev) => [
+            ...prev,
+            ...consumed.map((m) => ({
+              id: m.id,
+              role: m.role as "user",
+              parts: m.parts as UIMessage["parts"],
+              createdAt: new Date(),
+            })),
+          ]);
+        }
+      },
     });
 
   const isStreaming = status === "submitted" || status === "streaming";
@@ -167,7 +190,6 @@ function ChatView({
 
   // Steering is active when the agent is busy (streaming or awaiting approval).
   const shouldSteer = isStreaming || hasPendingApprovals;
-  const steeringQueue = useSteeringQueue(sessionId, shouldSteer);
 
   const handleSubmit = useCallback(
     async ({ text, files }: { text: string; files: FileUIPart[] }) => {
@@ -184,7 +206,6 @@ function ChatView({
       }
 
       if (shouldSteer) {
-        // Steering: push to the DB queue (consumed at next loop iteration).
         steeringQueue.enqueue(text, uploaded.length > 0 ? uploaded : undefined);
       } else {
         sendMessage({
