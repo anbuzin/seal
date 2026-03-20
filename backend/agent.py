@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, ClassVar
+from typing import Any
 
 import httpx
-import pydantic
 import vercel_ai_sdk as ai
 
 
@@ -71,21 +70,6 @@ async def web_fetch(
     return "\n".join(parts)
 
 
-@ai.hook
-class Steering(pydantic.BaseModel):
-    """Non-cancelling hook for the steering queue.
-
-    The agent loop will emit this hook at each iteration so the chat
-    endpoint can inject steering messages.  Because ``cancels_future``
-    is False the runtime keeps the future alive instead of killing the
-    branch — the chat endpoint auto-resolves it immediately.
-    """
-
-    cancels_future: ClassVar[bool] = False
-
-    messages: list[dict[str, Any]] = pydantic.Field(default_factory=list)
-
-
 SYSTEM = """You are a helpful assistant with access to a bash shell and the internet."""
 
 TOOLS: list[ai.Tool[..., Any]] = [bash, web_fetch]
@@ -134,21 +118,6 @@ async def _execute_with_approval(
         tc.set_error("Tool call was denied by the user.")
 
 
-def _dicts_to_messages(items: list[dict[str, Any]]) -> list[ai.Message]:
-    """Convert serialized steering dicts to SDK messages."""
-    messages: list[ai.Message] = []
-    for item in items:
-        parts: list[ai.TextPart] = []
-        for p in item.get("parts", []):
-            if p.get("type") == "text" and p.get("text"):
-                parts.append(ai.TextPart(text=p["text"]))
-        if parts:
-            messages.append(
-                ai.Message(id=item["id"], role=item["role"], parts=parts)
-            )
-    return messages
-
-
 async def graph(
     llm: ai.LanguageModel,
     messages: list[ai.Message],
@@ -162,26 +131,16 @@ async def graph(
     Reject buttons and sends the decision back on the next request.
     """
     local_messages = list(messages)
-    iteration = 0
 
     while True:
         result = await ai.stream_step(llm, local_messages, tools)
 
+        if not result.tool_calls:
+            return result
+
         last_msg = result.last_message
         assert last_msg is not None
         local_messages.append(last_msg)
-
-        # Always consume steering queue, regardless of tool calls.
-        steering = await Steering.create(f"steering-{iteration}")
-        iteration += 1
-        if steering.messages:
-            local_messages.extend(_dicts_to_messages(steering.messages))
-
-        if not result.tool_calls:
-            # If steering injected messages, loop again so the LLM sees them.
-            if steering.messages:
-                continue
-            return result
 
         await asyncio.gather(
             *(_execute_with_approval(tc, message=last_msg) for tc in result.tool_calls)

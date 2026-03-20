@@ -118,9 +118,7 @@ export type ToolInputProps = ComponentProps<"div"> & {
 };
 
 export const ToolInput = ({ className, input, ...props }: ToolInputProps) => {
-  if (input === undefined || input === null) {
-    return null;
-  }
+  if (input == null) return null;
 
   return (
     <div className={cn("space-y-2 overflow-hidden", className)} {...props}>
