@@ -243,13 +243,44 @@ async def chat(request: ChatRequest) -> fastapi.responses.StreamingResponse:
     )
 
     llm = agent.get_llm()
-    run_result = ai.run(agent.graph, llm, [system, *messages], agent.TOOLS)
+
+    # Load checkpoint so we can resume after a tool approval round-trip.
+    checkpoint_data = await db.get_checkpoint(session_id)
+    checkpoint = (
+        ai.Checkpoint.model_validate(checkpoint_data) if checkpoint_data else None
+    )
+
+    # When resuming from a checkpoint, the frontend already has an assistant
+    # message from the first (interrupted) stream.  We must ensure the
+    # resumed stream re-uses that same message ID so the frontend SDK
+    # *replaces* the existing message instead of pushing a duplicate.
+    resume_message_id: str | None = None
+    if checkpoint is not None:
+        for ui_msg in reversed(request.messages):
+            if ui_msg.role == "assistant":
+                resume_message_id = ui_msg.id
+                break
+
+    run_result = ai.run(
+        agent.graph,
+        llm,
+        [system, *messages],
+        agent.TOOLS,
+        checkpoint=checkpoint,
+        cancel_on_hooks=True,
+    )
 
     # Tap the stream to capture completed assistant messages for persistence.
     assistant_messages: list[ai.Message] = []
 
     async def _tap_messages() -> AsyncGenerator[ai.Message]:
+        pinned = False
         async for msg in run_result:
+            # Pin the first yielded message to the original assistant ID so
+            # the SSE StartPart carries the same ID the frontend already has.
+            if not pinned and resume_message_id and msg.role == "assistant":
+                msg = msg.model_copy(update={"id": resume_message_id})
+                pinned = True
             if msg.role == "assistant" and msg.is_done:
                 assistant_messages.append(msg.model_copy(deep=True))
             yield msg
@@ -260,8 +291,10 @@ async def chat(request: ChatRequest) -> fastapi.responses.StreamingResponse:
 
         # Post-stream persistence.
         await _persist_assistant_messages(session_id, assistant_messages)
-        if run_result.checkpoint:
+        if run_result.checkpoint.pending_hooks:
             await db.save_checkpoint(session_id, run_result.checkpoint.model_dump())
+        else:
+            await db.delete_checkpoint(session_id)
         await db.touch_session(session_id)
 
     return fastapi.responses.StreamingResponse(

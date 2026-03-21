@@ -1,5 +1,8 @@
 import { useChat } from "@ai-sdk/react";
-import { DefaultChatTransport } from "ai";
+import {
+  DefaultChatTransport,
+  lastAssistantMessageIsCompleteWithApprovalResponses,
+} from "ai";
 import type { FileUIPart, ToolUIPart, UIMessage } from "ai";
 import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
 
@@ -32,6 +35,14 @@ import {
   PromptInputTextarea,
   usePromptInputAttachments,
 } from "@/components/ai-elements/prompt-input";
+import {
+  Confirmation,
+  ConfirmationAccepted,
+  ConfirmationAction,
+  ConfirmationActions,
+  ConfirmationRejected,
+  ConfirmationRequest,
+} from "@/components/ai-elements/confirmation";
 import {
   Tool,
   ToolContent,
@@ -123,11 +134,14 @@ function ChatView({
     [sessionId],
   );
 
-  const { messages, sendMessage, status, stop } = useChat({
-    transport,
-    messages: initialMessages,
-    onFinish: onFinishReply,
-  });
+  const { messages, sendMessage, status, stop, addToolApprovalResponse } =
+    useChat({
+      transport,
+      messages: initialMessages,
+      onFinish: onFinishReply,
+      sendAutomaticallyWhen:
+        lastAssistantMessageIsCompleteWithApprovalResponses,
+    });
 
   const isStreaming = status === "submitted" || status === "streaming";
 
@@ -172,12 +186,15 @@ function ChatView({
                       part.type.startsWith("tool-")
                     ) {
                       const toolPart = part as ToolUIPart;
+                      const hasApproval = !!toolPart.approval;
                       const isComplete = toolPart.state === "output-available";
+                      const needsApproval =
+                        toolPart.state === "approval-requested";
 
                       return (
                         <Tool
                           key={`${message.id}-${partIndex}`}
-                          defaultOpen={isComplete}
+                          defaultOpen={isComplete || needsApproval}
                         >
                           <ToolHeader
                             type={toolPart.type}
@@ -185,6 +202,46 @@ function ChatView({
                           />
                           <ToolContent>
                             <ToolInput input={toolPart.input} />
+                            {hasApproval && (
+                              <Confirmation
+                                approval={toolPart.approval}
+                                state={toolPart.state}
+                              >
+                                <ConfirmationRequest>
+                                  This tool requires your approval to run.
+                                </ConfirmationRequest>
+                                <ConfirmationAccepted>
+                                  You approved this tool execution.
+                                </ConfirmationAccepted>
+                                <ConfirmationRejected>
+                                  You rejected this tool execution.
+                                </ConfirmationRejected>
+                                <ConfirmationActions>
+                                  <ConfirmationAction
+                                    variant="outline"
+                                    onClick={() =>
+                                      addToolApprovalResponse({
+                                        id: toolPart.approval!.id,
+                                        approved: false,
+                                      })
+                                    }
+                                  >
+                                    Reject
+                                  </ConfirmationAction>
+                                  <ConfirmationAction
+                                    variant="default"
+                                    onClick={() =>
+                                      addToolApprovalResponse({
+                                        id: toolPart.approval!.id,
+                                        approved: true,
+                                      })
+                                    }
+                                  >
+                                    Approve
+                                  </ConfirmationAction>
+                                </ConfirmationActions>
+                              </Confirmation>
+                            )}
                             <ToolOutput
                               output={toolPart.output}
                               errorText={toolPart.errorText}
