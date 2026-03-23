@@ -293,3 +293,9 @@ async def save_checkpoint(session_id: str, data: dict[str, Any]) -> None:
         session_id,
         json.dumps(data),
     )
+
+
+async def delete_checkpoint(session_id: str) -> None:
+    """Remove the checkpoint for a session."""
+    pool = await get_pool()
+    await pool.execute("DELETE FROM checkpoints WHERE session_id = $1", session_id)

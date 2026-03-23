@@ -3,7 +3,7 @@
 - [x] database and chat storage
 - [x] sessions, auto-generated titles
 
-- [ ] tool approval
+- [x] tool approval
 - [ ] steering queue
 - [ ] interruptions
  
