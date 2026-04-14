@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import logging
+from collections import deque
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from typing import Any
 
@@ -133,6 +134,7 @@ class ReplayMiddleware(ai.Middleware):
         self._new_tool_results: list[RecordedToolResult] = []
         self._pending_hooks: dict[str, PendingHookInfo] = {}
         self._last_assistant_message_id: str | None = None
+        self._replayed_outbound_messages: deque[str] = deque()
 
     async def wrap_model(
         self,
@@ -152,6 +154,7 @@ class ReplayMiddleware(ai.Middleware):
                 for message in deserialize_messages(replayed.messages):
                     if message.role == "assistant":
                         self._last_assistant_message_id = message.id
+                    self._replayed_outbound_messages.append(serialize_message_key(message))
                     yield message
 
             return ai.StreamResult.from_generator(_from_replay())
@@ -187,7 +190,9 @@ class ReplayMiddleware(ai.Middleware):
                 replayed.tool_name,
                 self._session_id,
             )
-            return deserialize_message(replayed.message)
+            message = deserialize_message(replayed.message)
+            self._replayed_outbound_messages.append(serialize_message_key(message))
+            return message
 
         message = await next(call)
         self._new_tool_results.append(
@@ -254,6 +259,16 @@ class ReplayMiddleware(ai.Middleware):
             ),
         )
 
+    def consume_replayed_outbound(self, message: ai.Message) -> bool:
+        """Return True when a message belongs to the replayed prefix."""
+        if not self._replayed_outbound_messages:
+            return False
+        key = serialize_message_key(message)
+        if self._replayed_outbound_messages[0] != key:
+            return False
+        self._replayed_outbound_messages.popleft()
+        return True
+
     def _recorded_model_count(self) -> int:
         base = len(self._replay.model_steps) if self._replay is not None else 0
         return base + len(self._new_model_steps)
@@ -291,3 +306,8 @@ class ReplayMiddleware(ai.Middleware):
 
         self._replay_tool_index += 1
         return recorded
+
+
+def serialize_message_key(message: ai.Message) -> str:
+    """Stable key used to match replayed outbound messages in-order."""
+    return json.dumps(serialize_message(message), sort_keys=True, separators=(",", ":"))

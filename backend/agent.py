@@ -132,6 +132,39 @@ async def generate_title(first_message: str) -> str:
 seal = ai.agent(tools=TOOLS)
 
 
+async def _execute_with_approval(tc: ai.ToolCall) -> ai.Message | None:
+    """Resolve one tool approval and execute the tool if approved.
+
+    Returns ``None`` when the approval is still pending and the run should
+    suspend for serverless re-entry.
+    """
+    try:
+        approval: ai.ToolApproval = await ai.hook(
+            make_approval_label(tc.id),
+            payload=ai.ToolApproval,
+            metadata={
+                "session_id": _current_session_id.get(),
+                "tool_name": tc.name,
+                "tool_args": tc.kwargs,
+            },
+            interrupt_loop=True,
+        )
+    except asyncio.CancelledError:
+        return None
+
+    if approval.granted:
+        return await tc()
+
+    return ai.tool_message(
+        ai.tool_result(
+            tc.id,
+            tool_name=tc.name,
+            result="Tool call was denied by the user.",
+            is_error=True,
+        )
+    )
+
+
 @seal.loop
 async def _loop(context: ai.Context) -> AsyncGenerator[ai.Message]:
     """Agent loop with human-in-the-loop tool approval.
@@ -150,29 +183,15 @@ async def _loop(context: ai.Context) -> AsyncGenerator[ai.Message]:
         if not tool_calls:
             return
 
-        # Gate each tool call behind user approval.
-        results = []
-        for tc in tool_calls:
-            approval: ai.ToolApproval = await ai.hook(
-                make_approval_label(tc.id),
-                payload=ai.ToolApproval,
-                metadata={
-                    "session_id": _current_session_id.get(),
-                    "tool_name": tc.name,
-                    "tool_args": tc.kwargs,
-                },
-                interrupt_loop=True,
-            )
-            if approval.granted:
-                results.append(await tc())
-            else:
-                results.append(
-                    ai.tool_result(
-                        tc.id,
-                        tool_name=tc.name,
-                        result="Tool call was denied by the user.",
-                        is_error=True,
-                    )
-                )
+        # Gate tool calls behind concurrent approvals so every pending tool
+        # from the current model step can surface in one round-trip.
+        async with asyncio.TaskGroup() as tg:
+            tasks = [tg.create_task(_execute_with_approval(tc)) for tc in tool_calls]
 
-        yield ai.tool_message(*results)
+        results = [task.result() for task in tasks]
+        completed = [result for result in results if result is not None]
+        if completed:
+            yield ai.tool_message(*completed)
+
+        if any(result is None for result in results):
+            return

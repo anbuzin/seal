@@ -67,6 +67,25 @@ function isKnownPart(p: Record<string, unknown>): boolean {
   return KNOWN_TYPES.has(t) || t.startsWith("tool-");
 }
 
+function normalizePart(
+  part: Record<string, unknown>,
+): Record<string, unknown> | null {
+  if (!isKnownPart(part)) return null;
+
+  if (
+    typeof part.type === "string" &&
+    part.type.startsWith("tool-") &&
+    part.state === "call"
+  ) {
+    return {
+      ...part,
+      state: "input-available",
+    };
+  }
+
+  return part;
+}
+
 /**
  * Fetch messages for a session and convert them to the UIMessage shape
  * that `useChat` expects as `initialMessages`.
@@ -90,7 +109,9 @@ export async function fetchSessionMessages(
     .map((m) => ({
       id: m.id,
       role: m.role as UIMessage["role"],
-      parts: m.parts.filter(isKnownPart) as UIMessage["parts"],
+      parts: m.parts
+        .map(normalizePart)
+        .filter((part): part is Record<string, unknown> => part !== null) as UIMessage["parts"],
       createdAt: new Date(m.createdAt),
     }))
     .filter((m) => m.parts.length > 0);

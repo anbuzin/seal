@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import json
 from collections.abc import AsyncGenerator
 from typing import Any
 
@@ -181,7 +182,7 @@ def _sdk_parts_to_ui_dicts(
                     "type": f"tool-{part.tool_name}",
                     "toolCallId": part.tool_call_id,
                     "toolName": part.tool_name,
-                    "state": "call",
+                    "state": "input-available",
                     "input": part.tool_args,
                 }
             )
@@ -216,15 +217,123 @@ async def _persist_request_messages(
 
 
 async def _persist_assistant_messages(
-    session_id: str, messages: list[ai.Message]
+    rows: list[tuple[str, str, str, list[dict[str, Any]]]]
 ) -> None:
-    """Save completed assistant messages to the DB."""
-    rows: list[tuple[str, str, str, list[dict]]] = []  # type: ignore[type-arg]
-    for msg in messages:
-        ui_parts = _sdk_parts_to_ui_dicts(msg.parts)
-        if ui_parts:
-            rows.append((msg.id, session_id, "assistant", ui_parts))
+    """Save completed assistant UI messages to the DB."""
     await db.save_messages_batch(rows)
+
+
+def _tool_call_id_from_approval_id(approval_id: str) -> str | None:
+    """Extract the tool_call_id from a ToolApproval hook label."""
+    prefix = "approve_"
+    if approval_id.startswith(prefix):
+        return approval_id[len(prefix) :]
+    return None
+
+
+def _normalize_tool_input(raw: str) -> str | dict[str, Any]:
+    """Persist tool input in the UI's accepted string-or-dict shape."""
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return raw
+    return parsed if isinstance(parsed, dict) else raw
+
+
+class _AssistantTurnBuilder:
+    """Accumulate runtime messages into one persisted AI SDK UI assistant turn."""
+
+    def __init__(self, message_id: str | None = None) -> None:
+        self.message_id = message_id
+        self.parts: list[dict[str, Any]] = []
+        self._tool_indexes: dict[str, int] = {}
+
+    def ingest(self, message: ai.Message) -> None:
+        """Consume one runtime message."""
+        if message.role == "assistant" and message.is_done:
+            self._ingest_assistant(message)
+        elif message.role == "tool":
+            self._ingest_tool(message)
+        elif message.role == "signal":
+            self._ingest_signal(message)
+
+    def build_row(
+        self,
+        *,
+        session_id: str,
+    ) -> tuple[str, str, str, list[dict[str, Any]]] | None:
+        """Return one DB row for the assistant turn, if anything was accumulated."""
+        if not self.parts or self.message_id is None:
+            return None
+        return (self.message_id, session_id, "assistant", self.parts)
+
+    def _ingest_assistant(self, message: ai.Message) -> None:
+        if self.message_id is None:
+            self.message_id = message.id
+        for part in message.parts:
+            if isinstance(part, ai.ReasoningPart) and part.text:
+                self.parts.append({"type": "reasoning", "reasoning": part.text})
+            elif isinstance(part, ai.TextPart) and part.text:
+                self.parts.append({"type": "text", "text": part.text})
+            elif isinstance(part, ai.ToolCallPart):
+                if part.tool_call_id in self._tool_indexes:
+                    continue
+                self._tool_indexes[part.tool_call_id] = len(self.parts)
+                self.parts.append(
+                    {
+                        "type": f"tool-{part.tool_name}",
+                        "toolCallId": part.tool_call_id,
+                        "toolName": part.tool_name,
+                        "state": "input-available",
+                        "input": _normalize_tool_input(part.tool_args),
+                    }
+                )
+
+    def _ingest_tool(self, message: ai.Message) -> None:
+        for part in message.parts:
+            if not isinstance(part, ai.ToolResultPart):
+                continue
+            index = self._tool_indexes.get(part.tool_call_id)
+            if index is None:
+                continue
+            tool_part = dict(self.parts[index])
+            if tool_part.get("state") != "output-denied":
+                tool_part["state"] = (
+                    "output-error" if part.is_error else "output-available"
+                )
+            tool_part["output"] = part.result
+            self.parts[index] = tool_part
+
+    def _ingest_signal(self, message: ai.Message) -> None:
+        hook_part = message.get_hook_part()
+        if hook_part is None:
+            return
+        tool_call_id = _tool_call_id_from_approval_id(hook_part.hook_id)
+        if tool_call_id is None:
+            return
+        index = self._tool_indexes.get(tool_call_id)
+        if index is None:
+            return
+
+        tool_part = dict(self.parts[index])
+        if hook_part.status == "pending":
+            tool_part["state"] = "approval-requested"
+            tool_part["approval"] = {"id": hook_part.hook_id}
+        elif hook_part.status == "resolved":
+            resolution = hook_part.resolution or {}
+            tool_part["approval"] = {
+                "id": hook_part.hook_id,
+                "approved": resolution.get("granted"),
+                "reason": resolution.get("reason"),
+            }
+            if resolution.get("granted", False):
+                tool_part["state"] = "approval-responded"
+            else:
+                tool_part["state"] = "output-denied"
+        elif hook_part.status == "cancelled":
+            tool_part["state"] = "output-error"
+            tool_part["errorText"] = "Hook cancelled"
+        self.parts[index] = tool_part
 
 
 # ---------------------------------------------------------------------------
@@ -290,19 +399,28 @@ async def chat(request: ChatRequest) -> fastapi.responses.StreamingResponse:
         middleware=[replay_middleware],
     )
 
-    # Tap the stream to capture completed assistant messages for persistence.
-    assistant_messages: list[ai.Message] = []
+    # Accumulate one persisted UI assistant message for this turn.
+    turn_builder = _AssistantTurnBuilder(message_id=resume_message_id)
 
     async def _tap_messages() -> AsyncGenerator[ai.Message]:
         pinned = False
         async for msg in run_result:
-            # Pin the first yielded message to the original assistant ID so
-            # the SSE StartPart carries the same ID the frontend already has.
-            if not pinned and resume_message_id and msg.role == "assistant":
+            turn_builder.ingest(msg)
+
+            # Replayed prefix reconstructs agent state but should not be
+            # emitted back to the UI; the client already has it locally.
+            if replay_middleware.consume_replayed_outbound(msg):
+                continue
+
+            # Pin the first non-replayed message to the original assistant ID
+            # so resumed tool/result updates stay attached to the same UI turn.
+            if (
+                not pinned
+                and resume_message_id
+                and msg.role in {"assistant", "tool", "signal"}
+            ):
                 msg = msg.model_copy(update={"id": resume_message_id})
                 pinned = True
-            if msg.role == "assistant" and msg.is_done:
-                assistant_messages.append(msg.model_copy(deep=True))
             yield msg
 
     async def stream_response() -> AsyncGenerator[str]:
@@ -316,7 +434,9 @@ async def chat(request: ChatRequest) -> fastapi.responses.StreamingResponse:
                 await db.save_replay(session_id, replay_middleware.build_state())
             else:
                 await db.delete_replay(session_id)
-            await _persist_assistant_messages(session_id, assistant_messages)
+            assistant_row = turn_builder.build_row(session_id=session_id)
+            if assistant_row is not None:
+                await _persist_assistant_messages([assistant_row])
             await db.touch_session(session_id)
         except ReplayMismatchError:
             await db.delete_replay(session_id)
