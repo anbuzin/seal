@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 from collections.abc import AsyncGenerator
 from typing import Any
 
@@ -80,6 +81,26 @@ _TITLE_PROMPT = (
     "the following message. Reply with ONLY the title, no quotes or punctuation."
 )
 
+_current_session_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "seal_current_session_id",
+    default=None,
+)
+
+
+def activate_session(session_id: str) -> contextvars.Token[str | None]:
+    """Bind a session id to the current task for hook namespacing."""
+    return _current_session_id.set(session_id)
+
+
+def deactivate_session(token: contextvars.Token[str | None]) -> None:
+    """Restore the previous session binding."""
+    _current_session_id.reset(token)
+
+
+def make_approval_label(tool_call_id: str) -> str:
+    """Construct a ToolApproval hook label compatible with the UI adapter."""
+    return f"approve_{tool_call_id}"
+
 
 def get_model() -> ai.Model:
     """Create the primary LLM instance."""
@@ -133,9 +154,10 @@ async def _loop(context: ai.Context) -> AsyncGenerator[ai.Message]:
         results = []
         for tc in tool_calls:
             approval: ai.ToolApproval = await ai.hook(
-                f"approve_{tc.id}",
+                make_approval_label(tc.id),
                 payload=ai.ToolApproval,
                 metadata={
+                    "session_id": _current_session_id.get(),
                     "tool_name": tc.name,
                     "tool_args": tc.kwargs,
                 },

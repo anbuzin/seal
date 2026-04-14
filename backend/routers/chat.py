@@ -20,6 +20,7 @@ from vercel.blob import AsyncBlobClient
 
 import agent
 import db
+from replay import ReplayMiddleware, ReplayMismatchError, compute_replay_fingerprint
 
 router = fastapi.APIRouter()
 
@@ -255,6 +256,22 @@ async def chat(request: ChatRequest) -> fastapi.responses.StreamingResponse:
     system = ai.system_message(agent.SYSTEM)
 
     model = agent.get_model()
+    fingerprint = compute_replay_fingerprint(
+        session_id=session_id,
+        system=system,
+        messages=messages,
+        model=model,
+        tools=agent.TOOLS,
+    )
+    saved_replay = await db.get_replay(session_id)
+    replay_middleware = ReplayMiddleware(
+        session_id=session_id,
+        fingerprint=fingerprint,
+        model=model,
+        tools=agent.TOOLS,
+        input_message_count=len(messages) + 1,
+        replay=saved_replay,
+    )
 
     # When resuming from a tool approval round-trip, the frontend already
     # has an assistant message from the first (interrupted) stream. We must
@@ -267,7 +284,11 @@ async def chat(request: ChatRequest) -> fastapi.responses.StreamingResponse:
             resume_message_id = ui_msg.id
             break
 
-    run_result = agent.seal.run(model, [system, *messages])
+    run_result = agent.seal.run(
+        model,
+        [system, *messages],
+        middleware=[replay_middleware],
+    )
 
     # Tap the stream to capture completed assistant messages for persistence.
     assistant_messages: list[ai.Message] = []
@@ -285,12 +306,23 @@ async def chat(request: ChatRequest) -> fastapi.responses.StreamingResponse:
             yield msg
 
     async def stream_response() -> AsyncGenerator[str]:
-        async for chunk in to_sse_stream(_tap_messages()):
-            yield chunk
+        token = agent.activate_session(session_id)
+        try:
+            async for chunk in to_sse_stream(_tap_messages()):
+                yield chunk
 
-        # Post-stream persistence.
-        await _persist_assistant_messages(session_id, assistant_messages)
-        await db.touch_session(session_id)
+            # Post-stream persistence.
+            if replay_middleware.should_persist():
+                await db.save_replay(session_id, replay_middleware.build_state())
+            else:
+                await db.delete_replay(session_id)
+            await _persist_assistant_messages(session_id, assistant_messages)
+            await db.touch_session(session_id)
+        except ReplayMismatchError:
+            await db.delete_replay(session_id)
+            raise
+        finally:
+            agent.deactivate_session(token)
 
     return fastapi.responses.StreamingResponse(
         stream_response(),
