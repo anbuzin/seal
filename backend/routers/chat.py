@@ -98,6 +98,18 @@ class ChatRequest(pydantic.BaseModel):
     session_id: str
 
 
+def _request_has_approval_response(ui_messages: list[UIMessage]) -> bool:
+    """Return True when the request is resuming an approval round-trip."""
+    for message in ui_messages:
+        for part in message.parts:
+            if (
+                hasattr(part, "state")
+                and getattr(part, "state", None) == "approval-responded"
+            ):
+                return True
+    return False
+
+
 def _extract_blob_pathname(url: str) -> str | None:
     """Extract the blob pathname from a proxy URL, or return None."""
     if url.startswith(FILES_PREFIX):
@@ -208,10 +220,16 @@ def _sdk_parts_to_ui_dicts(
 async def _persist_request_messages(
     session_id: str, ui_messages: list[UIMessage]
 ) -> None:
-    """Batch-upsert all incoming UI messages into the DB."""
+    """Batch-upsert incoming client-authored messages into the DB.
+
+    Assistant turns are persisted from the server-side runtime only.  The
+    client's assistant copy may be transient or mid-resume and should not
+    overwrite the canonical stored history.
+    """
     rows: list[tuple[str, str, str, list[dict[str, Any]]]] = [
         (msg.id, session_id, msg.role, _ui_parts_to_dicts(msg.parts))
         for msg in ui_messages
+        if msg.role != "assistant"
     ]
     await db.save_messages_batch(rows)
 
@@ -248,6 +266,22 @@ class _AssistantTurnBuilder:
         self.parts: list[dict[str, Any]] = []
         self._tool_indexes: dict[str, int] = {}
 
+    @classmethod
+    def from_ui_message(cls, message: UIMessage) -> _AssistantTurnBuilder:
+        """Seed the builder from the current assistant UI message on resume."""
+        builder = cls(message_id=message.id)
+        builder.parts = _ui_parts_to_dicts(message.parts)
+        for index, part in enumerate(builder.parts):
+            part_type = part.get("type")
+            tool_call_id = part.get("toolCallId")
+            if (
+                isinstance(part_type, str)
+                and part_type.startswith("tool-")
+                and isinstance(tool_call_id, str)
+            ):
+                builder._tool_indexes[tool_call_id] = index
+        return builder
+
     def ingest(self, message: ai.Message) -> None:
         """Consume one runtime message."""
         if message.role == "assistant" and message.is_done:
@@ -272,9 +306,13 @@ class _AssistantTurnBuilder:
             self.message_id = message.id
         for part in message.parts:
             if isinstance(part, ai.ReasoningPart) and part.text:
-                self.parts.append({"type": "reasoning", "reasoning": part.text})
+                candidate = {"type": "reasoning", "reasoning": part.text}
+                if self.parts[-1:] != [candidate]:
+                    self.parts.append(candidate)
             elif isinstance(part, ai.TextPart) and part.text:
-                self.parts.append({"type": "text", "text": part.text})
+                candidate = {"type": "text", "text": part.text}
+                if self.parts[-1:] != [candidate]:
+                    self.parts.append(candidate)
             elif isinstance(part, ai.ToolCallPart):
                 if part.tool_call_id in self._tool_indexes:
                     continue
@@ -373,6 +411,7 @@ async def chat(request: ChatRequest) -> fastapi.responses.StreamingResponse:
         tools=agent.TOOLS,
     )
     saved_replay = await db.get_replay(session_id)
+    is_resume = _request_has_approval_response(request.messages)
     replay_middleware = ReplayMiddleware(
         session_id=session_id,
         fingerprint=fingerprint,
@@ -388,10 +427,11 @@ async def chat(request: ChatRequest) -> fastapi.responses.StreamingResponse:
     # frontend SDK *replaces* the existing message instead of pushing a
     # duplicate.
     resume_message_id: str | None = None
-    for ui_msg in reversed(request.messages):
-        if ui_msg.role == "assistant":
-            resume_message_id = ui_msg.id
-            break
+    if is_resume:
+        for ui_msg in reversed(request.messages):
+            if ui_msg.role == "assistant":
+                resume_message_id = ui_msg.id
+                break
 
     run_result = agent.seal.run(
         model,
@@ -400,22 +440,34 @@ async def chat(request: ChatRequest) -> fastapi.responses.StreamingResponse:
     )
 
     # Accumulate one persisted UI assistant message for this turn.
-    turn_builder = _AssistantTurnBuilder(message_id=resume_message_id)
+    resume_ui_message: UIMessage | None = None
+    if is_resume:
+        for ui_msg in reversed(request.messages):
+            if ui_msg.role == "assistant":
+                resume_ui_message = ui_msg
+                break
+
+    turn_builder = (
+        _AssistantTurnBuilder.from_ui_message(resume_ui_message)
+        if resume_ui_message is not None
+        else _AssistantTurnBuilder()
+    )
 
     async def _tap_messages() -> AsyncGenerator[ai.Message]:
         pinned = False
         async for msg in run_result:
-            turn_builder.ingest(msg)
-
             # Replayed prefix reconstructs agent state but should not be
             # emitted back to the UI; the client already has it locally.
             if replay_middleware.consume_replayed_outbound(msg):
                 continue
 
+            turn_builder.ingest(msg)
+
             # Pin the first non-replayed message to the original assistant ID
             # so resumed tool/result updates stay attached to the same UI turn.
             if (
                 not pinned
+                and is_resume
                 and resume_message_id
                 and msg.role in {"assistant", "tool", "signal"}
             ):
