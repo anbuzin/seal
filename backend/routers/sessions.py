@@ -53,7 +53,7 @@ async def get_session(session_id: str) -> dict:  # type: ignore[type-arg]
 
 @router.delete("/sessions/{session_id}")
 async def delete_session(session_id: str) -> dict[str, str]:
-    """Delete a session (cascades to messages + checkpoint)."""
+    """Delete a session (cascades to messages)."""
     found = await db.delete_session(session_id)
     if not found:
         raise fastapi.HTTPException(status_code=404, detail="Session not found")

@@ -6,11 +6,16 @@ import base64
 from collections.abc import AsyncGenerator
 from typing import Any
 
+import ai
 import fastapi
 import fastapi.responses
 import pydantic
-import vercel_ai_sdk as ai
-import vercel_ai_sdk.ai_sdk_ui
+from ai.adapters.ai_sdk_ui import (
+    UI_MESSAGE_STREAM_HEADERS,
+    UIMessage,
+    to_messages,
+    to_sse_stream,
+)
 from vercel.blob import AsyncBlobClient
 
 import agent
@@ -87,7 +92,7 @@ async def get_file(pathname: str) -> fastapi.responses.Response:
 class ChatRequest(pydantic.BaseModel):
     """Request body for the chat endpoint."""
 
-    messages: list[ai.ai_sdk_ui.UIMessage]
+    messages: list[UIMessage]
     session_id: str
 
 
@@ -109,7 +114,9 @@ async def _inline_file_parts(
     """
     result: list[ai.Message] = []
     for msg in messages:
-        new_parts: list[ai.core.messages.Part] = []
+        new_parts: list[
+            ai.TextPart | ai.ToolCallPart | ai.ToolResultPart | ai.FilePart | Any
+        ] = []
         for part in msg.parts:
             pathname = (
                 _extract_blob_pathname(part.data)
@@ -154,7 +161,7 @@ def _ui_parts_to_dicts(
 
 
 def _sdk_parts_to_ui_dicts(
-    parts: list[ai.core.messages.Part],
+    parts: list[Any],
 ) -> list[dict]:  # type: ignore[type-arg]
     """Convert internal SDK parts to the UI-compatible dict format.
 
@@ -167,19 +174,24 @@ def _sdk_parts_to_ui_dicts(
         if isinstance(part, ai.TextPart):
             if part.text:
                 result.append({"type": "text", "text": part.text})
-        elif isinstance(part, ai.core.messages.ToolPart):
-            state = {
-                "result": "output-available",
-                "error": "output-error",
-                "pending": "call",
-            }.get(part.status, "call")
+        elif isinstance(part, ai.ToolCallPart):
+            result.append(
+                {
+                    "type": f"tool-{part.tool_name}",
+                    "toolCallId": part.tool_call_id,
+                    "toolName": part.tool_name,
+                    "state": "call",
+                    "input": part.tool_args,
+                }
+            )
+        elif isinstance(part, ai.ToolResultPart):
+            state = "output-error" if part.is_error else "output-available"
             result.append(
                 {
                     "type": f"tool-{part.tool_name}",
                     "toolCallId": part.tool_call_id,
                     "toolName": part.tool_name,
                     "state": state,
-                    "input": part.tool_args,
                     "output": part.result,
                 }
             )
@@ -192,7 +204,7 @@ def _sdk_parts_to_ui_dicts(
 
 
 async def _persist_request_messages(
-    session_id: str, ui_messages: list[ai.ai_sdk_ui.UIMessage]
+    session_id: str, ui_messages: list[UIMessage]
 ) -> None:
     """Batch-upsert all incoming UI messages into the DB."""
     rows: list[tuple[str, str, str, list[dict[str, Any]]]] = [
@@ -233,42 +245,29 @@ async def chat(request: ChatRequest) -> fastapi.responses.StreamingResponse:
     await _persist_request_messages(session_id, request.messages)
 
     # Convert UI messages to SDK messages and inline file parts.
-    messages = ai.ai_sdk_ui.to_messages(request.messages)
+    # NOTE: to_messages() has a side-effect of calling resolve_hook() for
+    # any tool parts in "approval-responded" state. This pre-registers
+    # resolutions so the agent loop can pass through hooks on replay.
+    messages = to_messages(request.messages)
     messages = await _inline_file_parts(messages)
 
     # Prepend the system prompt.
-    system = ai.Message(
-        role="system",
-        parts=[ai.TextPart(text=agent.SYSTEM)],
-    )
+    system = ai.system_message(agent.SYSTEM)
 
-    llm = agent.get_llm()
+    model = agent.get_model()
 
-    # Load checkpoint so we can resume after a tool approval round-trip.
-    checkpoint_data = await db.get_checkpoint(session_id)
-    checkpoint = (
-        ai.Checkpoint.model_validate(checkpoint_data) if checkpoint_data else None
-    )
-
-    # When resuming from a checkpoint, the frontend already has an assistant
-    # message from the first (interrupted) stream.  We must ensure the
-    # resumed stream re-uses that same message ID so the frontend SDK
-    # *replaces* the existing message instead of pushing a duplicate.
+    # When resuming from a tool approval round-trip, the frontend already
+    # has an assistant message from the first (interrupted) stream. We must
+    # ensure the resumed stream re-uses that same message ID so the
+    # frontend SDK *replaces* the existing message instead of pushing a
+    # duplicate.
     resume_message_id: str | None = None
-    if checkpoint is not None:
-        for ui_msg in reversed(request.messages):
-            if ui_msg.role == "assistant":
-                resume_message_id = ui_msg.id
-                break
+    for ui_msg in reversed(request.messages):
+        if ui_msg.role == "assistant":
+            resume_message_id = ui_msg.id
+            break
 
-    run_result = ai.run(
-        agent.graph,
-        llm,
-        [system, *messages],
-        agent.TOOLS,
-        checkpoint=checkpoint,
-        cancel_on_hooks=True,
-    )
+    run_result = agent.seal.run(model, [system, *messages])
 
     # Tap the stream to capture completed assistant messages for persistence.
     assistant_messages: list[ai.Message] = []
@@ -286,18 +285,14 @@ async def chat(request: ChatRequest) -> fastapi.responses.StreamingResponse:
             yield msg
 
     async def stream_response() -> AsyncGenerator[str]:
-        async for chunk in ai.ai_sdk_ui.to_sse_stream(_tap_messages()):
+        async for chunk in to_sse_stream(_tap_messages()):
             yield chunk
 
         # Post-stream persistence.
         await _persist_assistant_messages(session_id, assistant_messages)
-        if run_result.checkpoint.pending_hooks:
-            await db.save_checkpoint(session_id, run_result.checkpoint.model_dump())
-        else:
-            await db.delete_checkpoint(session_id)
         await db.touch_session(session_id)
 
     return fastapi.responses.StreamingResponse(
         stream_response(),
-        headers=ai.ai_sdk_ui.UI_MESSAGE_STREAM_HEADERS,
+        headers=UI_MESSAGE_STREAM_HEADERS,
     )
