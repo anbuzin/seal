@@ -121,7 +121,7 @@ requires-dist = [
     { name = "asyncpg", specifier = ">=0.29.0" },
     { name = "fastapi", extras = ["standard"], specifier = ">=0.115.0" },
     { name = "vercel", specifier = ">=0.5.1" },
-    { name = "vercel-ai-sdk", editable = "../../py-ai" },
+    { name = "vercel-ai-sdk", specifier = ">=0.0.1.dev10" },
 ]
 
 [package.metadata.requires-dev]
@@ -1470,7 +1470,7 @@ wheels = [
 [[package]]
 name = "vercel-ai-sdk"
 version = "0.0.1.dev10"
-source = { editable = "../../py-ai" }
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anthropic" },
     { name = "httpx" },
@@ -1479,26 +1479,9 @@ dependencies = [
     { name = "pydantic" },
     { name = "vercel" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "anthropic", specifier = ">=0.83.0" },
-    { name = "httpx", specifier = ">=0.28.1" },
-    { name = "mcp", specifier = ">=1.18.0" },
-    { name = "openai", specifier = ">=2.14.0" },
-    { name = "pydantic", specifier = ">=2.12.5" },
-    { name = "vercel", specifier = ">=0.3.8" },
-]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "mypy", specifier = ">=1.11" },
-    { name = "pyright", specifier = ">=1.1.408" },
-    { name = "pytest", specifier = ">=8.0" },
-    { name = "pytest-asyncio", specifier = ">=0.24" },
-    { name = "python-dotenv", specifier = ">=1.2.1" },
-    { name = "rich", specifier = ">=14.2.0" },
-    { name = "ruff", specifier = ">=0.8" },
+sdist = { url = "https://files.pythonhosted.org/packages/7c/f4/058b2d8b6c9e347b953af92b5aabc32a29fa5bd42d4baaa6d4ab5b869671/vercel_ai_sdk-0.0.1.dev10.tar.gz", hash = "sha256:c60cc9a57a38000de41875ab240ec401b945f49ac3bb0cc5b503786b86168fd3", size = 54869, upload-time = "2026-04-13T22:12:02.216Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/e9/1d/3d264609a8e40b6ea1aed46e48e80c45e80bba9e06dbae592d51288fc97f/vercel_ai_sdk-0.0.1.dev10-py3-none-any.whl", hash = "sha256:d86e38b2ef2234f962c2feb4caec1995d252df035238b8fd3b7bc3dbc043d47a", size = 74718, upload-time = "2026-04-13T22:12:00.562Z" },
 ]
 
 [[package]]

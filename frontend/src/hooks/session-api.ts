@@ -72,15 +72,28 @@ function normalizePart(
 ): Record<string, unknown> | null {
   if (!isKnownPart(part)) return null;
 
-  if (
-    typeof part.type === "string" &&
-    part.type.startsWith("tool-") &&
-    part.state === "call"
-  ) {
-    return {
-      ...part,
-      state: "input-available",
-    };
+  if (typeof part.type === "string" && part.type.startsWith("tool-")) {
+    if (part.output !== undefined) {
+      return {
+        ...part,
+        state:
+          part.state === "output-error" || typeof part.errorText === "string"
+            ? "output-error"
+            : part.state === "output-denied" ||
+                (typeof part.approval === "object" &&
+                  part.approval !== null &&
+                  (part.approval as { approved?: unknown }).approved === false)
+              ? "output-denied"
+              : "output-available",
+      };
+    }
+
+    if (part.state === "call") {
+      return {
+        ...part,
+        state: "input-available",
+      };
+    }
   }
 
   return part;
@@ -111,7 +124,9 @@ export async function fetchSessionMessages(
       role: m.role as UIMessage["role"],
       parts: m.parts
         .map(normalizePart)
-        .filter((part): part is Record<string, unknown> => part !== null) as UIMessage["parts"],
+        .filter(
+          (part): part is Record<string, unknown> => part !== null,
+        ) as UIMessage["parts"],
       createdAt: new Date(m.createdAt),
     }))
     .filter((m) => m.parts.length > 0);

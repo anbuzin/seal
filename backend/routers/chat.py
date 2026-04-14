@@ -98,6 +98,44 @@ class ChatRequest(pydantic.BaseModel):
     session_id: str
 
 
+def _normalize_request_messages(ui_messages: list[UIMessage]) -> list[UIMessage]:
+    """Heal stale tool-part states from previously persisted assistant history."""
+    normalized: list[UIMessage] = []
+    for message in ui_messages:
+        new_parts = []
+        changed = False
+        for part in message.parts:
+            part_type = getattr(part, "type", None)
+            state = getattr(part, "state", None)
+            if isinstance(part_type, str) and part_type.startswith("tool-"):
+                output = getattr(part, "output", None)
+                approval = getattr(part, "approval", None)
+                approved = approval.approved if approval is not None else None
+                error_text = getattr(part, "error_text", None)
+
+                next_state = state
+                if output is not None:
+                    if state == "output-error" or error_text is not None:
+                        next_state = "output-error"
+                    elif state == "output-denied" or approved is False:
+                        next_state = "output-denied"
+                    else:
+                        next_state = "output-available"
+                elif state == "call":
+                    next_state = "input-available"
+
+                if next_state != state:
+                    part = part.model_copy(update={"state": next_state})
+                    changed = True
+
+            new_parts.append(part)
+
+        normalized.append(
+            message.model_copy(update={"parts": new_parts}) if changed else message
+        )
+    return normalized
+
+
 def _request_has_approval_response(ui_messages: list[UIMessage]) -> bool:
     """Return True when the request is resuming an approval round-trip."""
     for message in ui_messages:
@@ -235,7 +273,7 @@ async def _persist_request_messages(
 
 
 async def _persist_assistant_messages(
-    rows: list[tuple[str, str, str, list[dict[str, Any]]]]
+    rows: list[tuple[str, str, str, list[dict[str, Any]]]],
 ) -> None:
     """Save completed assistant UI messages to the DB."""
     await db.save_messages_batch(rows)
@@ -390,13 +428,14 @@ async def chat(request: ChatRequest) -> fastapi.responses.StreamingResponse:
         await db.create_session(session_id)
 
     # Batch-upsert all incoming messages.
-    await _persist_request_messages(session_id, request.messages)
+    normalized_request_messages = _normalize_request_messages(request.messages)
+    await _persist_request_messages(session_id, normalized_request_messages)
 
     # Convert UI messages to SDK messages and inline file parts.
     # NOTE: to_messages() has a side-effect of calling resolve_hook() for
     # any tool parts in "approval-responded" state. This pre-registers
     # resolutions so the agent loop can pass through hooks on replay.
-    messages = to_messages(request.messages)
+    messages = to_messages(normalized_request_messages)
     messages = await _inline_file_parts(messages)
 
     # Prepend the system prompt.
@@ -411,7 +450,7 @@ async def chat(request: ChatRequest) -> fastapi.responses.StreamingResponse:
         tools=agent.TOOLS,
     )
     saved_replay = await db.get_replay(session_id)
-    is_resume = _request_has_approval_response(request.messages)
+    is_resume = _request_has_approval_response(normalized_request_messages)
     replay_middleware = ReplayMiddleware(
         session_id=session_id,
         fingerprint=fingerprint,
@@ -428,7 +467,7 @@ async def chat(request: ChatRequest) -> fastapi.responses.StreamingResponse:
     # duplicate.
     resume_message_id: str | None = None
     if is_resume:
-        for ui_msg in reversed(request.messages):
+        for ui_msg in reversed(normalized_request_messages):
             if ui_msg.role == "assistant":
                 resume_message_id = ui_msg.id
                 break
@@ -442,7 +481,7 @@ async def chat(request: ChatRequest) -> fastapi.responses.StreamingResponse:
     # Accumulate one persisted UI assistant message for this turn.
     resume_ui_message: UIMessage | None = None
     if is_resume:
-        for ui_msg in reversed(request.messages):
+        for ui_msg in reversed(normalized_request_messages):
             if ui_msg.role == "assistant":
                 resume_ui_message = ui_msg
                 break

@@ -154,7 +154,9 @@ class ReplayMiddleware(ai.Middleware):
                 for message in deserialize_messages(replayed.messages):
                     if message.role == "assistant":
                         self._last_assistant_message_id = message.id
-                    self._replayed_outbound_messages.append(serialize_message_key(message))
+                    self._replayed_outbound_messages.append(
+                        serialize_message_key(message)
+                    )
                     yield message
 
             return ai.StreamResult.from_generator(_from_replay())
