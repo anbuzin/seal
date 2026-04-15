@@ -1,12 +1,14 @@
-"""Agent graph and tool definitions."""
+"""Agent definition and tool declarations."""
 
 from __future__ import annotations
 
 import asyncio
+import contextvars
+from collections.abc import AsyncGenerator
 from typing import Any
 
+import ai
 import httpx
-import vercel_ai_sdk as ai
 
 
 @ai.tool
@@ -74,74 +76,122 @@ SYSTEM = """You are a helpful assistant with access to a bash shell and the inte
 
 TOOLS: list[ai.Tool[..., Any]] = [bash, web_fetch]
 
-
 _TITLE_PROMPT = (
     "Generate a concise 3-6 word title for a conversation that starts with "
     "the following message. Reply with ONLY the title, no quotes or punctuation."
 )
 
+_current_session_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "seal_current_session_id",
+    default=None,
+)
 
-def get_llm() -> ai.LanguageModel:
-    """Create the LLM instance."""
-    return ai.ai_gateway.GatewayModel(model="anthropic/claude-opus-4.6")
+
+def activate_session(session_id: str) -> contextvars.Token[str | None]:
+    """Bind a session id to the current task for hook namespacing."""
+    return _current_session_id.set(session_id)
 
 
-def _get_fast_llm() -> ai.LanguageModel:
+def deactivate_session(token: contextvars.Token[str | None]) -> None:
+    """Restore the previous session binding."""
+    _current_session_id.reset(token)
+
+
+def make_approval_label(tool_call_id: str) -> str:
+    """Construct a ToolApproval hook label compatible with the UI adapter."""
+    return f"approve_{tool_call_id}"
+
+
+def get_model() -> ai.Model:
+    """Create the primary LLM instance."""
+    return ai.ai_gateway("anthropic/claude-opus-4.6")
+
+
+def _get_fast_model() -> ai.Model:
     """Cheap / fast model for lightweight tasks like title generation."""
-    return ai.ai_gateway.GatewayModel(model="anthropic/claude-sonnet-4-20250514")
+    return ai.ai_gateway("anthropic/claude-sonnet-4-20250514")
 
 
 async def generate_title(first_message: str) -> str:
     """Generate a short title for a session using a cheap LLM call."""
-    llm = _get_fast_llm()
-    msg = await llm.buffer(
-        messages=ai.make_messages(system=_TITLE_PROMPT, user=first_message),
-    )
-    return msg.text.strip()
+    model = _get_fast_model()
+    messages = [
+        ai.system_message(_TITLE_PROMPT),
+        ai.user_message(first_message),
+    ]
+    stream = await ai.stream(model, messages)
+    async for _ in stream:
+        pass
+    return stream.text.strip()
 
 
-async def _execute_with_approval(
-    tc: ai.ToolPart, message: ai.Message | None = None
-) -> None:
-    """Gate a single tool call behind user approval.
+# ---------------------------------------------------------------------------
+# Agent with human-in-the-loop tool approval
+# ---------------------------------------------------------------------------
 
-    Creates a ``ToolApproval`` hook that suspends execution until the
-    frontend responds with an approve/reject decision.
+seal = ai.agent(tools=TOOLS)
+
+
+async def _execute_with_approval(tc: ai.ToolCall) -> ai.Message | None:
+    """Resolve one tool approval and execute the tool if approved.
+
+    Returns ``None`` when the approval is still pending and the run should
+    suspend for serverless re-entry.
     """
-    approval = await ai.ToolApproval.create(  # type: ignore[attr-defined]
-        f"approve_{tc.tool_call_id}",
-        metadata={"tool_name": tc.tool_name, "tool_args": tc.tool_args},
-    )
+    try:
+        approval: ai.ToolApproval = await ai.hook(
+            make_approval_label(tc.id),
+            payload=ai.ToolApproval,
+            metadata={
+                "session_id": _current_session_id.get(),
+                "tool_name": tc.name,
+                "tool_args": tc.kwargs,
+            },
+            interrupt_loop=True,
+        )
+    except asyncio.CancelledError:
+        return None
+
     if approval.granted:
-        await ai.execute_tool(tc, message=message)
-    else:
-        tc.set_error("Tool call was denied by the user.")
+        return await tc()
+
+    return ai.tool_message(
+        ai.tool_result(
+            tc.id,
+            tool_name=tc.name,
+            result="Tool call was denied by the user.",
+            is_error=True,
+        )
+    )
 
 
-async def graph(
-    llm: ai.LanguageModel,
-    messages: list[ai.Message],
-    tools: list[ai.Tool[..., Any]],
-) -> ai.StreamResult:
-    """Agent graph with human-in-the-loop tool approval.
+@seal.loop
+async def _loop(context: ai.Context) -> AsyncGenerator[ai.Message]:
+    """Agent loop with human-in-the-loop tool approval.
 
     Loops: stream LLM -> request approval -> execute tools -> repeat.
-    The ToolApproval hook suspends execution and emits an approval-
-    request event on the SSE stream.  The frontend displays Approve /
-    Reject buttons and sends the decision back on the next request.
+    The hook suspends execution and emits an approval-request event on
+    the SSE stream. The frontend displays Approve / Reject buttons and
+    sends the decision back on the next request.
     """
-    local_messages = list(messages)
-
     while True:
-        result = await ai.stream_step(llm, local_messages, tools)
+        stream = await ai.stream(context.model, context.messages, tools=context.tools)
+        async for msg in stream:
+            yield msg
 
-        if not result.tool_calls:
-            return result
+        tool_calls = context.resolve(stream.tool_calls)
+        if not tool_calls:
+            return
 
-        last_msg = result.last_message
-        assert last_msg is not None
-        local_messages.append(last_msg)
+        # Gate tool calls behind concurrent approvals so every pending tool
+        # from the current model step can surface in one round-trip.
+        async with asyncio.TaskGroup() as tg:
+            tasks = [tg.create_task(_execute_with_approval(tc)) for tc in tool_calls]
 
-        await asyncio.gather(
-            *(_execute_with_approval(tc, message=last_msg) for tc in result.tool_calls)
-        )
+        results = [task.result() for task in tasks]
+        completed = [result for result in results if result is not None]
+        if completed:
+            yield ai.tool_message(*completed)
+
+        if any(result is None for result in results):
+            return

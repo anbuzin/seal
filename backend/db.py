@@ -1,9 +1,9 @@
 """
 Neon PostgreSQL storage layer.
 
-Manages a shared asyncpg pool and exposes async functions for sessions,
-messages, and checkpoints.  All IDs are plain text (nanoid-style) so
-they round-trip cleanly with the AI SDK frontend.
+Manages a shared asyncpg pool and exposes async functions for sessions
+and messages.  All IDs are plain text (nanoid-style) so they round-trip
+cleanly with the AI SDK frontend.
 """
 
 from __future__ import annotations
@@ -14,6 +14,8 @@ from typing import Any
 
 import asyncpg  # type: ignore[import-untyped]
 import pydantic
+
+from replay_types import ReplayState
 
 # ---------------------------------------------------------------------------
 # Schema (inlined so the backend has no runtime dependency on repo layout)
@@ -38,11 +40,13 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE INDEX IF NOT EXISTS idx_messages_session
     ON messages(session_id, created_at);
 
-CREATE TABLE IF NOT EXISTS checkpoints (
+CREATE TABLE IF NOT EXISTS session_replays (
     session_id  TEXT PRIMARY KEY REFERENCES sessions(id) ON DELETE CASCADE,
-    data        JSONB NOT NULL,
+    payload     JSONB NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
 """
 
 # ---------------------------------------------------------------------------
@@ -181,7 +185,7 @@ async def update_session_title(session_id: str, title: str) -> Session | None:
 
 
 async def delete_session(session_id: str) -> bool:
-    """Delete a session (messages + checkpoint cascade). Return True if found."""
+    """Delete a session (messages cascade). Return True if found."""
     pool = await get_pool()
     result = await pool.execute("DELETE FROM sessions WHERE id = $1", session_id)
     return bool(result == "DELETE 1")
@@ -266,36 +270,39 @@ async def save_messages_batch(
 
 
 # ---------------------------------------------------------------------------
-# Checkpoints
+# Replay state
 # ---------------------------------------------------------------------------
 
 
-async def get_checkpoint(session_id: str) -> dict[str, Any] | None:
-    """Return the checkpoint data dict, or ``None``."""
+async def get_replay(session_id: str) -> ReplayState | None:
+    """Return persisted replay state for a session, if any."""
     pool = await get_pool()
     row = await pool.fetchrow(
-        "SELECT data FROM checkpoints WHERE session_id = $1", session_id
+        "SELECT payload FROM session_replays WHERE session_id = $1",
+        session_id,
     )
-    if row is None:
+    if not row:
         return None
-    data = row["data"]
-    return json.loads(data) if isinstance(data, str) else data  # type: ignore[no-any-return]
+    payload = _parse_jsonb(row["payload"])
+    return ReplayState.model_validate(payload)
 
 
-async def save_checkpoint(session_id: str, data: dict[str, Any]) -> None:
-    """Upsert the checkpoint for a session (one per session)."""
+async def save_replay(session_id: str, replay: ReplayState) -> None:
+    """Upsert replay state for a session."""
     pool = await get_pool()
     await pool.execute(
-        "INSERT INTO checkpoints (session_id, data) "
-        "VALUES ($1, $2::jsonb) "
-        "ON CONFLICT (session_id) "
-        "DO UPDATE SET data = EXCLUDED.data, updated_at = now()",
+        "INSERT INTO session_replays (session_id, payload) VALUES ($1, $2::jsonb) "
+        "ON CONFLICT (session_id) DO UPDATE "
+        "SET payload = EXCLUDED.payload, updated_at = now()",
         session_id,
-        json.dumps(data),
+        json.dumps(replay.model_dump(mode="json")),
     )
 
 
-async def delete_checkpoint(session_id: str) -> None:
-    """Remove the checkpoint for a session."""
+async def delete_replay(session_id: str) -> None:
+    """Delete replay state for a session."""
     pool = await get_pool()
-    await pool.execute("DELETE FROM checkpoints WHERE session_id = $1", session_id)
+    await pool.execute(
+        "DELETE FROM session_replays WHERE session_id = $1",
+        session_id,
+    )

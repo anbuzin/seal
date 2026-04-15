@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "skills": {
+    "ai": {
+      "source": "vercel-labs/py-ai",
+      "sourceType": "github",
+      "computedHash": "03e5b64beb2c6ae374430ef904f2cd7d0358a5f9115ea37a9ff3570edf37dfab"
+    }
+  }
+}
