@@ -263,6 +263,57 @@ async def test_approval_resume_continuation_opens_id_less() -> None:
     assert any(p.get("type") == "text-delta" for p in payloads)
 
 
+async def test_to_sse_ends_the_connection_on_reload_requested() -> None:
+    # a retried llm_step wipes its own aborted attempt's events and asks the
+    # client to reconnect. The adapter (`_StreamState`) is stateful across
+    # this whole connection -- e.g. it never closes a tool-call block it
+    # already opened -- so folding whatever the retry writes next into this
+    # same connection would leave the aborted attempt's tool call dangling
+    # open forever. The connection must end at the reload signal instead;
+    # events written after it (simulating the retry) must not reach it.
+    await _write(
+        "s1",
+        stream.session_started(),
+        stream.turn_started(turn_index=0),
+        events_.StreamStart(),
+        events_.ToolStart(tool_call_id="tc-aborted", tool_name="bash"),
+        stream.reload_requested(),
+        events_.ToolStart(tool_call_id="tc-retry", tool_name="bash"),
+    )
+    lines = await _collect_sse("s1")
+
+    payloads = _sse_payloads(lines)
+    assert any(p.get("type") == "data-reload" for p in payloads)
+    tool_starts = [p for p in payloads if p.get("type") == "tool-input-start"]
+    assert [p["toolCallId"] for p in tool_starts] == ["tc-aborted"]
+    assert "[DONE]" in lines[-1]
+
+
+async def test_to_sse_skips_a_reload_marker_seen_before_streaming_anything() -> None:
+    # a ``reload.requested`` event is a permanent stream entry, not a one-shot
+    # signal -- a fresh connection (e.g. the reconnect the marker itself
+    # triggered) replaying history lands on it too. If it hasn't forwarded any
+    # of the wiped attempt's output itself, there's nothing of its own to
+    # discard: it must read straight through, not bounce into another reload
+    # (an unconditional end-on-sight here is an infinite reconnect loop).
+    await _write(
+        "s1",
+        stream.session_started(),
+        stream.turn_started(turn_index=0),
+        stream.reload_requested(),
+        *_text_events("done"),
+        stream.turn_completed(turn_index=0, kind="suspend"),
+        stream.session_waiting(turn_index=0),
+    )
+    lines = await _collect_sse("s1")
+
+    payloads = _sse_payloads(lines)
+    assert not any(p.get("type") == "data-reload" for p in payloads)
+    deltas = [p for p in payloads if p.get("type") == "text-delta"]
+    assert [delta["delta"] for delta in deltas] == ["done"]
+    assert "[DONE]" in lines[-1]
+
+
 async def test_to_sse_interleaves_live_subagent_progress() -> None:
     child_id = "s1:child:tc-1"
     child_message = ai.messages.Message(

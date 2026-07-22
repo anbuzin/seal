@@ -21,7 +21,7 @@ SUBAGENT_SYSTEM_PROMPT = (
 )
 
 
-@workflow.step(max_retries=0)
+@workflow.step
 async def llm_step(
     model_id: str,
     messages_data: list[dict[str, object]],
@@ -36,7 +36,12 @@ async def llm_step(
     tools = [ai.Tool.model_validate(tool) for tool in tools_data]
 
     writer = await stream.get_writable(session_id) if session_id else None
-    message: ai.messages.Message | None = None
+    metadata = vercel.workflow.get_step_metadata()
+
+    # On a retry, emit a message requesting a reload. The will trigger
+    # the client to drop everything from the last step.
+    if writer is not None and metadata.attempt > 1:
+        await writer.write(stream.reload_requested())
 
     # parent this step's spans under the turn's span
     turn_span = (
@@ -51,17 +56,11 @@ async def llm_step(
         async for e in model_stream:
             if writer is not None and not e.replay:
                 await writer.write(e)
-            if isinstance(e, ai.events.StreamEnd):
-                message = e.message
 
-        if message is None:
-            message = model_stream.message
-
-    assert message is not None
-    return message.model_dump(mode="json")
+    return model_stream.message.model_dump(mode="json")
 
 
-@workflow.step(max_retries=0)
+@workflow.step
 async def write_event(
     # writes one stream event (agent or lifecycle) to the durable stream
     session_id: str,
@@ -72,7 +71,7 @@ async def write_event(
 
 
 # closes a durable event stream once the owning session is terminal.
-@workflow.step(max_retries=0)
+@workflow.step
 async def close_stream(session_id: str) -> None:
     writer = await stream.get_writable(session_id)
     await writer.close()
@@ -109,7 +108,7 @@ bash_ungated = dataclasses.replace(
 
 
 @ai.tool
-@workflow.step(max_retries=0)
+@workflow.step
 async def web_fetch(
     url: str,
     method: str = "GET",
@@ -287,13 +286,13 @@ class DurableAgent(ai.Agent):
                 context.add(tool_message)
 
 
-@workflow.step(max_retries=0)
+@workflow.step
 async def ship_spans(spans_data: list[dict[str, Any]]) -> None:
     # re-deliver spans collected in the workflow body to the real adapters.
     await ai.experimental_telemetry.push_all(spans_data)
 
 
-@workflow.step(max_retries=0)
+@workflow.step
 async def resume_turn_hook(token: str, output_data: dict[str, Any]) -> None:
     # resume() is a side effect, so it must run in a step. the driver may not
     # have parked on the hook yet, so retry while it is missing.
