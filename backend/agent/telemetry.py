@@ -7,6 +7,7 @@ off by default and follows ``OTEL_INSTRUMENTATION_GENAI_CAPTURE_MESSAGE_CONTENT`
 
 import os
 
+import ai.experimental_telemetry
 import ai.experimental_telemetry.otel as otel_adapter
 import opentelemetry.exporter.otlp.proto.http.trace_exporter as otlp
 import opentelemetry.sdk.resources as resources
@@ -26,4 +27,6 @@ def install(service: str) -> otel_adapter.OtelAdapter | None:
         resource=resources.Resource.create({"service.name": service})
     )
     provider.add_span_processor(sdk_export.BatchSpanProcessor(otlp.OTLPSpanExporter()))
-    return otel_adapter.install(tracer_provider=provider)
+    adapter = otel_adapter.OtelAdapter(tracer_provider=provider)
+    ai.experimental_telemetry.register(adapter)
+    return adapter

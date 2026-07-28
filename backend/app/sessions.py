@@ -235,15 +235,15 @@ async def generate_title(session_id: str, first_message: str) -> str:
     # the named root span keeps this call out of the trace list as an
     # anonymous chat and groups it with its session (``session.id``).
     async with (
-        ai.experimental_telemetry.span(
-            "generate_title",
+        ai.experimental_telemetry.span("generate_title") as sp,
+        ai.stream(ai.get_model(_TITLE_MODEL), messages) as stream,
+    ):
+        sp.set_attrs(
             {
                 "session.id": session_id,
                 "openinference.span.kind": "CHAIN",
-            },
-        ),
-        ai.stream(ai.get_model(_TITLE_MODEL), messages) as stream,
-    ):
+            }
+        )
         async for _ in stream:
             pass
         return stream.text.strip()

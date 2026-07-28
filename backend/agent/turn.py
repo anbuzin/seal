@@ -148,7 +148,7 @@ async def spawn_subagent_turn(
 ) -> dict[str, object]:
     # a subagent is just one ungated turn writing to its own stream. its span
     payload = dict(turn_input)
-    if ai.experimental_telemetry.enabled():
+    if ai.experimental_telemetry.is_enabled():
         # create and nest the span for the subagent turn
         parent = (
             ai.experimental_telemetry.Span.model_validate(parent_span_data)
@@ -156,10 +156,9 @@ async def spawn_subagent_turn(
             else None
         )
         turn_span = ai.experimental_telemetry.create_span(
-            "turn",
-            {"openinference.span.kind": "AGENT"},
-            parent=parent,
+            "turn", parent=parent
         ).stamp_start()
+        turn_span.set_attrs({"openinference.span.kind": "AGENT"})
         payload["turn_span"] = turn_span.model_dump(mode="json")
     started = await vercel.workflow.start(run_turn, payload)
     return {"run_id": started.run_id}
@@ -315,7 +314,7 @@ async def resume_turn_hook(
             else None
         )
         if span_attributes:
-            turn_span.set(span_attributes)
+            turn_span.set_attrs(span_attributes)
         await turn_span.push()
 
     # the driver may not have parked on the hook yet, so retry while it is
@@ -337,7 +336,7 @@ async def resume_turn_hook(
 # stable across replay. ``vercel.workflow.random`` is a factory resolved on
 # entry (only valid inside the workflow).
 @ai.messages.use_random(vercel.workflow.random)
-@ai.experimental_telemetry.use_clock(vercel.workflow.time_ns)
+@ai.experimental_telemetry.use_time(vercel.workflow.time_ns)
 async def run_turn(turn_input: dict[str, Any]) -> None:
     _turn_input = proto.TurnInput.model_validate(turn_input)
     messages = _turn_input.messages
@@ -370,7 +369,7 @@ async def run_turn(turn_input: dict[str, Any]) -> None:
     # collect spans that happen inside the workflow body, and send them
     # once in a separate step.
     collector = (
-        ai.experimental_telemetry.Collector()
+        ai.experimental_telemetry.DictSink()
         if _turn_input.turn_span is not None
         else None
     )
@@ -428,7 +427,7 @@ async def run_turn(turn_input: dict[str, Any]) -> None:
     # deliver the body's collected spans. only complete records ship: a span
     # still open here would dangle in the shipping process's adapter.
     if collector is not None:
-        finished = [s.model_dump(mode="json") for s in collector.finished]
+        finished = [s.model_dump(mode="json") for s in collector.finished_spans]
         if finished:
             await ship_spans(finished)
 
