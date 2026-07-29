@@ -21,10 +21,12 @@ import path from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { Chat } from "@ai-sdk/react";
-import { DefaultChatTransport, UI_MESSAGE_STREAM_HEADERS } from "ai";
+import {
+  DefaultChatTransport,
+  UI_MESSAGE_STREAM_HEADERS,
+  lastAssistantMessageIsCompleteWithApprovalResponses,
+} from "ai";
 import type { UIMessage } from "ai";
-
-import { lastAssistantMessageIsCompleteWithSealApprovals } from "../src/lib/approvals";
 
 const FIXTURES = path.resolve(__dirname, "../../common_fixtures");
 const UPDATE = !!process.env.UPDATE_FIXTURES;
@@ -153,7 +155,7 @@ function makeChat(scenario: string, seed?: UIMessage[]) {
     id: "s1",
     messages: seed ?? [],
     generateId: () => `msg_${(counter++).toString(16).padStart(12, "0")}`,
-    sendAutomaticallyWhen: lastAssistantMessageIsCompleteWithSealApprovals,
+    sendAutomaticallyWhen: lastAssistantMessageIsCompleteWithApprovalResponses,
     transport: new DefaultChatTransport({
       api: "/api/chat",
       fetch: fetchStub,

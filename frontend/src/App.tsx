@@ -1,5 +1,10 @@
 import { useChat } from "@ai-sdk/react";
-import { DefaultChatTransport, getToolName, isToolUIPart } from "ai";
+import {
+  DefaultChatTransport,
+  getToolName,
+  isToolUIPart,
+  lastAssistantMessageIsCompleteWithApprovalResponses,
+} from "ai";
 import type {
   ChatAddToolApproveResponseFunction,
   UIDataTypes,
@@ -10,8 +15,6 @@ import type {
 import type { FileUIPart } from "ai";
 import { Fragment, useCallback, useEffect, useMemo, useState } from "react";
 import type { ReactNode } from "react";
-
-import { lastAssistantMessageIsCompleteWithSealApprovals } from "@/lib/approvals";
 
 import {
   Attachment,
@@ -316,7 +319,8 @@ function ChatView({
       messages: initialMessages,
       resume: true,
       onFinish: onFinishReply,
-      sendAutomaticallyWhen: lastAssistantMessageIsCompleteWithSealApprovals,
+      sendAutomaticallyWhen:
+        lastAssistantMessageIsCompleteWithApprovalResponses,
     });
 
   const isStreaming = status === "submitted" || status === "streaming";
