@@ -38,7 +38,11 @@ data: {"toolCallId": "tc-sb", "output": {"id": "msg_af657876e63b", "role": "assi
 
 data: {"toolCallId": "tc-sa", "output": {"id": "msg_b00478d372db", "role": "assistant", "metadata": {"aiPython": {"sourceMessages": [{"id": "msg_b00478d372db", "role": "assistant", "turnId": null, "partIds": ["text-0"]}]}}, "parts": [{"type": "text", "text": "alpha report", "state": null, "provider_metadata": null}]}, "type": "tool-output-available"}
 
-data: {"toolCallId": "tc-sb", "output": {"id": "msg_af657876e63b", "role": "assistant", "metadata": {"aiPython": {"sourceMessages": [{"id": "msg_af657876e63b", "role": "assistant", "turnId": null, "partIds": ["text-0"]}]}}, "parts": [{"type": "text", "text": "beta report", "state": null, "provider_metadata": null}]}, "type": "tool-output-available"}
+data: {"toolCallId": "tc-sb", "output": {"id": "msg_51e28f79d13c", "role": "assistant", "metadata": {"aiPython": {"sourceMessages": [{"id": "msg_51e28f79d13c", "role": "assistant", "turnId": null, "partIds": ["text-0"]}]}}, "parts": [{"type": "text", "text": "beta report", "state": null, "provider_metadata": null}]}, "type": "tool-output-available"}
+
+data: {"type": "finish-step"}
+
+data: {"type": "start-step"}
 
 data: {"id": "text-0", "type": "text-start"}
 
