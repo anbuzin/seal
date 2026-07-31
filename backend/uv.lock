@@ -16,7 +16,7 @@ vercel-cache = false
 
 [[package]]
 name = "ai"
-version = "0.4.0"
+version = "0.4.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "httpx" },
@@ -24,9 +24,9 @@ dependencies = [
     { name = "pydantic" },
     { name = "typing-extensions" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/a1/64/e4fb93545d0bded3a826aa6b9bf7a1154fa67d9f559ad833f59e75778353/ai-0.4.0.tar.gz", hash = "sha256:9b1292d9615b0867591541fc9b82add25a002d78cb6a1c4ed18fb5bc8f217f3f", size = 1181865, upload-time = "2026-07-28T17:56:24.719Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/20/0b/97fd8012e459f6dac9813a805292f5cb2a5abce7b465519e35b8e84860b0/ai-0.4.1.tar.gz", hash = "sha256:b4adb107f94e016ecd1c7a05db389e3859885f33f2aaab55b0f359d3a8e7826c", size = 1182550, upload-time = "2026-07-30T21:18:59.697Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/7b/64/4e70ac7aa8fc6ad586d066cf5d1df853989cb80fd40d12a88172bf26885f/ai-0.4.0-py3-none-any.whl", hash = "sha256:39fb560872c34c43eda400ea1fc6bc4e1488f118f2efb850713677735e31459f", size = 179587, upload-time = "2026-07-28T17:56:23.63Z" },
+    { url = "https://files.pythonhosted.org/packages/f8/a9/07cd07e81bdf4520da8cfde02ebbdef84634006e61e964082d653a23fc14/ai-0.4.1-py3-none-any.whl", hash = "sha256:d3e288720bbd52f3378890c214cbd185a6e757ed5471469bb5cd8d00d95fa828", size = 179709, upload-time = "2026-07-30T21:18:58.224Z" },
 ]
 
 [package.optional-dependencies]
@@ -107,7 +107,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "ai", extras = ["otel"], specifier = ">=0.4.0" },
+    { name = "ai", extras = ["otel"], specifier = ">=0.4.1" },
     { name = "asyncpg", specifier = ">=0.29.0" },
     { name = "fastapi", extras = ["standard"], specifier = ">=0.115.0" },
     { name = "httpx", specifier = ">=0.28.1" },

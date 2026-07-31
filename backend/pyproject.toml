@@ -8,7 +8,7 @@ dependencies = [
     "vercel>=0.5.9",
     "asyncpg>=0.29.0",
     "httpx>=0.28.1",
-    "ai[otel]>=0.4.0",
+    "ai[otel]>=0.4.1",
     "vercel",
     "opentelemetry-exporter-otlp-proto-http>=1.30",
 ]
