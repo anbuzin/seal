@@ -93,19 +93,21 @@ class InProcessWorld(wf_local.LocalWorld):
                 raise RuntimeError(f"unexpected queue: {queue_name}")
             run_id = getattr(message, "run_id", None) or message.workflow_run_id
             lock = self._locks.setdefault(run_id, asyncio.Lock())
-            # Install a seeded RNG for steps so they get deterministic IDs also.
-            rng_ctx = ai.messages.use_random(self._step_rng)
             attempt = 1
             while True:
-                async with lock:
-                    with rng_ctx:
-                        retry = await handler(
-                            message.model_dump(),
-                            attempt=attempt,
-                            queue_name=queue_name,
-                            message_id=message_id,
-                            registry=self._registry,
-                        )
+                async with (
+                    lock,
+                    # Install a seeded RNG for steps so they get
+                    # deterministic IDs also.
+                    ai.messages.use_random(self._step_rng),
+                ):
+                    retry = await handler(
+                        message.model_dump(),
+                        attempt=attempt,
+                        queue_name=queue_name,
+                        message_id=message_id,
+                        registry=self._registry,
+                    )
                 if retry is None:
                     return
                 attempt += 1

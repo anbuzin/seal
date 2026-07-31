@@ -22,8 +22,15 @@ async def write_event(
 
 @workflow.step(max_retries=0)
 async def spawn_turn_workflow(turn_input: dict[str, object]) -> dict[str, object]:
-    # fires child workflow for an agent turn
-    started = await vercel.workflow.start(turn.run_turn, turn_input)
+    # fires child workflow for an agent turn.
+    payload = dict(turn_input)
+    if ai.experimental_telemetry.is_enabled():
+        # mint the span for the turn and pass it in. this way
+        # whatever is going on inside will be able to nest under it.
+        turn_span = ai.experimental_telemetry.create_span("turn").stamp_start()
+        turn_span.set_attrs({"openinference.span.kind": "AGENT"})
+        payload["turn_span"] = turn_span.model_dump(mode="json")
+    started = await vercel.workflow.start(turn.run_turn, payload)
     return {"run_id": started.run_id}
 
 
@@ -51,7 +58,7 @@ def _last_text(messages: list[ai.messages.Message]) -> str:
 # Draw message/part ids from the workflow's deterministic RNG so they're
 # stable across replay.
 @ai.messages.use_random(vercel.workflow.random)
-@ai.experimental_telemetry.use_clock(vercel.workflow.time_ns)
+@ai.experimental_telemetry.use_time(vercel.workflow.time_ns)
 async def run_session(session_input: dict[str, Any]) -> dict[str, Any]:
     # prepare the session
     _session_input = proto.SessionInput.model_validate(session_input)
@@ -83,6 +90,7 @@ async def run_session(session_input: dict[str, Any]) -> dict[str, Any]:
             session_id=session_id,
             messages=state.messages,
             turn_hook_token=turn_hook_token,
+            turn_index=turn_index,
         )
         await spawn_turn_workflow(turn_input.model_dump(mode="json"))
         turn_resolution = await turn_hook
