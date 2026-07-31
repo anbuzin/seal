@@ -52,6 +52,8 @@ vercel-headers = { git = "https://github.com/vercel/vercel-py", branch = "main",
 vercel-oidc = { git = "https://github.com/vercel/vercel-py", branch = "main", subdirectory = "src/vercel-oidc" }
 vercel-internal-telemetry = { git = "https://github.com/vercel/vercel-py", branch = "main", subdirectory = "src/vercel-internal-telemetry" }
 
+ai = { git = "https://github.com/vercel-labs/ai-python", branch = "main" }
+
 [dependency-groups]
 dev = [
     "mypy>=1.19.1",
