@@ -294,32 +294,10 @@ async def ship_spans(spans_data: list[dict[str, Any]]) -> None:
 
 
 @workflow.step(max_retries=0)
-async def resume_turn_hook(
-    token: str,
-    output_data: dict[str, Any],
-    turn_span_data: dict[str, Any] | None = None,
-    span_attributes: dict[str, Any] | None = None,
-) -> None:
-    # resume() is a side effect, so it must run in a step
-    output = proto.TurnOutput.model_validate(output_data)
-
-    if turn_span_data is not None:
-        turn_span = ai.experimental_telemetry.Span.model_validate(turn_span_data)
-        # complete and push the turn span
-        turn_span.stamp_end(
-            error=ai.experimental_telemetry.SpanError(
-                type="TurnError", message=output.error
-            )
-            if output.kind == "error" and output.error
-            else None
-        )
-        if span_attributes:
-            turn_span.set_attrs(span_attributes)
-        await turn_span.push()
-
-    # the driver may not have parked on the hook yet, so retry while it is
-    # missing.
-    hook = proto.TurnHook(output=output)
+async def resume_turn_hook(token: str, output_data: dict[str, Any]) -> None:
+    # resume() is a side effect, so it must run in a step. the driver may not
+    # have parked on the hook yet, so retry while it is missing.
+    hook = proto.TurnHook(output=proto.TurnOutput.model_validate(output_data))
     for attempt in range(40):
         try:
             await hook.resume(token)
@@ -428,18 +406,20 @@ async def run_turn(turn_input: dict[str, Any]) -> None:
     # still open here would dangle in the shipping process's adapter.
     if collector is not None:
         finished = [s.model_dump(mode="json") for s in collector.finished_spans]
+        if _turn_input.turn_span is not None:
+            # complete the turn span here (pure data ops on workflow time) so
+            # it ships with the rest instead of riding the resume step.
+            turn_span = _turn_input.turn_span.stamp_end(
+                error=ai.experimental_telemetry.SpanError(
+                    type="TurnError", message=output.error
+                )
+                if output.kind == "error" and output.error
+                else None
+            )
+            turn_span.set_attrs({"session.id": session_id, "turn_index": turn_index})
+            finished.append(turn_span.model_dump(mode="json"))
         if finished:
             await ship_spans(finished)
 
-    # notify session that the turn is complete (and export its span).
-    span_attrs: dict[str, Any] | None = None
-    if _turn_input.turn_span is not None:
-        span_attrs = {"session.id": session_id, "turn_index": turn_index}
-    await resume_turn_hook(
-        _turn_input.turn_hook_token,
-        output.model_dump(mode="json"),
-        _turn_input.turn_span.model_dump(mode="json")
-        if _turn_input.turn_span
-        else None,
-        span_attrs,
-    )
+    # notify session that the turn is complete.
+    await resume_turn_hook(_turn_input.turn_hook_token, output.model_dump(mode="json"))

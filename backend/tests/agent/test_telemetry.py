@@ -162,13 +162,15 @@ async def test_turn_span_continues_across_steps_and_exports(
     ):
         pass
 
-    # "resume step": the completed record exports with attributes and outcome.
+    # "workflow body": complete the record with outcome and attributes (pure
+    # data ops)...
     done = ai.experimental_telemetry.Span.model_validate(payload)
     done.stamp_end(
         error=ai.experimental_telemetry.SpanError(type="TurnError", message="boom")
     )
     done.set_attrs({"session.id": "s1"})
-    await done.push()
+    # ..."ship step": the completed record exports alongside collected spans.
+    await ai.experimental_telemetry.push_all([done.model_dump(mode="json")])
 
     child, turn = exporter.get_finished_spans()  # child ended first
     assert child.context is not None and turn.context is not None
