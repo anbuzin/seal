@@ -168,10 +168,9 @@ async def _turn_events(
     folds it into the assistant message it resubmitted.
 
     ``reload.requested`` is a permanent stream entry, not a one-shot signal --
-    a later connection replaying history past it sees it again. It only means
-    something to a connection that already forwarded the aborted attempt's
-    output *itself*; a fresh connection catching up on history has nothing of
-    its own to discard, so it just reads on through.
+    a later connection replaying history past it sees it again. Every connection
+    forwards the reload marker and continues reading, so the client can discard
+    the current step before applying events from the retried step.
     """
     async for event in stream.get_readable(session_id, start_index=start_index):
         if not isinstance(event, proto.LifecycleEvent):
@@ -184,9 +183,8 @@ async def _turn_events(
             # turn parks until the human responds on the next /chat request.
             return
         elif event.type == proto.RELOAD_REQUESTED:
-            # On a reload event, we end the step, send a custom reload
-            # message, and then start a new step.
-            # The frontend will need to know to drop the partial step.
+            # Tell the client to discard the current step, then keep reading so
+            # events from the retried step can use the same connection.
             await queue.put(ui_events.UIFinishStepEvent())
             await queue.put(ui_events.UIDataEvent(data_type="reload", data={}))
             await queue.put(ui_events.UIStartStepEvent())

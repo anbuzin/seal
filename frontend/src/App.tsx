@@ -336,21 +336,16 @@ function ChatView({
     [],
   );
 
-  const {
-    messages,
-    sendMessage,
-    status,
-    stop,
-    addToolApprovalResponse,
-    resumeStream,
-  } = useChat({
-    id: sessionId,
-    transport,
-    messages: initialMessages,
-    resume: true,
-    onFinish: onFinishReply,
-    sendAutomaticallyWhen: lastAssistantMessageIsCompleteWithApprovalResponses,
-  });
+  const { messages, sendMessage, status, stop, addToolApprovalResponse } =
+    useChat({
+      id: sessionId,
+      transport,
+      messages: initialMessages,
+      resume: true,
+      onFinish: onFinishReply,
+      sendAutomaticallyWhen:
+        lastAssistantMessageIsCompleteWithApprovalResponses,
+    });
 
   const isStreaming = status === "submitted" || status === "streaming";
 
