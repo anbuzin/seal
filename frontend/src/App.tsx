@@ -70,6 +70,30 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 import { useSessionManager } from "@/hooks/use-session-manager";
 
 // ---------------------------------------------------------------------------
+// Message parts
+// ---------------------------------------------------------------------------
+
+// Implement the custom streaming retry logic:
+// If there is a disconnection mid LLM response, the seal stream will emit
+// a data-reload event that signals for us to ignore the previous step.
+// We do that, and it'll drop off the screen.
+export function getFreshParts<T extends { type: string }>(parts: T[]): T[] {
+  const freshParts: T[] = [];
+
+  for (const part of parts) {
+    freshParts.push(part);
+    if (part.type == "data-reload") {
+      const reloadIndex = freshParts.findLastIndex(
+        (part) => part.type === "step-start",
+      );
+      freshParts.splice(reloadIndex + 1);
+    }
+  }
+
+  return freshParts;
+}
+
+// ---------------------------------------------------------------------------
 // Upload helper
 // ---------------------------------------------------------------------------
 
@@ -360,7 +384,7 @@ function ChatView({
             ) : (
               messages.map((message) => (
                 <Fragment key={message.id}>
-                  {message.parts.map((part, partIndex) =>
+                  {getFreshParts(message.parts).map((part, partIndex) =>
                     renderPart({
                       part,
                       key: `${message.id}-${partIndex}`,

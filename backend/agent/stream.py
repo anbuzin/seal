@@ -70,6 +70,13 @@ def tool_approval_requested(*, turn_index: int) -> dict[str, Any]:
     ).model_dump(mode="json")
 
 
+def reload_requested() -> dict[str, Any]:
+    # a retried step just wiped its own aborted first attempt's partial
+    # output; a client that already streamed that output needs to reload
+    # rather than trust it.
+    return proto.LifecycleEvent(type=proto.RELOAD_REQUESTED).model_dump(mode="json")
+
+
 DEFAULT_STREAM_NAMESPACE = "default"
 DEFAULT_STREAM_POLL_INTERVAL = 0.05
 

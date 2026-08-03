@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import collections.abc
+import contextlib
 
 import ai
 import ai.ui.ai_sdk as ai_sdk
@@ -119,17 +120,17 @@ async def to_sse(
     """Stream one turn of the session as AI SDK UI SSE chunks.
 
     The parent turn is converted by the SDK adapter. Subagent progress is tailed
-    off-thread and interleaved as already-formatted preliminary tool-output SSE
-    lines (the adapter never sees them — they sit on tool calls it already
-    started). All lines funnel through one queue so the merge is sequential.
+    off-thread and interleaved as preliminary tool-output events (the adapter
+    never sees them — they sit on tool calls it already started). All events
+    funnel through one queue so the merge is sequential.
     """
-    queue: asyncio.Queue[str | None] = asyncio.Queue()
+    queue: asyncio.Queue[ui_events.UIMessageStreamEvent | None] = asyncio.Queue()
     children: list[asyncio.Task[None]] = []
 
     async def pump_adapter() -> None:
         events = _turn_events(session_id, start_index, queue, children)
         async for event in ai_sdk.to_stream(events):
-            await queue.put(outbound_stream.format_sse(event))
+            await queue.put(event)
         await queue.put(None)
 
     adapter_task = asyncio.create_task(pump_adapter())
@@ -138,18 +139,21 @@ async def to_sse(
             line = await queue.get()
             if line is None:
                 break
-            yield line
+            formatted = outbound_stream.format_sse(line)
+            yield formatted
         yield outbound_stream.format_done_sse()
     finally:
         adapter_task.cancel()
         for child in children:
             child.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await adapter_task
 
 
 async def _turn_events(
     session_id: str,
     start_index: int,
-    queue: asyncio.Queue[str | None],
+    queue: asyncio.Queue[ui_events.UIMessageStreamEvent | None],
     children: list[asyncio.Task[None]],
 ) -> collections.abc.AsyncIterator[ai.events.AgentEvent]:
     """Yield this turn's ``AgentEvent``s, ending at the next turn boundary.
@@ -162,6 +166,11 @@ async def _turn_events(
     An approval resume just tails the continuation from after the park; its first
     event is a tool result (no ``turn_id`` → id-less ``start``), so the client
     folds it into the assistant message it resubmitted.
+
+    ``reload.requested`` is a permanent stream entry, not a one-shot signal --
+    a later connection replaying history past it sees it again. Every connection
+    forwards the reload marker and continues reading, so the client can discard
+    the current step before applying events from the retried step.
     """
     async for event in stream.get_readable(session_id, start_index=start_index):
         if not isinstance(event, proto.LifecycleEvent):
@@ -173,6 +182,13 @@ async def _turn_events(
         elif event.type == proto.TOOL_APPROVAL_REQUESTED:
             # turn parks until the human responds on the next /chat request.
             return
+        elif event.type == proto.RELOAD_REQUESTED:
+            # Tell the client to discard the current step, then keep reading so
+            # events from the retried step can use the same connection.
+            await queue.put(ui_events.UIFinishStepEvent())
+            await queue.put(ui_events.UIDataEvent(data_type="reload", data={}))
+            await queue.put(ui_events.UIStartStepEvent())
+
         elif event.type in _TERMINAL:
             return
 
@@ -207,7 +223,8 @@ def bundle_to_wire(
 
 
 async def _pump_subagent(
-    event: proto.LifecycleEvent, queue: asyncio.Queue[str | None]
+    event: proto.LifecycleEvent,
+    queue: asyncio.Queue[ui_events.UIMessageStreamEvent | None],
 ) -> None:
     """Tail a child session stream, republishing it as preliminary tool output.
 
@@ -231,14 +248,13 @@ async def _pump_subagent(
         nested = bundle_to_wire(child_messages)
         if nested is None:
             continue
-        line = outbound_stream.format_sse(
+        await queue.put(
             ui_events.UIToolOutputAvailableEvent(
                 tool_call_id=tool_call_id,
                 output=nested,
                 preliminary=True,
             )
         )
-        await queue.put(line)
 
 
 def _upsert(messages: list[ai.messages.Message], message: ai.messages.Message) -> None:

@@ -10,7 +10,7 @@ import agent.turn as turn
 from agent import workflow
 
 
-@workflow.step(max_retries=0)
+@workflow.step
 async def write_event(
     # writes one stream event (here, lifecycle) to the durable stream
     session_id: str,
@@ -22,7 +22,9 @@ async def write_event(
 
 @workflow.step(max_retries=0)
 async def spawn_turn_workflow(turn_input: dict[str, object]) -> dict[str, object]:
-    # fires child workflow for an agent turn.
+    # TODO: making retry for this safe requires cooperation on the workflow side
+    # ts docs suggest using a hook and checking uniqueness!
+    # fires child workflow for an agent turn
     payload = dict(turn_input)
     if ai.experimental_telemetry.is_enabled():
         # mint the span for the turn and pass it in. this way
@@ -34,14 +36,14 @@ async def spawn_turn_workflow(turn_input: dict[str, object]) -> dict[str, object
     return {"run_id": started.run_id}
 
 
-@workflow.step(max_retries=0)
+@workflow.step
 async def load_session(session_id: str) -> dict[str, Any] | None:
     # restores the latest persisted session snapshot, if any
     state = await session.read_session(session_id)
     return state.model_dump(mode="json") if state is not None else None
 
 
-@workflow.step(max_retries=0)
+@workflow.step
 async def save_session(state_data: dict[str, Any]) -> None:
     # appends the current session state as the latest snapshot
     await session.write_session(proto.SessionState.model_validate(state_data))
