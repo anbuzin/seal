@@ -121,9 +121,9 @@ class InProcessWorld(wf_local.LocalWorld):
 async def start_session(session_id: str, prompt: str) -> Any:
     return await vercel.workflow.start(
         driver.run_session,
-        proto.SessionInput(session_id=session_id, prompt=prompt).model_dump(
-            mode="json"
-        ),
+        session_input=proto.SessionInput(
+            session_id=session_id, prompt=prompt
+        ).model_dump(mode="json"),
     )
 
 

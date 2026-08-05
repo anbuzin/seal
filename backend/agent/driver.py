@@ -13,6 +13,7 @@ from agent import workflow
 @workflow.step
 async def write_event(
     # writes one stream event (here, lifecycle) to the durable stream
+    *,
     session_id: str,
     event_data: dict[str, object],
 ) -> None:
@@ -21,7 +22,7 @@ async def write_event(
 
 
 @workflow.step(max_retries=0)
-async def spawn_turn_workflow(turn_input: dict[str, object]) -> dict[str, object]:
+async def spawn_turn_workflow(*, turn_input: dict[str, object]) -> dict[str, object]:
     # TODO: making retry for this safe requires cooperation on the workflow side
     # ts docs suggest using a hook and checking uniqueness!
     # fires child workflow for an agent turn
@@ -32,19 +33,19 @@ async def spawn_turn_workflow(turn_input: dict[str, object]) -> dict[str, object
         turn_span = ai.experimental_telemetry.create_span("turn").stamp_start()
         turn_span.set_attrs({"openinference.span.kind": "AGENT"})
         payload["turn_span"] = turn_span.model_dump(mode="json")
-    started = await vercel.workflow.start(turn.run_turn, payload)
+    started = await vercel.workflow.start(turn.run_turn, turn_input=payload)
     return {"run_id": started.run_id}
 
 
 @workflow.step
-async def load_session(session_id: str) -> dict[str, Any] | None:
+async def load_session(*, session_id: str) -> dict[str, Any] | None:
     # restores the latest persisted session snapshot, if any
     state = await session.read_session(session_id)
     return state.model_dump(mode="json") if state is not None else None
 
 
 @workflow.step
-async def save_session(state_data: dict[str, Any]) -> None:
+async def save_session(*, state_data: dict[str, Any]) -> None:
     # appends the current session state as the latest snapshot
     await session.write_session(proto.SessionState.model_validate(state_data))
 
@@ -61,12 +62,12 @@ def _last_text(messages: list[ai.messages.Message]) -> str:
 # stable across replay.
 @ai.messages.use_random(vercel.workflow.random)
 @ai.experimental_telemetry.use_time(vercel.workflow.time_ns)
-async def run_session(session_input: dict[str, Any]) -> dict[str, Any]:
+async def run_session(*, session_input: dict[str, Any]) -> dict[str, Any]:
     # prepare the session
     _session_input = proto.SessionInput.model_validate(session_input)
     session_id = _session_input.session_id
 
-    restored = await load_session(session_id)
+    restored = await load_session(session_id=session_id)
     if restored is not None:
         # resume a persisted session with the new user message appended.
         state = proto.SessionState.model_validate(restored)
@@ -79,13 +80,16 @@ async def run_session(session_input: dict[str, Any]) -> dict[str, Any]:
                 ai.user_message(_session_input.prompt),
             ],
         )
-    await save_session(state.model_dump(mode="json"))
-    await write_event(session_id, stream.session_started())
+    await save_session(state_data=state.model_dump(mode="json"))
+    await write_event(session_id=session_id, event_data=stream.session_started())
 
     turn_index = 0
     while True:
         # run turn workflow and suspend on a hook until it completes
-        await write_event(session_id, stream.turn_started(turn_index=turn_index))
+        await write_event(
+            session_id=session_id,
+            event_data=stream.turn_started(turn_index=turn_index),
+        )
         turn_hook_token = f"seal-turn:{session_id}:{turn_index}"
         turn_hook = proto.TurnHook.wait(token=turn_hook_token)
         turn_input = proto.TurnInput(
@@ -94,7 +98,7 @@ async def run_session(session_input: dict[str, Any]) -> dict[str, Any]:
             turn_hook_token=turn_hook_token,
             turn_index=turn_index,
         )
-        await spawn_turn_workflow(turn_input.model_dump(mode="json"))
+        await spawn_turn_workflow(turn_input=turn_input.model_dump(mode="json"))
         turn_resolution = await turn_hook
         turn_hook.dispose()
         assert turn_resolution is not None
@@ -102,17 +106,20 @@ async def run_session(session_input: dict[str, Any]) -> dict[str, Any]:
 
         # process turn results
         state.messages = turn_result.messages
-        await save_session(state.model_dump(mode="json"))
+        await save_session(state_data=state.model_dump(mode="json"))
         await write_event(
-            session_id,
-            stream.turn_completed(turn_index=turn_index, kind=turn_result.kind),
+            session_id=session_id,
+            event_data=stream.turn_completed(
+                turn_index=turn_index, kind=turn_result.kind
+            ),
         )
 
         match turn_result.kind:
             case "suspend":
                 # we are currently in the main session. wait for the next user message.
                 await write_event(
-                    session_id, stream.session_waiting(turn_index=turn_index)
+                    session_id=session_id,
+                    event_data=stream.session_waiting(turn_index=turn_index),
                 )
                 hook = proto.SessionHook.wait(
                     token=f"seal-session:{session_id}:{turn_index}"
@@ -122,8 +129,11 @@ async def run_session(session_input: dict[str, Any]) -> dict[str, Any]:
                 message = resolution.payload if resolution is not None else None
 
                 if not isinstance(message, proto.NewUserMessage) or message.close:
-                    await write_event(session_id, stream.session_completed())
-                    await turn.close_stream(session_id)
+                    await write_event(
+                        session_id=session_id,
+                        event_data=stream.session_completed(),
+                    )
+                    await turn.close_stream(session_id=session_id)
                     return proto.SessionOutput(
                         session_id=session_id,
                         output=_last_text(state.messages),
@@ -132,8 +142,11 @@ async def run_session(session_input: dict[str, Any]) -> dict[str, Any]:
                 state.messages.append(ai.user_message(message.prompt or ""))
 
             case "error":
-                await write_event(session_id, stream.session_completed(is_error=True))
-                await turn.close_stream(session_id)
+                await write_event(
+                    session_id=session_id,
+                    event_data=stream.session_completed(is_error=True),
+                )
+                await turn.close_stream(session_id=session_id)
                 return proto.SessionOutput(
                     session_id=session_id,
                     output=turn_result.error or _last_text(state.messages),
@@ -142,5 +155,5 @@ async def run_session(session_input: dict[str, Any]) -> dict[str, Any]:
 
         # persist post-turn mutations (resume prompt / subagent results) so the
         # next turn resumes from the latest state after a crash.
-        await save_session(state.model_dump(mode="json"))
+        await save_session(state_data=state.model_dump(mode="json"))
         turn_index += 1

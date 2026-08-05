@@ -82,9 +82,9 @@ async def start_or_resume(session_id: str, prompt: str) -> int:
     if await session.read_session(session_id) is None:
         await vercel.workflow.start(
             driver.run_session,
-            proto.SessionInput(session_id=session_id, prompt=prompt).model_dump(
-                mode="json"
-            ),
+            session_input=proto.SessionInput(
+                session_id=session_id, prompt=prompt
+            ).model_dump(mode="json"),
         )
     else:
         turn_index = await _waiting_turn_index(session_id)

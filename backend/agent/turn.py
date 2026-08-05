@@ -23,6 +23,7 @@ SUBAGENT_SYSTEM_PROMPT = (
 
 @workflow.step
 async def llm_step(
+    *,
     model_id: str,
     messages_data: list[dict[str, object]],
     tools_data: list[dict[str, object]],
@@ -63,6 +64,7 @@ async def llm_step(
 @workflow.step
 async def write_event(
     # writes one stream event (agent or lifecycle) to the durable stream
+    *,
     session_id: str,
     event_data: dict[str, object],
 ) -> None:
@@ -72,14 +74,14 @@ async def write_event(
 
 # closes a durable event stream once the owning session is terminal.
 @workflow.step
-async def close_stream(session_id: str) -> None:
+async def close_stream(*, session_id: str) -> None:
     writer = await stream.get_writable(session_id)
     await writer.close()
 
 
 @ai.tool(require_approval=True)
 @workflow.step(max_retries=0)
-async def bash(command: str, timeout: int | None = None) -> str:
+async def bash(*, command: str, timeout: int | None = None) -> str:
     proc = await asyncio.create_subprocess_exec(
         "bash",
         "-c",
@@ -110,6 +112,7 @@ bash_ungated = dataclasses.replace(
 @ai.tool
 @workflow.step
 async def web_fetch(
+    *,
     url: str,
     method: str = "GET",
     headers: str = "",
@@ -142,6 +145,7 @@ async def web_fetch(
 
 @workflow.step(max_retries=0)
 async def spawn_subagent_turn(
+    *,
     turn_input: dict[str, object],
     parent_span_data: dict[str, object] | None = None,
 ) -> dict[str, object]:
@@ -159,7 +163,7 @@ async def spawn_subagent_turn(
         ).stamp_start()
         turn_span.set_attrs({"openinference.span.kind": "AGENT"})
         payload["turn_span"] = turn_span.model_dump(mode="json")
-    started = await vercel.workflow.start(run_turn, payload)
+    started = await vercel.workflow.start(run_turn, turn_input=payload)
     return {"run_id": started.run_id}
 
 
@@ -185,14 +189,14 @@ async def subagent(prompt: str, name: str | None = None) -> ai.agents.MessageBun
     child_session_id = f"{session_id}:child:{tool_call_id}"
     token = f"seal-turn:{child_session_id}:0"
     await write_event(
-        session_id,
-        stream.subagent_called(
+        session_id=session_id,
+        event_data=stream.subagent_called(
             tool_call_id=tool_call_id, child_session_id=child_session_id, name=name
         ),
     )
     hook = proto.TurnHook.wait(token=token)
     await spawn_subagent_turn(
-        proto.TurnInput(
+        turn_input=proto.TurnInput(
             session_id=child_session_id,
             messages=[
                 ai.system_message(SUBAGENT_SYSTEM_PROMPT),
@@ -202,19 +206,21 @@ async def subagent(prompt: str, name: str | None = None) -> ai.agents.MessageBun
             turn_hook_token=token,
         ).model_dump(mode="json"),
         # the child turn's root span nests under this turn's root span.
-        call.turn_span.model_dump(mode="json") if call.turn_span else None,
+        parent_span_data=(
+            call.turn_span.model_dump(mode="json") if call.turn_span else None
+        ),
     )
     resolution = await hook
     hook.dispose()
     assert resolution is not None
     output = resolution.output
     await write_event(
-        session_id,
-        stream.subagent_completed(
+        session_id=session_id,
+        event_data=stream.subagent_completed(
             tool_call_id=tool_call_id, is_error=output.kind == "error"
         ),
     )
-    await close_stream(child_session_id)
+    await close_stream(session_id=child_session_id)
     return ai.agents.MessageBundle(
         messages=tuple(m for m in output.messages if m.role in ("assistant", "tool"))
     )
@@ -246,11 +252,13 @@ class DurableAgent(ai.Agent):
 
         while context.keep_running():
             result = await llm_step(
-                model_id,
-                [message.model_dump(mode="json") for message in context.messages],
-                [tool.model_dump(mode="json") for tool in context.tools],
-                session_id,
-                turn_span_data,
+                model_id=model_id,
+                messages_data=[
+                    message.model_dump(mode="json") for message in context.messages
+                ],
+                tools_data=[tool.model_dump(mode="json") for tool in context.tools],
+                session_id=session_id,
+                turn_span_data=turn_span_data,
             )
 
             assistant_message = ai.messages.Message.model_validate(result)
@@ -277,7 +285,10 @@ class DurableAgent(ai.Agent):
                     # in loop order (results before the next turn's answer); run_turn
                     # only writes HookEvents, which ride the runtime queue instead.
                     if session_id is not None:
-                        await write_event(session_id, event.model_dump(mode="json"))
+                        await write_event(
+                            session_id=session_id,
+                            event_data=event.model_dump(mode="json"),
+                        )
                     yield event
 
                 tool_message = runner.get_tool_message()
@@ -287,13 +298,13 @@ class DurableAgent(ai.Agent):
 
 
 @workflow.step
-async def ship_spans(spans_data: list[dict[str, Any]]) -> None:
+async def ship_spans(*, spans_data: list[dict[str, Any]]) -> None:
     # re-deliver spans collected in the workflow body to the real adapters.
     await ai.experimental_telemetry.push_all(spans_data)
 
 
 @workflow.step
-async def resume_turn_hook(token: str, output_data: dict[str, Any]) -> None:
+async def resume_turn_hook(*, token: str, output_data: dict[str, Any]) -> None:
     # resume() is a side effect, so it must run in a step. the driver may not
     # have parked on the hook yet, so retry while it is missing.
     hook = proto.TurnHook(output=proto.TurnOutput.model_validate(output_data))
@@ -314,7 +325,7 @@ async def resume_turn_hook(token: str, output_data: dict[str, Any]) -> None:
 # entry (only valid inside the workflow).
 @ai.messages.use_random(vercel.workflow.random)
 @ai.experimental_telemetry.use_time(vercel.workflow.time_ns)
-async def run_turn(turn_input: dict[str, Any]) -> None:
+async def run_turn(*, turn_input: dict[str, Any]) -> None:
     _turn_input = proto.TurnInput.model_validate(turn_input)
     messages = _turn_input.messages
     session_id = _turn_input.session_id
@@ -368,7 +379,10 @@ async def run_turn(turn_input: dict[str, Any]) -> None:
                     # HookEvents ride the runtime queue, not runner.events(),
                     # so the loop never wrote this; write it here so the UI
                     # gets the approval request part.
-                    await write_event(session_id, event.model_dump(mode="json"))
+                    await write_event(
+                        session_id=session_id,
+                        event_data=event.model_dump(mode="json"),
+                    )
                     tg.create_task(
                         mediate(
                             proto.ApprovalHook.wait(
@@ -383,8 +397,10 @@ async def run_turn(turn_input: dict[str, Any]) -> None:
                     # the run is blocked on approvals; tell the client we're
                     # waiting on a human.
                     await write_event(
-                        session_id,
-                        stream.tool_approval_requested(turn_index=turn_index),
+                        session_id=session_id,
+                        event_data=stream.tool_approval_requested(
+                            turn_index=turn_index
+                        ),
                     )
 
             messages = run.messages
@@ -418,7 +434,10 @@ async def run_turn(turn_input: dict[str, Any]) -> None:
             turn_span.set_attrs({"session.id": session_id, "turn_index": turn_index})
             finished.append(turn_span.model_dump(mode="json"))
         if finished:
-            await ship_spans(finished)
+            await ship_spans(spans_data=finished)
 
     # notify session that the turn is complete.
-    await resume_turn_hook(_turn_input.turn_hook_token, output.model_dump(mode="json"))
+    await resume_turn_hook(
+        token=_turn_input.turn_hook_token,
+        output_data=output.model_dump(mode="json"),
+    )
