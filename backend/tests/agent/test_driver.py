@@ -10,6 +10,7 @@ deadlocks (every wait is bounded, so a deadlock is a fast red test).
 
 from __future__ import annotations
 
+import base64
 import os
 
 import ai
@@ -248,6 +249,64 @@ async def test_subagent_result_lands_on_the_trailing_tool_message(
     # the child ran as a single turn on its own stream (no session wrapper)
     assert await _lifecycle("s1:child:tc-sub") == []
     assert scripted_model.call_count == 3
+
+
+async def test_generate_image_returns_multipart_result(
+    world: InProcessWorld, scripted_model: MockProvider
+) -> None:
+    png_b64 = base64.b64encode(b"\x89PNG fake image bytes").decode()
+    scripted_model.responses = [
+        [
+            tool_call_msg(
+                tc_id="tc-img",
+                name="generate_image",
+                args='{"prompt": "a cat in cherry blossoms"}',
+                text="drawing it",
+            )
+        ],
+        # the image model's turn: an inline image alongside text
+        [
+            ai.messages.Message(
+                role="assistant",
+                parts=[
+                    ai.messages.TextPart(text="here it is"),
+                    ai.messages.FilePart(data=png_b64, media_type="image/png"),
+                ],
+            )
+        ],
+        [text_msg("done drawing")],
+    ]
+
+    await _start("s1", "draw a cat")
+    await _wait_for_lifecycle("s1", proto.SESSION_WAITING)
+
+    state = await session.read_session("s1")
+    assert state is not None
+    assert_message_invariants(state.messages)
+    assert state.messages[-1].text == "done drawing"
+
+    # the tool result is a multipart ContentOutput carrying the image, so the
+    # model (and the UI adapter) sees the actual media.
+    [tool_message] = [m for m in state.messages if m.role == "tool"]
+    [result] = tool_message.tool_results
+    assert result.tool_call_id == "tc-img"
+    assert result.result_kind == "special"
+    content = result.result
+    assert isinstance(content, ai.messages.ContentOutput)
+    [text_part, file_part] = content.value
+    assert isinstance(text_part, ai.messages.TextPart)
+    assert text_part.text == "here it is"
+    assert isinstance(file_part, ai.messages.FilePart)
+    assert file_part.media_type == "image/png"
+    assert file_part.data == png_b64
+    assert scripted_model.call_count == 3
+
+    # what the follow-up model call actually saw: the tool result's
+    # model-facing value must still be typed after the step JSON round-trip,
+    # or providers JSON-encode it and the image goes up as base64 text.
+    final_call = scripted_model.calls[-1]
+    [seen_result] = [part for m in final_call for part in m.tool_results]
+    assert isinstance(seen_result.get_model_input(), ai.messages.ContentOutput)
 
 
 # How many times to repeat the parallel-subagent stress. Kept low by default

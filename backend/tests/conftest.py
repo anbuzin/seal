@@ -77,6 +77,9 @@ class MockProvider(models.Provider):
         default_factory=dict, exclude=True
     )
     call_count: int = pydantic.Field(default=0, exclude=True)
+    calls: list[list[messages_.Message]] = pydantic.Field(
+        default_factory=list, exclude=True
+    )
 
     async def list_models(self) -> list[str]:
         return []
@@ -92,6 +95,7 @@ class MockProvider(models.Provider):
         protocol: Any = None,
     ) -> AsyncGenerator[events_.Event]:
         self.call_count += 1
+        self.calls.append(messages)
         last_user = next((m.text for m in reversed(messages) if m.role == "user"), "")
         for key, response in self.keyed_responses.items():
             if key in last_user:
@@ -137,6 +141,13 @@ async def _emit_events(
                         tool_call_id=part.tool_call_id, chunk=part.tool_args
                     )
                 yield events_.ToolEnd(tool_call_id=part.tool_call_id, tool_call=part)
+            elif isinstance(part, messages_.FilePart):
+                yield events_.FileEvent(
+                    block_id=part.id,
+                    data=part.data,
+                    media_type=part.media_type,
+                    filename=part.filename,
+                )
     yield events_.StreamEnd()
 
 
@@ -146,9 +157,11 @@ def mock_llm() -> Iterator[MockProvider]:
     MOCK_PROVIDER.responses = []
     MOCK_PROVIDER.keyed_responses = {}
     MOCK_PROVIDER.call_count = 0
+    MOCK_PROVIDER.calls = []
     yield MOCK_PROVIDER
     MOCK_PROVIDER.responses = []
     MOCK_PROVIDER.keyed_responses = {}
+    MOCK_PROVIDER.calls = []
 
 
 # --- in-process engine fixtures ---------------------------------------------------

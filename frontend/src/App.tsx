@@ -45,6 +45,7 @@ import {
   PromptInputTextarea,
   usePromptInputAttachments,
 } from "@/components/ai-elements/prompt-input";
+import { Image as GeneratedImage } from "@/components/ai-elements/image";
 import {
   Confirmation,
   ConfirmationAccepted,
@@ -203,6 +204,64 @@ function renderPart({
               )
             ) : (
               <ToolOutput output={output} errorText={part.errorText} />
+            )}
+          </ToolContent>
+        </Tool>
+      );
+    }
+
+    // generate_image returns multipart output (text + file parts); render the
+    // generated images instead of dumping base64 JSON.
+    if (toolName === "generate_image") {
+      const outputParts = Array.isArray(part.output)
+        ? (part.output as {
+            kind: string;
+            text?: string;
+            data?: string;
+            media_type?: string;
+          }[])
+        : [];
+      const images = outputParts.filter(
+        (p) => p.kind === "file" && p.media_type?.startsWith("image/"),
+      );
+      const texts = outputParts.filter((p) => p.kind === "text" && p.text);
+      return (
+        <Tool
+          key={key}
+          data-testid="tool-card"
+          data-tool-depth={depth}
+          data-tool-name={toolName}
+          data-tool-state={part.state}
+          defaultOpen
+        >
+          <ToolHeader
+            type="dynamic-tool"
+            state={part.state}
+            toolName={toolName}
+          />
+          <ToolContent>
+            <ToolInput input={part.input} />
+            {images.length > 0 ? (
+              <div className="space-y-2">
+                {images.map((img, imgIndex) => (
+                  <GeneratedImage
+                    key={`${key}-img-${imgIndex}`}
+                    base64={img.data!}
+                    mediaType={img.media_type!}
+                    alt="Generated image"
+                  />
+                ))}
+                {texts.map((t, textIndex) => (
+                  <p
+                    key={`${key}-text-${textIndex}`}
+                    className="text-muted-foreground text-sm"
+                  >
+                    {t.text}
+                  </p>
+                ))}
+              </div>
+            ) : (
+              <ToolOutput output={part.output} errorText={part.errorText} />
             )}
           </ToolContent>
         </Tool>

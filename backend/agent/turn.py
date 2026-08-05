@@ -11,13 +11,18 @@ import vercel.workflow
 from agent import proto, stream, util, workflow
 
 MODEL_ID = "gateway:anthropic/claude-sonnet-4.6"
+IMAGE_MODEL_ID = "gateway:google/gemini-3.1-flash-image"
 SYSTEM_PROMPT = (
     "You are Seal, a coding assistant. Use bash, web_fetch, and subagent to "
-    "inspect the environment, gather information, and delegate focused work."
+    "inspect the environment, gather information, and delegate focused work. "
+    "Use generate_image to create images."
 )
 SUBAGENT_SYSTEM_PROMPT = (
-    "You are a focused Seal subagent. Use bash and web_fetch when useful, then "
-    "answer the delegated task directly."
+    "You are a focused Seal subagent. Use bash, web_fetch, and generate_image "
+    "when useful, then answer the delegated task directly."
+)
+IMAGE_SYSTEM_PROMPT = (
+    "You are an image generator. Generate an image for the user's prompt."
 )
 
 
@@ -140,6 +145,41 @@ async def web_fetch(
     return "\n".join(parts)
 
 
+@workflow.step
+async def image_step(prompt: str) -> dict[str, object]:
+    """Generate an image from a text prompt. Describe the desired image in
+    detail, including subject, style, and composition."""
+
+    # the ai library has no direct image-generation API yet, so this
+    # runs a model that emits images inline with its response
+    # (FileParts on the message).
+    model = ai.get_model(IMAGE_MODEL_ID)
+    messages = [ai.system_message(IMAGE_SYSTEM_PROMPT), ai.user_message(prompt)]
+    async with ai.stream(model, messages) as model_stream:
+        async for _ in model_stream:
+            pass
+    message = model_stream.message
+
+    if not message.images:
+        return ai.content_output(
+            message.text or "The image model returned no image.",
+        ).model_dump(mode="json")
+    # keep any caption text the model emitted alongside its images
+    return ai.content_output(
+        *(
+            part
+            for part in message.parts
+            if isinstance(part, ai.messages.TextPart | ai.messages.FilePart)
+        )
+    ).model_dump(mode="json")
+
+
+@ai.tool
+async def generate_image(prompt: str) -> ai.messages.ContentOutput:
+    # TODO: annoyingly we have to have a model_validate in a tool outside the step
+    return ai.messages.ContentOutput.model_validate(await image_step(prompt))
+
+
 @workflow.step(max_retries=0)
 async def spawn_subagent_turn(
     turn_input: dict[str, object],
@@ -222,7 +262,7 @@ async def subagent(prompt: str, name: str | None = None) -> ai.agents.MessageBun
 
 class DurableAgent(ai.Agent):
     # bash is gated/ungated per mode, so it is supplied via tools=, not here.
-    TOOLS: ClassVar[list[ai.AgentTool]] = [web_fetch]
+    TOOLS: ClassVar[list[ai.AgentTool]] = [web_fetch, generate_image]
 
     # ``run(params=...)`` is typed inference params now, so the durable plumbing
     # (model id, stream target, subagent side-channel) lives on the instance.
