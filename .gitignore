@@ -24,3 +24,6 @@ venv/
 .env*.local
 .env*
 .reference
+
+# Node
+node_modules/

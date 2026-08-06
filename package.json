@@ -1,0 +1,17 @@
+{
+  "name": "seal",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "config:refresh": "VERCEL_CONFIG_REFRESH=1 node vercel.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.2",
+    "@vercel/fs-detectors": "^6.15.1",
+    "@vercel/routing-utils": "^6.4.1",
+    "ai": "^7.0.55",
+    "ajv": "^8.20.0",
+    "typescript": "^7.0.2",
+    "zod": "^4.4.3"
+  }
+}

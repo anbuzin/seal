@@ -34,8 +34,11 @@ silly, but this is a demo app.)
   `DATABASE_URL` is set, local jsonl files otherwise. Uses Vercel Blob
   to store attachments when available.
 
-Deployment is two Vercel services (see `vercel.json`): the frontend and the
-backend, with the workflow worker declared in `backend/pyproject.toml`.
+Deployment is two Vercel services: the frontend and the backend, with the
+workflow worker declared in `backend/pyproject.toml`. The config lives in
+`vercel.ts`, which runs an agent over the repo and the Vercel docs to work out
+the services; `pnpm config:refresh` re-runs it and rewrites
+`vercel.generated.json`, which is what builds actually read.
 
 ## Development
 
