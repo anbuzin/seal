@@ -5,7 +5,8 @@
   "description": "Full-stack end-to-end tests: drive the running seal app (frontend + backend + worker) via a real browser.",
   "type": "module",
   "scripts": {
-    "test": "node run-ls-date.mjs",
+    "test": "node test.mjs",
+    "test:images": "node images.mjs",
     "install-browser": "playwright install chromium"
   },
   "devDependencies": {
