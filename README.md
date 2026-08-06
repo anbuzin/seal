@@ -66,7 +66,13 @@ make ci-frontend      # pnpm install, prettier, eslint, tsc, vitest, build
 ```sh
 cd e2e && pnpm install && pnpm run install-browser
 pnpm test             # expects the app at http://localhost:3000
+pnpm run test:images  # image latency: time to first image, time to all N
 ```
+
+`test:images` prompts "draw N pictures of things you find interesting"
+(`N=5` by default) and reports when each image actually painted, measured
+from the submit click. Timings also land in
+`/tmp/seal-e2e-images-summary.json`.
 
 ## Deployment
 
