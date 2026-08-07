@@ -1,0 +1,14 @@
+[services.frontend]
+root = "frontend/"
+
+[services.backend]
+root = "backend/"
+entrypoint = "pyproject.toml"
+
+[[rewrites]]
+source = "/api/(.*)"
+destination = { service = "backend" }
+
+[[rewrites]]
+source = "/(.*)"
+destination = { service = "frontend" }
