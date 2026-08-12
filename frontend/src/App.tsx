@@ -18,7 +18,7 @@ export default function App() {
 
   return (
     <TooltipProvider>
-      <SidebarProvider>
+      <SidebarProvider className="h-svh">
         <SessionSidebar
           sessions={mgr.sessions}
           isLoading={mgr.sessionsLoading}
@@ -28,7 +28,7 @@ export default function App() {
           onDelete={mgr.deleteSession}
         />
 
-        <SidebarInset>
+        <SidebarInset className="min-h-0">
           <SiteHeader onNewChat={mgr.newSession} />
 
           {!mgr.isReady || !mgr.sessionId ? (

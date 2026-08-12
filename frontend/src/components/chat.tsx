@@ -117,7 +117,7 @@ export function ChatView({
   )
 
   return (
-    <>
+    <div className="mx-auto flex min-h-0 w-full flex-1 flex-col">
       {messages.length === 0 ? (
         <div className="flex flex-1 items-center justify-center p-6">
           <Empty>
@@ -135,7 +135,7 @@ export function ChatView({
             <MessageScrollerViewport>
               <MessageScrollerContent
                 data-testid="chat-log"
-                className="mx-auto flex w-full max-w-3xl flex-col gap-4 px-4 py-4"
+                className="mx-auto flex w-full max-w-2xl flex-col gap-6 px-6 py-6"
               >
                 {messages.map((message) => (
                   <MessageScrollerItem
@@ -151,7 +151,7 @@ export function ChatView({
                 ))}
                 {status === "submitted" && (
                   <MessageScrollerItem messageId="thinking">
-                    <div className="flex shimmer items-center gap-2 px-1.5 text-sm text-muted-foreground">
+                    <div className="flex shimmer items-center gap-2 px-3 text-sm text-muted-foreground">
                       Thinking…
                     </div>
                   </MessageScrollerItem>
@@ -163,24 +163,22 @@ export function ChatView({
         </MessageScrollerProvider>
       )}
 
-      <div className="border-t px-4 py-3">
-        <div className="mx-auto flex w-full max-w-3xl flex-col gap-2">
-          {error && (
-            <Alert variant="destructive">
-              <AlertTitle>Request failed</AlertTitle>
-              <AlertDescription>{error.message}</AlertDescription>
-            </Alert>
-          )}
-          <PromptForm
-            models={MODELS}
-            model={model}
-            onModelChange={setModel}
-            isBusy={isStreaming || isUploading}
-            onSubmit={handleSubmit}
-            onStop={() => void stop()}
-          />
-        </div>
+      <div className="mx-auto flex w-full max-w-2xl flex-col gap-2 px-6 pb-6">
+        {error && (
+          <Alert variant="destructive">
+            <AlertTitle>Request failed</AlertTitle>
+            <AlertDescription>{error.message}</AlertDescription>
+          </Alert>
+        )}
+        <PromptForm
+          models={MODELS}
+          model={model}
+          onModelChange={setModel}
+          isBusy={isStreaming || isUploading}
+          onSubmit={handleSubmit}
+          onStop={() => void stop()}
+        />
       </div>
-    </>
+    </div>
   )
 }
