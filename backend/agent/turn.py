@@ -390,6 +390,19 @@ class DurableAgent(ai.Agent):
                 tool_message = runner.get_tool_message()
 
             if tool_message is not None:
+                # the library computes aggregator model_input only for
+                # generator tools (and backfills only at run start), so a
+                # MessageBundle from the subagent hack would reach the next
+                # llm_step raw and fail JSON encoding. backfill it here.
+                for part in tool_message.tool_results:
+                    if (
+                        isinstance(part.result, ai.agents.MessageBundle)
+                        and not part.has_model_input
+                        and not part.is_error
+                    ):
+                        part.set_model_input(
+                            ai.agents.MessageAggregator.to_model_input(part.result)
+                        )
                 context.add(tool_message)
 
         watcher_task.cancel()
