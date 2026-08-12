@@ -323,7 +323,8 @@ try {
   });
   const textarea = mainPane(page).getByPlaceholder("Ask me anything...");
   await textarea.waitFor({ state: "visible", timeout: TIMEOUT_MS.appReady });
-  await chatLog(page)
+  // The empty state renders in place of the chat log, not inside it.
+  await mainPane(page)
     .getByText("Start a conversation")
     .waitFor({ state: "visible", timeout: TIMEOUT_MS.emptyState });
   log("app ready in a fresh empty chat");

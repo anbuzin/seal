@@ -16,26 +16,26 @@
  *              what the client sends.
  */
 
-import fs from "node:fs";
-import path from "node:path";
-import { describe, expect, it } from "vitest";
+import fs from "node:fs"
+import path from "node:path"
+import { describe, expect, it } from "vitest"
 
-import { Chat } from "@ai-sdk/react";
+import { Chat } from "@ai-sdk/react"
 import {
   DefaultChatTransport,
   UI_MESSAGE_STREAM_HEADERS,
   lastAssistantMessageIsCompleteWithApprovalResponses,
-} from "ai";
-import type { UIMessage } from "ai";
+} from "ai"
+import type { UIMessage } from "ai"
 
-const FIXTURES = path.resolve(__dirname, "../../common_fixtures");
-const UPDATE = !!process.env.UPDATE_FIXTURES;
+const FIXTURES = path.resolve(__dirname, "../../common_fixtures")
+const UPDATE = !!process.env.UPDATE_FIXTURES
 
 const PROMPTS: Record<string, string> = {
   "parallel-approvals": "run both commands",
   "parallel-subagents": "delegate to two helpers",
   "mixed-subagents-approvals": "delegate and run",
-};
+}
 
 const APPROVAL_ANSWERS: Record<
   string,
@@ -46,30 +46,30 @@ const APPROVAL_ANSWERS: Record<
     { id: "approve_tc-b", approved: false, reason: "not today" },
   ],
   "mixed-subagents-approvals": [{ id: "approve_tc-cmd", approved: true }],
-};
+}
 
-const ALL_SCENARIOS = Object.keys(PROMPTS);
-const APPROVAL_SCENARIOS = Object.keys(APPROVAL_ANSWERS);
+const ALL_SCENARIOS = Object.keys(PROMPTS)
+const APPROVAL_SCENARIOS = Object.keys(APPROVAL_ANSWERS)
 
 // --- fixture access ---------------------------------------------------------
 
 function fixturePath(scenario: string, file: string): string {
-  return path.join(FIXTURES, scenario, file);
+  return path.join(FIXTURES, scenario, file)
 }
 
 function loadSse(scenario: string): string {
-  return fs.readFileSync(fixturePath(scenario, "sse.txt"), "utf8");
+  return fs.readFileSync(fixturePath(scenario, "sse.txt"), "utf8")
 }
 
 function loadUiMessages(scenario: string): UIMessage[] {
   return JSON.parse(
-    fs.readFileSync(fixturePath(scenario, "ui_messages.json"), "utf8"),
-  );
+    fs.readFileSync(fixturePath(scenario, "ui_messages.json"), "utf8")
+  )
 }
 
 // --- normalization (mirrors backend/tests/test_contract.py) -----------------
 
-const VOLATILE_ID = /^(msg|part|turn|run)_[0-9a-f]+$/;
+const VOLATILE_ID = /^(msg|part|turn|run)_[0-9a-f]+$/
 
 /**
  * Generated ids are canonicalized in encounter order; null/undefined fields
@@ -79,58 +79,58 @@ const VOLATILE_ID = /^(msg|part|turn|run)_[0-9a-f]+$/;
  * the reload rendering has no step boundaries) are dropped.
  */
 function normalize(value: unknown): unknown {
-  const mapping = new Map<string, string>();
+  const mapping = new Map<string, string>()
 
   const isStepStart = (item: unknown) =>
     !!item &&
     typeof item === "object" &&
-    (item as { type?: string }).type === "step-start";
+    (item as { type?: string }).type === "step-start"
 
   function walk(node: unknown): unknown {
     if (typeof node === "string" && VOLATILE_ID.test(node)) {
-      if (!mapping.has(node)) mapping.set(node, `id-${mapping.size}`);
-      return mapping.get(node);
+      if (!mapping.has(node)) mapping.set(node, `id-${mapping.size}`)
+      return mapping.get(node)
     }
     if (Array.isArray(node))
-      return node.filter((i) => !isStepStart(i)).map(walk);
+      return node.filter((i) => !isStepStart(i)).map(walk)
     if (node && typeof node === "object") {
-      const record = node as Record<string, unknown>;
-      const out: Record<string, unknown> = {};
+      const record = node as Record<string, unknown>
+      const out: Record<string, unknown> = {}
       for (const [key, item] of Object.entries(record)) {
-        if (item === null || item === undefined) continue;
-        if (key === "metadata") continue;
-        if (key === "state" && record.type === "text") continue;
-        if (key === "preliminary") continue;
-        out[key] = walk(item);
+        if (item === null || item === undefined) continue
+        if (key === "metadata") continue
+        if (key === "state" && record.type === "text") continue
+        if (key === "preliminary") continue
+        out[key] = walk(item)
       }
-      return out;
+      return out
     }
-    return node;
+    return node
   }
 
-  return walk(JSON.parse(JSON.stringify(value)));
+  return walk(JSON.parse(JSON.stringify(value)))
 }
 
 // --- harness -----------------------------------------------------------------
 
 interface CapturedRequest {
-  url: string;
-  method: string;
-  body?: unknown;
+  url: string
+  method: string
+  body?: unknown
 }
 
 function makeChat(scenario: string, seed?: UIMessage[]) {
-  const requests: CapturedRequest[] = [];
-  let streamsServed = 0;
+  const requests: CapturedRequest[] = []
+  let streamsServed = 0
 
   const fetchStub: typeof fetch = async (input, init) => {
-    const url = typeof input === "string" ? input : input.toString();
-    const method = init?.method ?? "GET";
+    const url = typeof input === "string" ? input : input.toString()
+    const method = init?.method ?? "GET"
     requests.push({
       url,
       method,
       body: init?.body ? JSON.parse(init.body as string) : undefined,
-    });
+    })
     // The first stream request gets the fixture. Later ones (the automatic
     // post-approval send) get a minimal continuation — it must open a new
     // step, exactly like the real backend's next turn does, or the app's
@@ -146,11 +146,11 @@ function makeChat(scenario: string, seed?: UIMessage[]) {
             "[DONE]",
           ]
             .map((chunk) => `data: ${chunk}\n\n`)
-            .join("");
-    return new Response(body, { headers: UI_MESSAGE_STREAM_HEADERS });
-  };
+            .join("")
+    return new Response(body, { headers: UI_MESSAGE_STREAM_HEADERS })
+  }
 
-  let counter = 0;
+  let counter = 0
   const chat = new Chat({
     id: "s1",
     messages: seed ?? [],
@@ -163,15 +163,15 @@ function makeChat(scenario: string, seed?: UIMessage[]) {
         body: { session_id: id, messages },
       }),
     }),
-  });
-  return { chat, requests };
+  })
+  return { chat, requests }
 }
 
 async function until(cond: () => boolean, ms = 5000): Promise<void> {
-  const start = Date.now();
+  const start = Date.now()
   while (!cond()) {
-    if (Date.now() - start > ms) throw new Error("condition timed out");
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    if (Date.now() - start > ms) throw new Error("condition timed out")
+    await new Promise((resolve) => setTimeout(resolve, 10))
   }
 }
 
@@ -179,106 +179,117 @@ async function until(cond: () => boolean, ms = 5000): Promise<void> {
 
 describe.each(ALL_SCENARIOS)("%s: consume", (scenario) => {
   it("folds one POST's stream into exactly one assistant message", async () => {
-    const { chat } = makeChat(scenario);
-    await chat.sendMessage({ text: PROMPTS[scenario] });
-    await until(() => chat.status === "ready");
+    const { chat } = makeChat(scenario)
+    await chat.sendMessage({ text: PROMPTS[scenario] })
+    await until(() => chat.status === "ready")
 
-    expect(chat.messages).toHaveLength(2); // the user message + ONE assistant
-    const assistant = chat.messages[1];
-    expect(assistant.role).toBe("assistant");
+    expect(chat.messages).toHaveLength(2) // the user message + ONE assistant
+    const assistant = chat.messages[1]
+    expect(assistant.role).toBe("assistant")
 
-    const fixture = loadUiMessages(scenario);
+    const fixture = loadUiMessages(scenario)
     if (APPROVAL_SCENARIOS.includes(scenario)) {
       // a turn parked on an approval is still in flight, so GET /sessions returns
       // only the committed prefix; the assistant is rebuilt from the resumed
       // stream (see the resume test), not persisted here.
-      expect(fixture.map((m) => m.role)).toEqual(["system", "user"]);
-      return;
+      expect(fixture.map((m) => m.role)).toEqual(["system", "user"])
+      return
     }
 
     // a completed turn is persisted: live and reload renderings must agree on the
     // message identity (reload reconciliation keys on it) and the tool structure.
-    const reload = fixture[fixture.length - 1];
-    expect(reload.role).toBe("assistant");
-    expect(assistant.id).toBe(reload.id);
+    const reload = fixture[fixture.length - 1]
+    expect(reload.role).toBe("assistant")
+    expect(assistant.id).toBe(reload.id)
     const toolParts = (m: UIMessage) =>
       m.parts
         .filter((part) => part.type.startsWith("tool-"))
         .map((part) => ({
           type: part.type,
           toolCallId: (part as { toolCallId: string }).toolCallId,
-        }));
-    expect(toolParts(assistant)).toEqual(toolParts(reload));
-  });
-});
+        }))
+    expect(toolParts(assistant)).toEqual(toolParts(reload))
+  })
+})
 
 it("parallel-subagents: live state equals the reload rendering", async () => {
   // full live/reload parity — chat.py promises the nested subagent shape is
   // identical on both paths. (Approval scenarios legitimately diverge: the
   // pending-approval prompt exists only in the live stream, see sibling test.)
-  const { chat } = makeChat("parallel-subagents");
-  await chat.sendMessage({ text: PROMPTS["parallel-subagents"] });
-  await until(() => chat.status === "ready");
+  const { chat } = makeChat("parallel-subagents")
+  await chat.sendMessage({ text: PROMPTS["parallel-subagents"] })
+  await until(() => chat.status === "ready")
 
-  const fixture = loadUiMessages("parallel-subagents");
+  const fixture = loadUiMessages("parallel-subagents")
   expect(normalize(chat.messages[1])).toEqual(
-    normalize(fixture[fixture.length - 1]),
-  );
-});
+    normalize(fixture[fixture.length - 1])
+  )
+})
 
 describe.each(APPROVAL_SCENARIOS)("%s: consume approvals", (scenario) => {
   it("renders a pending approval for each gated call", async () => {
-    const { chat } = makeChat(scenario);
-    await chat.sendMessage({ text: PROMPTS[scenario] });
-    await until(() => chat.status === "ready");
+    const { chat } = makeChat(scenario)
+    await chat.sendMessage({ text: PROMPTS[scenario] })
+    await until(() => chat.status === "ready")
 
     const approvals = chat.messages[1].parts
       .filter((part) => part.type.startsWith("tool-"))
       .map((part) => (part as { approval?: { id: string } }).approval?.id)
-      .filter(Boolean);
-    expect(approvals).toEqual(APPROVAL_ANSWERS[scenario].map((a) => a.id));
-  });
-});
+      .filter(Boolean)
+    expect(approvals).toEqual(APPROVAL_ANSWERS[scenario].map((a) => a.id))
+  })
+})
 
 // --- resume ------------------------------------------------------------------
 
 describe.each(ALL_SCENARIOS)("%s: resume", (scenario) => {
   it("rebuilds the in-flight run from the resumed stream", async () => {
-    const seed = loadUiMessages(scenario);
-    const { chat, requests } = makeChat(scenario, structuredClone(seed));
+    const seed = loadUiMessages(scenario)
+    const { chat, requests } = makeChat(scenario, structuredClone(seed))
 
-    await chat.resumeStream();
-    await until(() => chat.status === "ready");
+    await chat.resumeStream()
+    await until(() => chat.status === "ready")
 
     // the resume endpoint contract
-    expect(requests[0].method).toBe("GET");
-    expect(requests[0].url).toBe("/api/chat/s1/stream");
+    expect(requests[0].method).toBe("GET")
+    expect(requests[0].url).toBe("/api/chat/s1/stream")
 
     if (APPROVAL_SCENARIOS.includes(scenario)) {
       // the parked turn isn't persisted, so GET /sessions seeded only the prefix;
       // the resumed stream appends the assistant with its pending approvals. The
       // step-start must precede the tool parts (else answering them won't auto-
       // send — see the "approve after reload" test).
-      const assistant = chat.messages[chat.messages.length - 1];
-      expect(assistant.role).toBe("assistant");
+      const assistant = chat.messages[chat.messages.length - 1]
+      expect(assistant.role).toBe("assistant")
       const approvals = assistant.parts
         .filter((part) => part.type.startsWith("tool-"))
         .map((part) => (part as { approval?: { id: string } }).approval?.id)
-        .filter(Boolean);
-      expect(approvals).toEqual(APPROVAL_ANSWERS[scenario].map((a) => a.id));
-      return;
+        .filter(Boolean)
+      expect(approvals).toEqual(APPROVAL_ANSWERS[scenario].map((a) => a.id))
+      return
     }
 
     // a completed turn is already in the seed; the replay reconciles in place.
     // no message duplication: same number of messages, same ids, in order
-    expect(chat.messages.map((m) => m.id)).toEqual(seed.map((m) => m.id));
+    expect(chat.messages.map((m) => m.id)).toEqual(seed.map((m) => m.id))
 
-    // no tool-part duplication: reconciled by toolCallId, one part per call
-    const last = chat.messages[chat.messages.length - 1];
+    // KNOWN DIVERGENCE, pinned since AI SDK v7: tool-part reconciliation is
+    // scoped to the current step (parts after the last `step-start`). The
+    // replayed stream opens a new step, so the seeded tool parts are invisible
+    // to it and every tool part is appended a second time — the same wart as
+    // the text duplication below. The app deduplicates tool parts by
+    // toolCallId at render time (getFreshParts in lib/messages). If this
+    // assertion starts failing because the ids are unique again, the SDK
+    // re-widened reconciliation — restore `new Set(ids).size === ids.length`
+    // and drop the render-time dedup.
+    const last = chat.messages[chat.messages.length - 1]
     const toolCallIds = last.parts
       .filter((part) => part.type.startsWith("tool-"))
-      .map((part) => (part as { toolCallId: string }).toolCallId);
-    expect(new Set(toolCallIds).size).toBe(toolCallIds.length);
+      .map((part) => (part as { toolCallId: string }).toolCallId)
+    const seedToolCallIds = seed[seed.length - 1].parts
+      .filter((part) => part.type.startsWith("tool-"))
+      .map((part) => (part as { toolCallId: string }).toolCallId)
+    expect(toolCallIds).toEqual([...seedToolCallIds, ...seedToolCallIds])
 
     // KNOWN DIVERGENCE, pinned: text parts carry no stable ids, so replaying
     // a stream over seeded history appends a second copy of every text block
@@ -289,63 +300,63 @@ describe.each(ALL_SCENARIOS)("%s: resume", (scenario) => {
     // part-level reconciliation — update this test to assert equality.
     const seedTexts = seed[seed.length - 1].parts
       .filter((part) => part.type === "text")
-      .map((part) => (part as { text: string }).text);
+      .map((part) => (part as { text: string }).text)
     const texts = last.parts
       .filter((part) => part.type === "text")
-      .map((part) => (part as { text: string }).text);
-    expect(texts).toEqual([...seedTexts, ...seedTexts]);
-  });
-});
+      .map((part) => (part as { text: string }).text)
+    expect(texts).toEqual([...seedTexts, ...seedTexts])
+  })
+})
 
 // --- approve after reload (regression) ---------------------------------------
 
 describe.each(APPROVAL_SCENARIOS)("%s: approve after reload", (scenario) => {
   it("answering a resumed approval still auto-sends the resubmit", async () => {
-    const seed = loadUiMessages(scenario);
-    const { chat, requests } = makeChat(scenario, structuredClone(seed));
+    const seed = loadUiMessages(scenario)
+    const { chat, requests } = makeChat(scenario, structuredClone(seed))
 
     // reload: GET /sessions seeded the committed prefix; the resumed stream
     // rebuilds the parked assistant with its pending approvals.
-    await chat.resumeStream();
-    await until(() => chat.status === "ready");
+    await chat.resumeStream()
+    await until(() => chat.status === "ready")
 
     for (const answer of APPROVAL_ANSWERS[scenario]) {
-      await chat.addToolApprovalResponse(answer);
+      await chat.addToolApprovalResponse(answer)
     }
 
     // Regression: if the rebuilt assistant mis-orders its parts (step-start after
     // the tool calls), `sendAutomaticallyWhen` never matches and no resubmit is
     // sent — the approval looks answered but nothing happens.
     await until(
-      () => requests.filter((r) => r.method === "POST").length >= 1,
-    ).catch(() => undefined);
+      () => requests.filter((r) => r.method === "POST").length >= 1
+    ).catch(() => undefined)
     expect(
-      requests.filter((r) => r.method === "POST").length,
-    ).toBeGreaterThanOrEqual(1);
-  });
-});
+      requests.filter((r) => r.method === "POST").length
+    ).toBeGreaterThanOrEqual(1)
+  })
+})
 
 // --- produce -----------------------------------------------------------------
 
 describe.each(APPROVAL_SCENARIOS)("%s: produce", (scenario) => {
   it("answering approvals auto-sends the request the backend expects", async () => {
-    const { chat, requests } = makeChat(scenario);
-    await chat.sendMessage({ text: PROMPTS[scenario] });
-    await until(() => chat.status === "ready");
+    const { chat, requests } = makeChat(scenario)
+    await chat.sendMessage({ text: PROMPTS[scenario] })
+    await until(() => chat.status === "ready")
 
     for (const answer of APPROVAL_ANSWERS[scenario]) {
-      await chat.addToolApprovalResponse(answer);
+      await chat.addToolApprovalResponse(answer)
     }
 
-    await until(() => requests.filter((r) => r.method === "POST").length >= 2);
-    const body = requests.filter((r) => r.method === "POST")[1].body;
+    await until(() => requests.filter((r) => r.method === "POST").length >= 2)
+    const body = requests.filter((r) => r.method === "POST")[1].body
 
-    const file = fixturePath(scenario, "approval_request.json");
+    const file = fixturePath(scenario, "approval_request.json")
     if (UPDATE) {
-      fs.writeFileSync(file, JSON.stringify(body, null, 1) + "\n");
-      return;
+      fs.writeFileSync(file, JSON.stringify(body, null, 1) + "\n")
+      return
     }
-    const fixture = JSON.parse(fs.readFileSync(file, "utf8"));
-    expect(normalize(body)).toEqual(normalize(fixture));
-  });
-});
+    const fixture = JSON.parse(fs.readFileSync(file, "utf8"))
+    expect(normalize(body)).toEqual(normalize(fixture))
+  })
+})

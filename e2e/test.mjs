@@ -28,7 +28,6 @@ const TIMEOUT_MS = {
   stalledProgress: 30_000,
   heartbeat: 1_000,
   afterApproval: 250,
-  afterCardExpand: 150,
   stableIdle: 1_000,
   poll: 250,
   headedPause: 3_000,
@@ -319,7 +318,8 @@ async function openFreshChat(page) {
 
   const textarea = mainPane(page).getByPlaceholder("Ask me anything...");
   await textarea.waitFor({ state: "visible", timeout: TIMEOUT_MS.appReady });
-  await chatLog(page)
+  // The empty state renders in place of the chat log, not inside it.
+  await mainPane(page)
     .getByText("Start a conversation")
     .waitFor({ state: "visible", timeout: TIMEOUT_MS.emptyState });
   log("app ready in a fresh empty chat");
@@ -368,25 +368,6 @@ async function approveAndWait(page, scenario) {
       lastProgressAt = Date.now();
       log(`approved tool execution #${approvals}`);
       await page.waitForTimeout(TIMEOUT_MS.afterApproval);
-      continue;
-    }
-
-    if (s.awaiting > 0) {
-      const cards = toolState(page, "approval-requested");
-      const n = await cards.count();
-      let opened = 0;
-      for (let i = 0; i < n; i++) {
-        const h = cards.nth(i).getByRole("button").first();
-        if ((await h.getAttribute("data-state")) === "closed") {
-          await h.click().catch(() => {});
-          opened++;
-        }
-      }
-      if (opened) {
-        lastProgressAt = Date.now();
-        log(`expanded ${opened} collapsed approval card(s)`);
-      }
-      await page.waitForTimeout(TIMEOUT_MS.afterCardExpand);
       continue;
     }
 

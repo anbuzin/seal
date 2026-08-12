@@ -1,8 +1,8 @@
-import { PlusIcon, Trash2Icon } from "lucide-react";
+import { PlusIcon, Trash2Icon } from "lucide-react"
 
-import type { Session } from "@/hooks/session-api";
-import { Button } from "@/components/ui/button";
-import { ScrollArea } from "@/components/ui/scroll-area";
+import type { Session } from "@/hooks/session-api"
+import { Button } from "@/components/ui/button"
+import { ScrollArea } from "@/components/ui/scroll-area"
 import {
   Sidebar,
   SidebarContent,
@@ -16,36 +16,36 @@ import {
   SidebarMenuItem,
   SidebarMenuSkeleton,
   SidebarRail,
-} from "@/components/ui/sidebar";
+} from "@/components/ui/sidebar"
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
 function groupByDate(sessions: Session[]) {
-  const today = new Date();
-  const yesterday = new Date(today);
-  yesterday.setDate(yesterday.getDate() - 1);
-  const weekAgo = new Date(today);
-  weekAgo.setDate(weekAgo.getDate() - 7);
+  const today = new Date()
+  const yesterday = new Date(today)
+  yesterday.setDate(yesterday.getDate() - 1)
+  const weekAgo = new Date(today)
+  weekAgo.setDate(weekAgo.getDate() - 7)
 
   const groups: { label: string; items: Session[] }[] = [
     { label: "Today", items: [] },
     { label: "Yesterday", items: [] },
     { label: "Previous 7 days", items: [] },
     { label: "Older", items: [] },
-  ];
+  ]
 
   for (const s of sessions) {
-    const d = new Date(s.updated_at);
-    if (d.toDateString() === today.toDateString()) groups[0].items.push(s);
+    const d = new Date(s.updated_at)
+    if (d.toDateString() === today.toDateString()) groups[0].items.push(s)
     else if (d.toDateString() === yesterday.toDateString())
-      groups[1].items.push(s);
-    else if (d >= weekAgo) groups[2].items.push(s);
-    else groups[3].items.push(s);
+      groups[1].items.push(s)
+    else if (d >= weekAgo) groups[2].items.push(s)
+    else groups[3].items.push(s)
   }
 
-  return groups.filter((g) => g.items.length > 0);
+  return groups.filter((g) => g.items.length > 0)
 }
 
 // ---------------------------------------------------------------------------
@@ -53,12 +53,12 @@ function groupByDate(sessions: Session[]) {
 // ---------------------------------------------------------------------------
 
 interface SessionSidebarProps {
-  sessions: Session[];
-  isLoading: boolean;
-  currentSessionId: string | null;
-  onSelect: (id: string) => void;
-  onNew: () => void;
-  onDelete: (id: string) => void;
+  sessions: Session[]
+  isLoading: boolean
+  currentSessionId: string | null
+  onSelect: (id: string) => void
+  onNew: () => void
+  onDelete: (id: string) => void
 }
 
 export function SessionSidebar({
@@ -69,7 +69,7 @@ export function SessionSidebar({
   onNew,
   onDelete,
 }: SessionSidebarProps) {
-  const groups = groupByDate(sessions);
+  const groups = groupByDate(sessions)
 
   return (
     <Sidebar>
@@ -121,8 +121,8 @@ export function SessionSidebar({
                         </SidebarMenuButton>
                         <SidebarMenuAction
                           onClick={(e) => {
-                            e.stopPropagation();
-                            onDelete(session.id);
+                            e.stopPropagation()
+                            onDelete(session.id)
                           }}
                           showOnHover
                         >
@@ -141,5 +141,5 @@ export function SessionSidebar({
 
       <SidebarRail />
     </Sidebar>
-  );
+  )
 }

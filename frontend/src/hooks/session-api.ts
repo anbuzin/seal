@@ -3,17 +3,17 @@
  * NOT a React hook — just async functions.
  */
 
-import type { UIMessage } from "ai";
+import type { UIMessage } from "ai"
 
 // ---------------------------------------------------------------------------
 // Types
 // ---------------------------------------------------------------------------
 
 export interface Session {
-  id: string;
-  title: string | null;
-  created_at: string;
-  updated_at: string;
+  id: string
+  title: string | null
+  created_at: string
+  updated_at: string
 }
 
 // ---------------------------------------------------------------------------
@@ -21,9 +21,9 @@ export interface Session {
 // ---------------------------------------------------------------------------
 
 export async function fetchSessions(): Promise<Session[]> {
-  const res = await fetch("/api/sessions");
-  if (!res.ok) throw new Error("Failed to fetch sessions");
-  return res.json();
+  const res = await fetch("/api/sessions")
+  if (!res.ok) throw new Error("Failed to fetch sessions")
+  return res.json()
 }
 
 export async function createSessionOnServer(id: string): Promise<Session> {
@@ -31,20 +31,20 @@ export async function createSessionOnServer(id: string): Promise<Session> {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ id }),
-  });
-  if (!res.ok) throw new Error("Failed to create session");
-  return res.json();
+  })
+  if (!res.ok) throw new Error("Failed to create session")
+  return res.json()
 }
 
 export async function deleteSessionOnServer(id: string): Promise<void> {
-  const res = await fetch(`/api/sessions/${id}`, { method: "DELETE" });
-  if (!res.ok) throw new Error("Failed to delete session");
+  const res = await fetch(`/api/sessions/${id}`, { method: "DELETE" })
+  if (!res.ok) throw new Error("Failed to delete session")
 }
 
 export async function generateSessionTitle(id: string): Promise<Session> {
-  const res = await fetch(`/api/sessions/${id}/title`, { method: "POST" });
-  if (!res.ok) throw new Error("Failed to generate title");
-  return res.json();
+  const res = await fetch(`/api/sessions/${id}/title`, { method: "POST" })
+  if (!res.ok) throw new Error("Failed to generate title")
+  return res.json()
 }
 
 // ---------------------------------------------------------------------------
@@ -56,20 +56,20 @@ export async function generateSessionTitle(id: string): Promise<Session> {
  * that `useChat` expects as `initialMessages`.
  */
 export async function fetchSessionMessages(
-  sessionId: string,
+  sessionId: string
 ): Promise<UIMessage[]> {
-  const res = await fetch(`/api/sessions/${sessionId}`);
-  if (res.status === 404) throw new Error("Session not found");
-  if (!res.ok) throw new Error("Failed to fetch session");
+  const res = await fetch(`/api/sessions/${sessionId}`)
+  if (res.status === 404) throw new Error("Session not found")
+  if (!res.ok) throw new Error("Failed to fetch session")
 
   const data: {
     messages: {
-      id: string;
-      role: string;
-      metadata?: UIMessage["metadata"];
-      parts: UIMessage["parts"];
-    }[];
-  } = await res.json();
+      id: string
+      role: string
+      metadata?: UIMessage["metadata"]
+      parts: UIMessage["parts"]
+    }[]
+  } = await res.json()
 
   return data.messages
     .map((m) => ({
@@ -78,5 +78,5 @@ export async function fetchSessionMessages(
       ...(m.metadata !== undefined ? { metadata: m.metadata } : {}),
       parts: m.parts,
     }))
-    .filter((m) => m.parts.length > 0);
+    .filter((m) => m.parts.length > 0)
 }
