@@ -48,6 +48,12 @@
       "sourceType": "github",
       "skillPath": "skills/ai-python-ui-adapter/SKILL.md",
       "computedHash": "1c15418a8ffb8efefac914150ef7c1caff4dabd879b7a7ee0c96c319c9bc6f6e"
+    },
+    "shadcn": {
+      "source": "shadcn/ui",
+      "sourceType": "github",
+      "skillPath": "skills/shadcn/SKILL.md",
+      "computedHash": "c1a68ee06a668aced9ab2b5fbdea5f989864123794eb2e056b339a072dbb7f10"
     }
   }
 }
