@@ -3,6 +3,7 @@
 Endpoints:
 
   POST /api/chat                     run a turn, stream the AI SDK UI message stream
+  POST /api/chat/{id}/cancel         interrupt the in-flight turn, keeping partial work
   GET  /api/chat/{id}/stream         resume an in-flight stream
   GET  /api/sessions                 list sessions
   POST /api/sessions                 create a session
@@ -129,6 +130,16 @@ async def post_chat(request: ChatRequest) -> fastapi.responses.StreamingResponse
         chat.to_sse(request.session_id, start_index),
         headers=ai_sdk.UI_MESSAGE_STREAM_HEADERS,
     )
+
+
+@app.post("/api/chat/{session_id}/cancel")
+async def cancel_chat(session_id: str) -> dict[str, str]:
+    # interrupt the in-flight turn; it settles with everything generated so
+    # far and the session stays open. the client keeps tailing its stream and
+    # sees the turn end.
+    if not await chat.cancel_turn(session_id):
+        raise fastapi.HTTPException(status_code=409, detail="No turn is running")
+    return {"status": "cancelling"}
 
 
 @app.get("/api/chat/{session_id}/stream")

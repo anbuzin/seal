@@ -47,6 +47,16 @@ export async function generateSessionTitle(id: string): Promise<Session> {
   return res.json()
 }
 
+/**
+ * Ask the server to interrupt the session's in-flight turn. The turn keeps
+ * everything generated so far and the open stream ends on its own.
+ * Returns false when the server had nothing to cancel (or errored).
+ */
+export async function cancelChat(sessionId: string): Promise<boolean> {
+  const res = await fetch(`/api/chat/${sessionId}/cancel`, { method: "POST" })
+  return res.ok
+}
+
 // ---------------------------------------------------------------------------
 // Messages
 // ---------------------------------------------------------------------------

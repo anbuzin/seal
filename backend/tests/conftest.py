@@ -14,6 +14,7 @@ streams, hooks, workflows, the UI adapter) is real.
 
 from __future__ import annotations
 
+import asyncio
 import sys
 from collections.abc import AsyncGenerator, Iterator, Sequence
 from pathlib import Path
@@ -116,6 +117,51 @@ class MockProvider(models.Provider):
         raise NotImplementedError
 
 
+class DrippingProvider(MockProvider):
+    """MockProvider that streams text forever when the prompt matches a key.
+
+    An endless response can only be ended by cancellation, which is exactly
+    what the cancellation tests need to prove: the in-flight llm step aborts
+    on the cancel flag instead of draining the model.
+    """
+
+    drip_keys: frozenset[str] = pydantic.Field(default_factory=frozenset, exclude=True)
+
+    def stream(
+        self,
+        model: models.Model,
+        messages: list[messages_.Message],
+        *,
+        tools: Sequence[ai.tools.Tool] | None = None,
+        output_type: type[pydantic.BaseModel] | None = None,
+        params: Any = None,
+        protocol: Any = None,
+    ) -> AsyncGenerator[events_.Event]:
+        last_user = next((m.text for m in reversed(messages) if m.role == "user"), "")
+        if any(key in last_user for key in self.drip_keys):
+            self.call_count += 1
+            self.calls.append(messages)
+            return _drip()
+        return super().stream(
+            model,
+            messages,
+            tools=tools,
+            output_type=output_type,
+            params=params,
+            protocol=protocol,
+        )
+
+
+async def _drip() -> AsyncGenerator[events_.Event]:
+    yield events_.StreamStart()
+    yield events_.TextStart(block_id="drip")
+    index = 0
+    while True:
+        yield events_.TextDelta(block_id="drip", chunk=f"chunk-{index} ")
+        index += 1
+        await asyncio.sleep(0.02)
+
+
 MOCK_PROVIDER = MockProvider()
 MOCK_MODEL = models.Model(id="mock-model", provider=MOCK_PROVIDER)
 
@@ -186,6 +232,15 @@ def scripted_model(
     model = models.Model(id="mock-model", provider=mock_llm)
     monkeypatch.setattr(ai, "get_model", lambda model_id=None, **kwargs: model)
     return mock_llm
+
+
+@pytest.fixture
+def dripping_model(monkeypatch: pytest.MonkeyPatch) -> DrippingProvider:
+    """A scripted model whose prompts containing "drip" stream forever."""
+    provider = DrippingProvider(drip_keys=frozenset({"drip"}))
+    model = models.Model(id="mock-model", provider=provider)
+    monkeypatch.setattr(ai, "get_model", lambda model_id=None, **kwargs: model)
+    return provider
 
 
 # --- message builders -----------------------------------------------------------

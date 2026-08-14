@@ -18,10 +18,12 @@ from typing import Any, cast
 import ai
 import ai.types.events as events_
 import ai.types.messages as messages_
+import conftest
+import harness
 import pytest
 import vercel.workflow
 
-from agent import proto, stream
+from agent import proto, session, storage, stream
 from app import chat
 
 
@@ -404,3 +406,73 @@ async def test_to_sse_interleaves_live_subagent_progress() -> None:
     deltas = [p["delta"] for p in payloads if p.get("type") == "text-delta"]
     assert deltas.count("all done") == 1
     assert "[DONE]" in lines[-1]
+
+
+# --- cancel_turn --------------------------------------------------------------------
+
+
+async def test_cancel_turn_with_nothing_running_returns_false() -> None:
+    # no stream at all
+    assert await chat.cancel_turn("s1") is False
+
+    # a settled turn is not cancellable either
+    await _write(
+        "s1",
+        stream.session_started(),
+        stream.turn_started(turn_index=0),
+        *_text_events("hi"),
+        stream.turn_completed(turn_index=0, kind="suspend"),
+        stream.session_waiting(turn_index=0),
+    )
+    assert await chat.cancel_turn("s1") is False
+
+
+async def test_cancel_turn_cascades_to_running_subagent(
+    world: harness.InProcessWorld, dripping_model: conftest.DrippingProvider
+) -> None:
+    # parent delegates; the child's model streams forever until cancelled.
+    dripping_model.responses = [
+        [
+            conftest.tool_call_msg(
+                tc_id="tc-sub",
+                name="subagent",
+                args='{"prompt": "drip on", "name": "helper"}',
+                text="delegating",
+            )
+        ],
+    ]
+
+    run = await harness.start_turn("s1", "delegate")
+    await harness.wait_for_lifecycle("s1", proto.SUBAGENT_CALLED)
+    await harness.wait_for_stream_text("s1:child:tc-sub")
+
+    assert await chat.cancel_turn("s1") is True
+
+    output = proto.TurnOutput.model_validate(await harness.wait_run(run))
+    assert output.kind == "cancelled"
+
+    # the child's partial transcript still landed as the subagent tool result
+    state = await session.read_session("s1")
+    assert state is not None
+    assert [m.role for m in state.messages] == ["system", "user", "assistant", "tool"]
+    [tool_message] = [m for m in state.messages if m.role == "tool"]
+    [result] = tool_message.tool_results
+    assert result.tool_call_id == "tc-sub"
+    bundle = ai.agents.MessageBundle.model_validate(result.result)
+    assert "chunk-" in (bundle.messages[-1].text or "")
+    conftest.assert_message_invariants(state.messages)
+
+    # the subagent round closed properly and the session stays open
+    assert await harness.lifecycle("s1") == [
+        proto.SESSION_STARTED,
+        proto.TURN_STARTED,
+        proto.SUBAGENT_CALLED,
+        proto.SUBAGENT_COMPLETED,
+        proto.TURN_COMPLETED,
+        proto.SESSION_WAITING,
+    ]
+    assert await stream.is_closed("s1:child:tc-sub")
+    _, parent_closed = await storage.store().info("s1", "default")
+    assert not parent_closed
+    # two model calls total (parent + child); nothing ran after the cancel
+    assert dripping_model.call_count == 2

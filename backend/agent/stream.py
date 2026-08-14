@@ -178,6 +178,22 @@ async def is_closed(
     return closed
 
 
+CONTROL_NAMESPACE = "control"
+
+
+async def request_cancel(scope: str) -> None:
+    """Raise the cancel flag for scope; steps polling it stop and return."""
+    await storage.ensure_ready()
+    await storage.store().append(scope, CONTROL_NAMESPACE, {"op": "cancel"})
+
+
+async def cancel_requested(scope: str) -> bool:
+    """True once request_cancel(scope) has been called."""
+    await storage.ensure_ready()
+    tail_index, _ = await storage.store().info(scope, CONTROL_NAMESPACE)
+    return tail_index >= 0
+
+
 async def replay(
     stream_id: str,
     *,

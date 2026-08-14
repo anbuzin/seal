@@ -91,3 +91,18 @@ async def test_agent_events_pass_through_unchanged() -> None:
 
     [received] = await _collect("s1")
     assert received.model_dump(mode="json") == sent.model_dump(mode="json")
+
+
+async def test_cancel_flag_is_scoped_to_one_turn() -> None:
+    scope = proto.control_scope("s1", 0)
+    assert not await stream.cancel_requested(scope)
+
+    await stream.request_cancel(scope)
+    assert await stream.cancel_requested(scope)
+    # raising it twice is harmless (the endpoint may be hit repeatedly)
+    await stream.request_cancel(scope)
+    assert await stream.cancel_requested(scope)
+
+    # the flag can't leak into the session's next turn or another session
+    assert not await stream.cancel_requested(proto.control_scope("s1", 1))
+    assert not await stream.cancel_requested(proto.control_scope("s2", 0))

@@ -76,6 +76,57 @@ async def start_turn(session_id: str, prompt: str) -> int:
     return start_index
 
 
+async def cancel_turn(session_id: str) -> bool:
+    """Interrupt the in-flight turn, keeping everything generated so far.
+
+    Raises the cancel flag for the running turn and for every subagent still
+    in flight (found from the parent stream), then sends ``Cancel`` to the
+    turn's inbox so a run parked on approvals unblocks too. The turn settles
+    itself: it commits its partial messages and emits ``turn.completed`` with
+    kind ``cancelled`` followed by ``session.waiting``.
+
+    Returns ``False`` when no turn is running (nothing to cancel).
+    """
+    running = False
+    turn_index = 0
+    # open subagents of the current run: tool_call_id -> child_session_id
+    open_children: dict[str, str] = {}
+    async for event in stream.replay(session_id):
+        if not isinstance(event, proto.LifecycleEvent):
+            continue
+        match event.type:
+            case proto.TURN_STARTED:
+                running = True
+                turn_index = int(event.data.get("turn_index", 0))
+                open_children.clear()
+            case proto.SESSION_WAITING | proto.SESSION_COMPLETED | proto.SESSION_FAILED:
+                running = False
+                open_children.clear()
+            case proto.SUBAGENT_CALLED:
+                open_children[str(event.data.get("tool_call_id"))] = str(
+                    event.data.get("child_session_id")
+                )
+            case proto.SUBAGENT_COMPLETED:
+                open_children.pop(str(event.data.get("tool_call_id")), None)
+    if not running:
+        return False
+
+    # children first: each cancelled child resumes its parent's subagent hook,
+    # so the parent converges with the child's partial transcript attached.
+    for child_session_id in open_children.values():
+        await stream.request_cancel(proto.control_scope(child_session_id, 0))
+    await stream.request_cancel(proto.control_scope(session_id, turn_index))
+
+    # unblock a run parked on tool approvals. if the turn finished in the
+    # meantime its inbox hook is gone — the flag above is then moot anyway.
+    with contextlib.suppress(vercel.workflow.HookNotFoundError):
+        await _resume(
+            proto.inbox_token(session_id),
+            proto.InboxHook(command=proto.Cancel()),
+        )
+    return True
+
+
 async def submit_approvals(
     session_id: str, approvals: list[proto.ToolApprovalResponse]
 ) -> int:

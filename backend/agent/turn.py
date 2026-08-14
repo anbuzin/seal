@@ -1,6 +1,7 @@
 import asyncio
 import contextvars
 import dataclasses
+import time
 import traceback
 from collections.abc import AsyncGenerator, Sequence
 from typing import Any, ClassVar
@@ -27,6 +28,10 @@ IMAGE_SYSTEM_PROMPT = (
 )
 
 
+# how often steps poll their stream for control messages
+CANCEL_POLL_INTERVAL = 0.2
+
+
 class EagerToolHook(pydantic.BaseModel, vercel.workflow.BaseHook):
     payload: ai.messages.ToolCallPart
 
@@ -39,6 +44,7 @@ async def llm_step(
     session_id: str | None,
     tool_token: str | None = None,
     turn_span_data: dict[str, object] | None = None,
+    control_scope: str | None = None,
 ) -> dict[str, object]:
     model = ai.get_model(model_id)
     messages = [
@@ -48,6 +54,13 @@ async def llm_step(
 
     writer = await stream.get_writable(session_id) if session_id else None
     metadata = vercel.workflow.get_step_metadata()
+
+    # cancelled before the model was called: skip the call entirely
+    if control_scope and await stream.cancel_requested(control_scope):
+        empty = ai.messages.Message(role="assistant", parts=[])
+        return proto.LlmStepResult(cancelled=True, message=empty).model_dump(
+            mode="json"
+        )
 
     # On a retry, emit a message requesting a reload. The will trigger
     # the client to drop everything from the last step.
@@ -60,20 +73,69 @@ async def llm_step(
         if turn_span_data
         else None
     )
-    async with (
-        ai.experimental_telemetry.use_span(turn_span),
-        ai.stream(model, messages, tools=tools) as model_stream,
-    ):
-        async for e in model_stream:
-            if e.replay:
-                continue
 
-            if writer is not None:
-                await writer.write(e)
-            if tool_token and isinstance(e, ai.types.events.ToolEnd):
-                await EagerToolHook(payload=e.tool_call).resume(tool_token)
+    cancelled = False
+    complete_call_ids: set[str] = set()
 
-    return model_stream.message.model_dump(mode="json")
+    # the cancel flag is polled in a background task
+    cancel_event = asyncio.Event()
+
+    async def poll_cancel(scope: str) -> None:
+        try:
+            while not await stream.cancel_requested(scope):
+                await asyncio.sleep(CANCEL_POLL_INTERVAL)
+            cancel_event.set()
+        except Exception:
+            print(
+                f"[seal] cancel poller failed:\n{traceback.format_exc()}",
+                flush=True,
+            )
+
+    poller = asyncio.create_task(poll_cancel(control_scope)) if control_scope else None
+    try:
+        async with (
+            ai.experimental_telemetry.use_span(turn_span),
+            ai.stream(model, messages, tools=tools) as model_stream,
+        ):
+            async for e in model_stream:
+                # track fully streamed tool calls (replayed ones included) so a
+                # cancel can drop calls whose args never finished arriving.
+                if isinstance(e, ai.types.events.ToolEnd):
+                    complete_call_ids.add(e.tool_call_id)
+                if e.replay:
+                    continue
+
+                if writer is not None:
+                    await writer.write(e)
+                if tool_token and isinstance(e, ai.types.events.ToolEnd):
+                    await EagerToolHook(payload=e.tool_call).resume(tool_token)
+
+                if cancel_event.is_set():
+                    cancelled = True
+                    break
+    finally:
+        if poller is not None:
+            poller.cancel()
+
+    message = model_stream.message
+    if cancelled:
+        message = message.model_copy(
+            update={
+                "parts": [
+                    part
+                    for part in message.parts
+                    if not isinstance(part, ai.messages.ToolCallPart)
+                    or part.tool_call_id in complete_call_ids
+                ]
+            }
+        )
+        if writer is not None:
+            # the aborted stream never emitted its end; write one so stream
+            # consumers see a finished message.
+            await writer.write(ai.types.events.StreamEnd(message=message))
+    return proto.LlmStepResult(cancelled=cancelled, message=message).model_dump(
+        mode="json"
+    )
 
 
 @workflow.step
@@ -93,9 +155,12 @@ async def close_stream(session_id: str) -> None:
     await writer.close()
 
 
-@ai.tool(require_approval=True)
 @workflow.step(max_retries=0)
-async def bash(command: str, timeout: int | None = None) -> str:
+async def bash_step(
+    command: str,
+    timeout: int | None = None,
+    control_scope: str | None = None,
+) -> str:
     proc = await asyncio.create_subprocess_exec(
         "bash",
         "-c",
@@ -103,17 +168,34 @@ async def bash(command: str, timeout: int | None = None) -> str:
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
     )
-    try:
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except TimeoutError:
-        proc.kill()
-        await proc.communicate()
-        return f"Command timed out after {timeout}s."
+    communicate = asyncio.ensure_future(proc.communicate())
+    deadline = time.monotonic() + timeout if timeout is not None else None
+    while True:
+        done, _ = await asyncio.wait({communicate}, timeout=CANCEL_POLL_INTERVAL)
+        if communicate in done:
+            break
+        if deadline is not None and time.monotonic() >= deadline:
+            proc.kill()
+            await communicate
+            return f"Command timed out after {timeout}s."
+        if control_scope and await stream.cancel_requested(control_scope):
+            proc.kill()
+            await communicate
+            return "Command interrupted: the user cancelled the turn."
 
+    stdout, _ = communicate.result()
     output = stdout.decode() if stdout else ""
     if proc.returncode != 0:
         return f"[exit code {proc.returncode}]\n{output}"
     return output
+
+
+@ai.tool(require_approval=True)
+async def bash(command: str, timeout: int | None = None) -> str:
+    # the step polls the turn's cancel flag while the command runs, so the
+    # scope rides the tool-call context instead of the model-facing signature.
+    call = tool_call_context.get(None)
+    return await bash_step(command, timeout, call.control_scope if call else None)
 
 
 # subagent (task) sessions cannot surface tool approvals to a human and would
@@ -289,11 +371,14 @@ class DurableAgent(ai.Agent):
         tools: Sequence[ai.AgentTool | ai.Tool] | None = None,
         session_id: str | None = None,
         turn_span: ai.experimental_telemetry.Span | None = None,
+        control_scope: str | None = None,
     ) -> None:
         super().__init__(tools=tools)
         self.tg = tg
         self.session_id = session_id
         self.turn_span = turn_span
+        self.control_scope = control_scope
+        self.cancelled = False
 
         # eager tool dispatch bits
         self.watcher_task: asyncio.Task[None] | None = None
@@ -323,6 +408,7 @@ class DurableAgent(ai.Agent):
                     session_id=session_id or "",
                     tool_call_id=tool_call.tool_call_id,
                     turn_span=self.turn_span,
+                    control_scope=self.control_scope,
                 )
             )
             self.live_tool_calls[tool_call.tool_call_id] = self.tg.create_task(
@@ -348,21 +434,46 @@ class DurableAgent(ai.Agent):
         while context.keep_running():
             self.live_tool_calls.clear()
 
-            result = await llm_step(
-                model_id,
-                [message.model_dump(mode="json") for message in context.messages],
-                [tool.model_dump(mode="json") for tool in context.tools],
-                session_id,
-                tool_token,
-                turn_span_data,
+            result = proto.LlmStepResult.model_validate(
+                await llm_step(
+                    model_id,
+                    [message.model_dump(mode="json") for message in context.messages],
+                    [tool.model_dump(mode="json") for tool in context.tools],
+                    session_id,
+                    tool_token,
+                    turn_span_data,
+                    self.control_scope,
+                )
             )
 
-            assistant_message = ai.messages.Message.model_validate(result)
-            context.add(assistant_message)
-            # llm_step streamed this turn out-of-band (straight to the durable
-            # stream), so yield the final StreamEnd here for run-blocked
-            # tracking, which counts the turn's tool calls from it.
-            yield ai.events.StreamEnd(message=assistant_message)
+            cancelled = result.cancelled
+            assistant_message = result.message
+            if assistant_message.parts:
+                context.add(assistant_message)
+                # llm_step streamed this turn out-of-band, yield the final StreamEnd
+                yield ai.events.StreamEnd(message=assistant_message)
+
+            if cancelled:
+                # the user interrupted the turn: keep the partial message but
+                # start no new work. answer its tool calls with error results
+                # so the transcript stays well-formed for the next turn.
+                self.cancelled = True
+                result_events = [
+                    ai.tool_result(
+                        tool_call_id=tool_call.tool_call_id,
+                        tool_name=tool_call.tool_name,
+                        result="Interrupted: the user cancelled the turn.",
+                        is_error=True,
+                    )
+                    for tool_call in assistant_message.tool_calls
+                ]
+                for event in result_events:
+                    if session_id is not None:
+                        await write_event(session_id, event.model_dump(mode="json"))
+                    yield event
+                if result_events:
+                    context.add(ai.tool_message(*result_events))
+                break
 
             async with ai.ToolRunner() as runner:
                 # Cancel eager tool calls that are not legit -- that
@@ -518,6 +629,9 @@ async def run_turn(turn_input: dict[str, Any]) -> dict[str, Any]:
 
     inbox = proto.InboxHook.wait(token=proto.inbox_token(session_id))
     output: proto.TurnOutput | None = None
+    # approval hooks currently pending, in arrival order; a Cancel command
+    # denies them so a parked run unblocks and can wind down.
+    pending_approvals: list[str] = []
 
     try:
         model = ai.get_model(MODEL_ID)
@@ -527,6 +641,7 @@ async def run_turn(turn_input: dict[str, Any]) -> dict[str, Any]:
             tools=extra_tools,
             session_id=session_id,
             turn_span=_turn_input.turn_span,
+            control_scope=proto.control_scope(session_id, turn_index),
         )
 
         async with (
@@ -544,13 +659,18 @@ async def run_turn(turn_input: dict[str, Any]) -> dict[str, Any]:
                     async for event in run:
                         if (
                             isinstance(event, ai.events.HookEvent)
-                            and event.hook.status == "pending"
                             and event.hook.hook_type
                             == ai.agents.TOOL_APPROVAL_HOOK_TYPE
                             and event.hook.tool_call_id is not None
                         ):
-                            # report hook event to the client
-                            await write_event(session_id, event.model_dump(mode="json"))
+                            if event.hook.status == "pending":
+                                pending_approvals.append(event.hook.tool_call_id)
+                                # report hook event to the client
+                                await write_event(
+                                    session_id, event.model_dump(mode="json")
+                                )
+                            elif event.hook.tool_call_id in pending_approvals:
+                                pending_approvals.remove(event.hook.tool_call_id)
                         elif isinstance(event, ai.events.RunBlocked):
                             # the run is blocked on approvals; tell the client
                             # we're waiting on a human.
@@ -558,7 +678,10 @@ async def run_turn(turn_input: dict[str, Any]) -> dict[str, Any]:
                                 session_id,
                                 stream.tool_approval_requested(turn_index=turn_index),
                             )
-                    output = proto.TurnOutput(kind="suspend", messages=run.messages)
+                    output = proto.TurnOutput(
+                        kind="cancelled" if agent.cancelled else "suspend",
+                        messages=run.messages,
+                    )
                 except Exception as error:
                     output = proto.TurnOutput(
                         kind="error",
@@ -579,17 +702,28 @@ async def run_turn(turn_input: dict[str, Any]) -> dict[str, Any]:
             tg.create_task(drive_agent_run())
 
             async for received in inbox:
-                command = received.command
-                if isinstance(command, proto.Approval):
-                    response = command.response
-                    # hack: using derived labels
-                    ai.resolve_hook(
-                        f"{proto.TOOL_APPROVAL_HOOK_PREFIX}{response.tool_call_id}",
-                        {"granted": response.granted, "reason": response.reason},
-                    )
-                elif isinstance(command, proto.AgentFinished):
-                    # stop reading the inbox and wrap up the run
-                    break
+                match received.command:
+                    case proto.Approval(response=response):
+                        # hack: using derived labels
+                        ai.resolve_hook(
+                            f"{proto.TOOL_APPROVAL_HOOK_PREFIX}{response.tool_call_id}",
+                            {"granted": response.granted, "reason": response.reason},
+                        )
+                    case proto.Cancel():
+                        # deny pending approvals so a parked run unblocks; steps
+                        # in flight notice the cancel flag on their own, and the
+                        # run still ends through AgentFinished.
+                        for tool_call_id in list(pending_approvals):
+                            ai.resolve_hook(
+                                f"{proto.TOOL_APPROVAL_HOOK_PREFIX}{tool_call_id}",
+                                {
+                                    "granted": False,
+                                    "reason": "The user cancelled the turn.",
+                                },
+                            )
+                    case proto.AgentFinished():
+                        # stop reading the inbox and wrap up the run
+                        break
 
             # clean up eager tool-related machinery
             agent.cancel_leftovers()
@@ -650,10 +784,10 @@ async def run_turn(turn_input: dict[str, Any]) -> dict[str, Any]:
             session_id,
             stream.turn_completed(turn_index=turn_index, kind=output.kind),
         )
-        if output.kind == "suspend":
-            await write_event(session_id, stream.session_waiting(turn_index=turn_index))
-        else:
+        if output.kind == "error":
             await write_event(session_id, stream.session_completed(is_error=True))
             await close_stream(session_id)
+        else:
+            await write_event(session_id, stream.session_waiting(turn_index=turn_index))
 
     return output.model_dump(mode="json")

@@ -26,6 +26,15 @@ def inbox_token(session_id: str) -> str:
     return f"seal-inbox:{session_id}"
 
 
+def control_scope(session_id: str, turn_index: int) -> str:
+    """Namespace for control signals for an agent turn.
+
+    Control signals ride the durable stream to get into llm_step
+    and other steps, and this is their agent-specific namespace.
+    """
+    return f"{session_id}#turn-{turn_index}"
+
+
 # a human's decision for one gated tool call.
 class Approval(pydantic.BaseModel):
     kind: Literal["approval"] = "approval"
@@ -37,7 +46,11 @@ class AgentFinished(pydantic.BaseModel):
     kind: Literal["agent_finished"] = "agent_finished"
 
 
-type InboxCommand = Approval | AgentFinished
+class Cancel(pydantic.BaseModel):
+    kind: Literal["cancel"] = "cancel"
+
+
+type InboxCommand = Approval | AgentFinished | Cancel
 
 
 class InboxHook(pydantic.BaseModel, vercel.workflow.BaseHook):
@@ -79,10 +92,19 @@ class ToolCallContext(pydantic.BaseModel):
     tool_call_id: str
     # the enclosing turn's root span; a spawned child turn nests under it.
     turn_span: ai.experimental_telemetry.Span | None = None
+    # the enclosing agent's control message scope on the durable stream
+    control_scope: str | None = None
+
+
+# result of one llm_step: the (possibly partial) assistant message and
+# whether the step exited on the turn's cancel flag.
+class LlmStepResult(pydantic.BaseModel):
+    cancelled: bool
+    message: ai.messages.Message
 
 
 class TurnOutput(pydantic.BaseModel):
-    kind: Literal["suspend", "error"]
+    kind: Literal["suspend", "error", "cancelled"]
     messages: list[ai.messages.Message]
     error: str | None = None
 

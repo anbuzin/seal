@@ -23,6 +23,7 @@ import {
   MessageScrollerProvider,
   MessageScrollerViewport,
 } from "@/components/ui/message-scroller"
+import { cancelChat } from "@/hooks/session-api"
 import type { ChatUIMessage } from "@/lib/messages"
 import { DEFAULT_MODEL, MODELS } from "@/lib/models"
 
@@ -93,6 +94,13 @@ export function ChatView({
   })
 
   const isStreaming = status === "submitted" || status === "streaming"
+
+  const handleStop = useCallback(async () => {
+    // interrupt the turn server-side; the stream then ends on the server's
+    // terminal events, so the UI keeps everything generated so far. only
+    // fall back to the client-side abort if the server had nothing to cancel.
+    if (!(await cancelChat(sessionId))) void stop()
+  }, [sessionId, stop])
 
   const handleSubmit = useCallback(
     async ({ text, files }: { text: string; files: FileUIPart[] }) => {
@@ -176,7 +184,7 @@ export function ChatView({
           onModelChange={setModel}
           isBusy={isStreaming || isUploading}
           onSubmit={handleSubmit}
-          onStop={() => void stop()}
+          onStop={() => void handleStop()}
         />
       </div>
     </div>

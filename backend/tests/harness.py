@@ -13,6 +13,7 @@ import random
 from typing import Any
 
 import ai
+import ai.types.events as events_
 import vercel._internal.workflow.runtime as wf_runtime  # noqa: E402
 import vercel._internal.workflow.worlds.local as wf_local  # noqa: E402
 import vercel.workflow  # noqa: E402
@@ -142,6 +143,29 @@ async def resume_approval(
         proto.inbox_token(session_id),
         proto.InboxHook(command=proto.Approval(response=response)),
     )
+
+
+async def cancel_turn(session_id: str, *, turn_index: int = 0) -> None:
+    """Raise the turn's cancel flag, then send Cancel to its inbox —
+    the agent-layer half of what ``chat.cancel_turn`` does."""
+    await stream.request_cancel(proto.control_scope(session_id, turn_index))
+    await _resume_hook(
+        proto.inbox_token(session_id),
+        proto.InboxHook(command=proto.Cancel()),
+    )
+
+
+async def wait_for_stream_text(session_id: str, *, timeout: float = 30) -> None:
+    """Wait until the session's stream carries at least one text delta."""
+
+    async def watch() -> None:
+        while True:
+            async for event in stream.replay(session_id):
+                if isinstance(event, events_.TextDelta):
+                    return
+            await asyncio.sleep(0.02)
+
+    await asyncio.wait_for(watch(), timeout)
 
 
 async def _resume_hook(token: str, hook: vercel.workflow.BaseHook) -> None:

@@ -9,9 +9,18 @@ import os
 import ai
 import ai.types.messages as messages_
 import pytest
-from conftest import MockProvider, assert_message_invariants, text_msg, tool_call_msg
+from conftest import (
+    DrippingProvider,
+    MockProvider,
+    assert_message_invariants,
+    text_msg,
+    tool_call_msg,
+)
 from harness import (
     InProcessWorld,
+)
+from harness import (
+    cancel_turn as _cancel_turn,
 )
 from harness import (
     lifecycle as _lifecycle,
@@ -26,10 +35,13 @@ from harness import (
     wait_for_lifecycle as _wait_for_lifecycle,
 )
 from harness import (
+    wait_for_stream_text as _wait_for_stream_text,
+)
+from harness import (
     wait_run as _wait_run,
 )
 
-from agent import proto, session, storage
+from agent import proto, session, storage, stream
 
 # --- message round trips ----------------------------------------------------------
 
@@ -494,3 +506,98 @@ async def test_parallel_subagents_land_deterministically(
     assert bundle_b.messages[-1].text == "beta-report"
     # parent: 1 llm call issuing both + 1 follow-up; each child: 1 call
     assert scripted_model.call_count == 4
+
+
+# --- cancellation -------------------------------------------------------------------
+
+
+async def test_cancel_mid_stream_keeps_partial_output(
+    world: InProcessWorld, dripping_model: DrippingProvider
+) -> None:
+    # the model streams forever; only the cancel flag can end this turn.
+    run = await _start("s1", "drip on")
+    await _wait_for_stream_text("s1")
+
+    await _cancel_turn("s1")
+
+    output = proto.TurnOutput.model_validate(await _wait_run(run))
+    assert output.kind == "cancelled"
+
+    # the partial assistant message is committed and the transcript is valid
+    state = await session.read_session("s1")
+    assert state is not None
+    assert [m.role for m in state.messages] == ["system", "user", "assistant"]
+    assert "chunk-" in (state.messages[-1].text or "")
+    assert_message_invariants(state.messages)
+
+    # settles like a normal turn: completed (kind=cancelled), session open
+    assert await _lifecycle("s1") == [
+        proto.SESSION_STARTED,
+        proto.TURN_STARTED,
+        proto.TURN_COMPLETED,
+        proto.SESSION_WAITING,
+    ]
+    async for event in stream.replay("s1"):
+        if (
+            isinstance(event, proto.LifecycleEvent)
+            and event.type == proto.TURN_COMPLETED
+        ):
+            assert event.data["kind"] == "cancelled"
+    _, closed = await storage.store().info("s1", "default")
+    assert not closed
+    # no model call happened after the cancel
+    assert dripping_model.call_count == 1
+
+    # the stale flag can't leak into the next turn (scoped per turn_index)
+    dripping_model.responses = [[text_msg("fresh answer")]]
+    await _start("s1", "again")
+    await _wait_for_lifecycle("s1", proto.SESSION_WAITING, count=2)
+    state = await session.read_session("s1")
+    assert state is not None
+    assert state.turn_index == 1
+    assert state.messages[-1].text == "fresh answer"
+    assert_message_invariants(state.messages)
+
+
+async def test_cancel_parked_approval_denies_and_settles(
+    world: InProcessWorld, scripted_model: MockProvider
+) -> None:
+    scripted_model.responses = [
+        [
+            tool_call_msg(
+                tc_id="tc-1",
+                name="bash",
+                args='{"command": "echo never"}',
+                text="running it",
+            )
+        ],
+    ]
+
+    run = await _start("s1", "run it")
+    await _wait_for_lifecycle("s1", proto.TOOL_APPROVAL_REQUESTED)
+
+    await _cancel_turn("s1")
+
+    output = proto.TurnOutput.model_validate(await _wait_run(run))
+    assert output.kind == "cancelled"
+
+    # the gated call was answered with an error result, not run
+    state = await session.read_session("s1")
+    assert state is not None
+    assert [m.role for m in state.messages] == ["system", "user", "assistant", "tool"]
+    [tool_message] = [m for m in state.messages if m.role == "tool"]
+    [result] = tool_message.tool_results
+    assert result.tool_call_id == "tc-1"
+    assert result.is_error
+    assert "never" not in str(result.result)  # bash output would contain it
+    assert_message_invariants(state.messages)
+
+    # exactly one model call: the follow-up llm step short-circuited on the flag
+    assert scripted_model.call_count == 1
+    assert await _lifecycle("s1") == [
+        proto.SESSION_STARTED,
+        proto.TURN_STARTED,
+        proto.TOOL_APPROVAL_REQUESTED,
+        proto.TURN_COMPLETED,
+        proto.SESSION_WAITING,
+    ]
