@@ -1,73 +1,71 @@
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 import ai
 import pydantic
 import vercel.workflow
 
-# Session inputs / outputs
 
-
-# external decision for a single gated tool call.
+# external decision for a single gated tool call
 class ToolApprovalResponse(pydantic.BaseModel):
     tool_call_id: str
     granted: bool
     reason: str | None = None
 
 
-# ai SDK gates a tool behind a hook labelled ``approve_{tool_call_id}``.
+# ai sdk gates a tool behind a hook labelled ``approve_{tool_call_id}``.
 TOOL_APPROVAL_HOOK_PREFIX = "approve_"
 
 
-# the durable hook a gated call parks on; its trailing segment is exactly the ai
-# ``HookPart.hook_id``. tokens are global, so the session id keeps them unique.
-def approval_hook_token(session_id: str, tool_call_id: str) -> str:
-    return f"seal-approval:{session_id}:{TOOL_APPROVAL_HOOK_PREFIX}{tool_call_id}"
+# turn inbox: turn workflow dispatches work in a task, and repeatedly
+# suspends on the inbox hook. the hook is resumed with InboxCommand.
 
 
-class SessionInput(pydantic.BaseModel):
-    session_id: str
-    prompt: str
+def inbox_token(session_id: str) -> str:
+    return f"seal-inbox:{session_id}"
 
 
-class SessionOutput(pydantic.BaseModel):
-    session_id: str
-    output: str
-    is_error: bool = False
-
-
-class NewUserMessage(pydantic.BaseModel):
-    kind: Literal["new_user_message"] = "new_user_message"
-    prompt: str | None = None
-    close: bool = False
-
-
-# carries the next user message (or a close) to a session parked in ``suspend``.
-class SessionHook(pydantic.BaseModel, vercel.workflow.BaseHook):
-    payload: NewUserMessage
-
-
-# one gated call's decision, delivered on its own per-approval hook.
-class ApprovalHook(pydantic.BaseModel, vercel.workflow.BaseHook):
+# a human's decision for one gated tool call.
+class Approval(pydantic.BaseModel):
+    kind: Literal["approval"] = "approval"
     response: ToolApprovalResponse
+
+
+# sent by the agent.run task when the run is finished
+class AgentFinished(pydantic.BaseModel):
+    kind: Literal["agent_finished"] = "agent_finished"
+
+
+type InboxCommand = Approval | AgentFinished
+
+
+class InboxHook(pydantic.BaseModel, vercel.workflow.BaseHook):
+    command: Annotated[InboxCommand, pydantic.Field(discriminator="kind")]
+
+
+# current state saved to disk
 
 
 class SessionState(pydantic.BaseModel):
     session_id: str
     messages: list[ai.messages.Message]
+    # index of the last turn that ran (the next turn is turn_index + 1).
+    turn_index: int = 0
 
 
-# Turn inputs / outputs
+# turn inputs / outputs
 
 
 class TurnInput(pydantic.BaseModel):
     session_id: str
     messages: list[ai.messages.Message]
-    # gated turns expose bash behind approval + subagent; ungated (subagent
-    # children) run bash directly and cannot delegate further.
-    gated: bool = True
-    turn_hook_token: str
+
+    # subagent behavior is different from root agent
+    is_subagent: bool = False
+    # set for subagent turns: the parent's hook to resume with the TurnOutput.
+    parent_hook_token: str | None = None
+
     # index of this turn within its session (always 0 for subagent turns).
     turn_index: int = 0
     # turn's root span. llm_steps and child turns nest under it.
@@ -89,7 +87,8 @@ class TurnOutput(pydantic.BaseModel):
     error: str | None = None
 
 
-class TurnHook(pydantic.BaseModel, vercel.workflow.BaseHook):
+# resumed by a subagent turn to deliver its result to the waiting parent.
+class SubagentHook(pydantic.BaseModel, vercel.workflow.BaseHook):
     output: TurnOutput
 
 

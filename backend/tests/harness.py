@@ -1,15 +1,8 @@
 """In-process runner for the durable workflow engine.
 
-``run_session`` executes under the workflow SDK's LocalWorld with one change:
-``world.queue`` dispatches to the workflow/step handlers directly instead of
-going through the queue service. Deliveries run as plain asyncio tasks on the
-test's event loop; the engine gives each workflow invocation its own dedicated
-loop internally (``run_workflow`` runs the body under ``asyncio.run``), so the
-``loop._ready`` check stays sound without the harness managing loops itself.
-Dispatching on one shared loop also keeps cross-delivery ordering deterministic
-(cooperative FIFO), so e.g. two parallel subagents don't race. Everything else
-is real — replay, suspensions, workflow hooks, the jsonl store, the bash
-subprocess.
+``world.queue`` dispatches straight to the workflow/step handlers on the
+test's event loop; everything else — replay, suspensions, hooks, the jsonl
+store — is real.
 """
 
 from __future__ import annotations
@@ -24,7 +17,7 @@ import vercel._internal.workflow.runtime as wf_runtime  # noqa: E402
 import vercel._internal.workflow.worlds.local as wf_local  # noqa: E402
 import vercel.workflow  # noqa: E402
 
-import agent.driver as driver  # noqa: E402
+import agent.turn as turn  # noqa: E402
 from agent import proto, stream  # noqa: E402
 
 
@@ -116,12 +109,13 @@ class InProcessWorld(wf_local.LocalWorld):
             self.errors.append(error)
 
 
-async def start_session(session_id: str, prompt: str) -> Any:
+async def start_turn(session_id: str, prompt: str) -> Any:
+    """Start the session's next turn, exactly as ``chat.start_turn`` would.
+
+    Returns the workflow run handle so tests can await the turn's output.
+    """
     return await vercel.workflow.start(
-        driver.run_session,
-        proto.SessionInput(session_id=session_id, prompt=prompt).model_dump(
-            mode="json"
-        ),
+        turn.run_turn, await turn.build_turn_input(session_id, prompt)
     )
 
 
@@ -141,16 +135,12 @@ async def wait_for_lifecycle(
     await asyncio.wait_for(watch(), timeout)
 
 
-async def resume_session(token: str, payload: proto.NewUserMessage) -> None:
-    await _resume_hook(token, proto.SessionHook(payload=payload))
-
-
 async def resume_approval(
     session_id: str, response: proto.ToolApprovalResponse
 ) -> None:
     await _resume_hook(
-        proto.approval_hook_token(session_id, response.tool_call_id),
-        proto.ApprovalHook(response=response),
+        proto.inbox_token(session_id),
+        proto.InboxHook(command=proto.Approval(response=response)),
     )
 
 

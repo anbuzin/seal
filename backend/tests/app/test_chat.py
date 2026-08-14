@@ -18,6 +18,8 @@ from typing import Any, cast
 import ai
 import ai.types.events as events_
 import ai.types.messages as messages_
+import pytest
+import vercel.workflow
 
 from agent import proto, stream
 from app import chat
@@ -107,27 +109,44 @@ async def test_run_parked_on_approval_is_resumable_from_run_start() -> None:
     assert await chat.active_run_start_index("s1") == 0
 
 
-# --- _waiting_turn_index ----------------------------------------------------------
+# --- start_turn guards ------------------------------------------------------------
 
 
-async def test_waiting_turn_index_takes_the_latest_waiting_event() -> None:
+async def test_start_turn_rejects_while_a_turn_is_running(
+    monkeypatch: Any,
+) -> None:
     await _write(
         "s1",
-        stream.session_waiting(turn_index=0),
-        stream.turn_started(turn_index=1),
-        stream.session_waiting(turn_index=1),
+        stream.session_started(),
+        stream.turn_started(turn_index=0),
+        events_.StreamStart(),
     )
-    assert await chat._waiting_turn_index("s1") == 1
+
+    async def unexpected_start(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("must not start a turn while one is running")
+
+    monkeypatch.setattr(vercel.workflow, "start", unexpected_start)
+    with pytest.raises(chat.SessionUnavailableError):
+        await chat.start_turn("s1", "another message")
 
 
-async def test_waiting_turn_index_falls_back_to_approval_park() -> None:
-    # a turn parked on a gated tool emits tool_approval.requested, not session.waiting.
+async def test_start_turn_rejects_an_ended_session(monkeypatch: Any) -> None:
     await _write(
         "s1",
-        stream.session_waiting(turn_index=0),
-        stream.tool_approval_requested(turn_index=1),
+        stream.session_started(),
+        stream.turn_started(turn_index=0),
+        stream.turn_completed(turn_index=0, kind="error"),
+        stream.session_completed(is_error=True),
     )
-    assert await chat._waiting_turn_index("s1") == 1
+    writer = await stream.get_writable("s1")
+    await writer.close()
+
+    async def unexpected_start(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("must not start a turn on an ended session")
+
+    monkeypatch.setattr(vercel.workflow, "start", unexpected_start)
+    with pytest.raises(chat.SessionUnavailableError):
+        await chat.start_turn("s1", "hello?")
 
 
 # --- bundle_to_wire ---------------------------------------------------------------

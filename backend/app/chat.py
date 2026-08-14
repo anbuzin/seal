@@ -1,24 +1,7 @@
 """Bridge the durable session protocol to the AI SDK UI message stream.
 
-The durable agent persists ``ai.events.AgentEvent | proto.LifecycleEvent`` to a
-per-session stream. The browser's ``useChat`` speaks the AI SDK UI protocol, so
-we tail one turn of the durable stream, hand the ``AgentEvent``s to the SDK's
-``to_stream`` adapter (lifecycle events stay server-side), and drive control
-flow off the lifecycle events.
-
-Two lifecycle features surface to the UI:
-
-  * tool approvals — a gated tool emits a ``tool-approval-request`` part (built by
-    the SDK adapter from the pending hook). The turn parks; the browser replies
-    with ``addToolApprovalResponse`` which arrives on the next ``POST /chat`` and
-    is forwarded back into the durable hook by :func:`submit_approvals`.
-  * subagents — a delegated child agent runs as its own durable workflow writing
-    to its own stream. We tail that child stream concurrently and republish it as
-    *preliminary* nested-``UIMessage`` output on the parent's ``subagent`` tool
-    call, so the user watches the subagent work live. The driver then stores the
-    child's full transcript (a ``MessageBundle``) as the final tool result; both
-    the live preliminary output and :func:`bundle_to_wire` (used on reload) reduce
-    that transcript to the identical nested ``UIMessage`` shape the UI expects.
+Tails one turn of the durable stream, hands ``AgentEvent``s to the SDK's
+``to_stream`` adapter, and drives control flow off the lifecycle events.
 """
 
 from __future__ import annotations
@@ -33,9 +16,13 @@ import ai.ui.ai_sdk.outbound_stream as outbound_stream
 import ai.ui.ai_sdk.ui_events as ui_events
 import vercel.workflow
 
-from agent import driver, proto, session, stream
+from agent import proto, stream, turn
 
 _TERMINAL = {proto.SESSION_WAITING, proto.SESSION_COMPLETED, proto.SESSION_FAILED}
+
+
+class SessionUnavailableError(Exception):
+    """The session cannot accept a new user message right now."""
 
 
 async def active_run_start_index(session_id: str) -> int | None:
@@ -71,45 +58,37 @@ async def active_run_start_index(session_id: str) -> int | None:
     return None if seen_boundary else run_start
 
 
-async def start_or_resume(session_id: str, prompt: str) -> int:
-    """Start a new session or resume a parked one.
+async def start_turn(session_id: str, prompt: str) -> int:
+    """Start the session's next turn as a fresh ``run_turn`` workflow.
 
     Returns the stream index to tail from so only the new turn reaches the
     client.
     """
-    start_index = await stream.tail_index(session_id) + 1
+    if await stream.is_closed(session_id):
+        raise SessionUnavailableError("Session has ended")
+    if await active_run_start_index(session_id) is not None:
+        raise SessionUnavailableError("A turn is already running")
 
-    if await session.read_session(session_id) is None:
-        await vercel.workflow.start(
-            driver.run_session,
-            proto.SessionInput(session_id=session_id, prompt=prompt).model_dump(
-                mode="json"
-            ),
-        )
-    else:
-        turn_index = await _waiting_turn_index(session_id)
-        await _resume(
-            f"seal-session:{session_id}:{turn_index}",
-            proto.SessionHook(payload=proto.NewUserMessage(prompt=prompt)),
-        )
+    start_index = await stream.tail_index(session_id) + 1
+    await vercel.workflow.start(
+        turn.run_turn, await turn.build_turn_input(session_id, prompt)
+    )
     return start_index
 
 
 async def submit_approvals(
     session_id: str, approvals: list[proto.ToolApprovalResponse]
 ) -> int:
-    """Forward each UI approval decision into its own parked hook.
+    """Forward each UI approval decision to the running turn's inbox.
 
-    Returns the stream index to tail the continuation from: the next index after
-    the park, computed *before* resuming so the continuation can't outrun it. The
-    resubmit carries the parked assistant message, so the client keeps streaming
-    into it and the continuation (tool output + answer) folds in.
+    Returns the stream index to tail the continuation from, computed before
+    resuming so the continuation can't outrun it.
     """
     start_index = await stream.tail_index(session_id) + 1
     for approval in approvals:
         await _resume(
-            proto.approval_hook_token(session_id, approval.tool_call_id),
-            proto.ApprovalHook(response=approval),
+            proto.inbox_token(session_id),
+            proto.InboxHook(command=proto.Approval(response=approval)),
         )
     return start_index
 
@@ -267,7 +246,7 @@ def _upsert(messages: list[ai.messages.Message], message: ai.messages.Message) -
 
 
 async def _resume(token: str, hook: vercel.workflow.BaseHook) -> None:
-    """Resolve a workflow hook, retrying while the driver registers it."""
+    """Resolve a workflow hook, retrying while the turn registers it."""
     for attempt in range(40):
         try:
             await hook.resume(token)
@@ -276,19 +255,3 @@ async def _resume(token: str, hook: vercel.workflow.BaseHook) -> None:
             if attempt == 39:
                 raise
             await asyncio.sleep(0.05)
-
-
-async def _waiting_turn_index(session_id: str) -> int:
-    """The turn the session is currently parked on (latest ``session.waiting``).
-
-    Falls back to the latest ``tool_approval.requested`` turn, since a turn parked
-    on a gated tool emits that rather than ``session.waiting``.
-    """
-    turn_index = 0
-    async for event in stream.replay(session_id):
-        if isinstance(event, proto.LifecycleEvent) and event.type in (
-            proto.SESSION_WAITING,
-            proto.TOOL_APPROVAL_REQUESTED,
-        ):
-            turn_index = int(event.data.get("turn_index", turn_index))
-    return turn_index

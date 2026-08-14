@@ -34,17 +34,28 @@ def _hook_event() -> events_.HookEvent:
 
 def test_hook_payloads_round_trip() -> None:
     """Each hook's payload survives the resume serialize -> validate round trip."""
-    message = proto.NewUserMessage(prompt="hi", close=False)
-    restored = proto.NewUserMessage.model_validate(message.model_dump(mode="json"))
-    assert restored == message
-
-    approval = proto.ApprovalHook(
-        response=proto.ToolApprovalResponse(
-            tool_call_id="tc-1", granted=False, reason="nope"
+    approval = proto.InboxHook(
+        command=proto.Approval(
+            response=proto.ToolApprovalResponse(
+                tool_call_id="tc-1", granted=False, reason="nope"
+            )
         )
     )
-    restored_hook = proto.ApprovalHook.model_validate(approval.model_dump(mode="json"))
-    assert restored_hook == approval
+    restored = proto.InboxHook.model_validate(approval.model_dump(mode="json"))
+    assert restored == approval
+    assert isinstance(restored.command, proto.Approval)
+
+    finished = proto.InboxHook(command=proto.AgentFinished())
+    restored_finished = proto.InboxHook.model_validate(finished.model_dump(mode="json"))
+    assert isinstance(restored_finished.command, proto.AgentFinished)
+
+    turn_output = proto.SubagentHook(
+        output=proto.TurnOutput(kind="suspend", messages=[ai.user_message("hi")])
+    )
+    restored_turn = proto.SubagentHook.model_validate(
+        turn_output.model_dump(mode="json")
+    )
+    assert restored_turn == turn_output
 
 
 # --- stream events ---------------------------------------------------------------

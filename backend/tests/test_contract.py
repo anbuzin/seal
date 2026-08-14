@@ -40,7 +40,7 @@ import pytest
 from conftest import MockProvider, assert_message_invariants, text_msg
 from harness import (
     InProcessWorld,
-    start_session,
+    start_turn,
     wait_for_lifecycle,
 )
 
@@ -106,7 +106,7 @@ async def _capture_run(
         return [line async for line in chat.to_sse(session_id, 0)]
 
     capture = asyncio.create_task(collect())
-    await start_session(session_id, prompt)
+    await start_turn(session_id, prompt)
     await wait_for_lifecycle(session_id, park_event)
     sse = await asyncio.wait_for(capture, 10)
 

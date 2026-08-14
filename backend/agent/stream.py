@@ -167,6 +167,17 @@ async def tail_index(
     return index
 
 
+async def is_closed(
+    stream_id: str,
+    *,
+    namespace: str = DEFAULT_STREAM_NAMESPACE,
+) -> bool:
+    """True once the stream is closed (its session ended)."""
+    await storage.ensure_ready()
+    _, closed = await storage.store().info(stream_id, namespace)
+    return closed
+
+
 async def replay(
     stream_id: str,
     *,

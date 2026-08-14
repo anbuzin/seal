@@ -14,8 +14,7 @@ from conftest import MockProvider, text_msg, tool_call_msg
 from harness import (
     InProcessWorld,
     resume_approval,
-    resume_session,
-    start_session,
+    start_turn,
     wait_for_lifecycle,
     wait_run,
 )
@@ -228,7 +227,7 @@ async def test_real_error_is_recorded(
 
 # --- telemetry enabled end-to-end on the real engine -------------------------
 #
-# the driver tests run with telemetry off (no turn span minted); these
+# the turn tests run with telemetry off (no turn span minted); these
 # re-run the critical flows with the adapter installed, covering the
 # mint -> sandbox-validate -> collect -> ship -> export path.
 
@@ -246,18 +245,17 @@ def telemetry_on() -> Iterator[in_memory.InMemorySpanExporter]:
     ai.experimental_telemetry.unregister(adapter)
 
 
-async def test_turn_with_telemetry_suspends_then_closes(
+async def test_turn_with_telemetry_suspends_then_ships_spans(
     telemetry_on: in_memory.InMemorySpanExporter,
     world: InProcessWorld,
     scripted_model: MockProvider,
 ) -> None:
     scripted_model.responses = [[text_msg("hello there")]]
 
-    run = await start_session("s1", "hi")
+    run = await start_turn("s1", "hi")
     await wait_for_lifecycle("s1", proto.SESSION_WAITING)
-    await resume_session("seal-session:s1:0", proto.NewUserMessage(close=True))
-    output = proto.SessionOutput.model_validate(await wait_run(run))
-    assert not output.is_error
+    output = proto.TurnOutput.model_validate(await wait_run(run))
+    assert output.kind == "suspend"
 
     spans = {s.name: s for s in telemetry_on.get_finished_spans()}
     # the turn root exported at completion; the model call and the agent run
@@ -296,7 +294,7 @@ async def test_gated_tool_approval_with_telemetry(
         [text_msg("done")],
     ]
 
-    await start_session("s1", "run it")
+    await start_turn("s1", "run it")
     # the approval request must still reach the stream with telemetry on.
     await wait_for_lifecycle("s1", proto.TOOL_APPROVAL_REQUESTED)
 

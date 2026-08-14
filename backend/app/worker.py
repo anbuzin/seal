@@ -1,10 +1,7 @@
 """Worker entrypoint for the durable agent.
 
-Importing `agent` constructs the `Workflows()` registry, which registers the queue
-handlers that actually drive `run_session` / `run_turn` to completion.
-
-The preamble (env defaults, log settup) must run before the
-workflow libraries are imported, so it lives at module top.
+The preamble (env defaults, log setup) must run before the workflow libraries
+are imported, so it lives at module top.
 """
 
 from __future__ import annotations
@@ -42,7 +39,6 @@ from agent import telemetry  # noqa: E402
 # hook flushes the batch exporter when uvicorn exits gracefully.
 telemetry.install("seal-agent")
 
-# Importing the driver pulls in turn/session/stream.
-import agent.driver  # noqa: E402, F401
+# Importing the turn module pulls in proto/session/stream.
 import agent.turn  # noqa: E402, F401
 from agent import workflow as workflow  # noqa: E402, F401

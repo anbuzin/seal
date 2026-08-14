@@ -16,19 +16,23 @@ silly, but this is a demo app.)
 
 ## How it works
 
-- **frontend/** — React + Vite chat UI using the AI SDK (`useChat`) and
-  [AI Elements](https://elements.ai-sdk.dev). Reconnecting to a session
-  re-tails the in-flight stream (`useChat({ resume: true })`).
-- **backend/app/** — FastAPI service. `POST /api/chat` starts (or resumes) a
-  run and streams the AI SDK UI message protocol; other endpoints cover
+- **frontend/** — React + Vite chat UI using the AI SDK (`useChat`).
+  Reconnecting to a session re-tails the in-flight stream
+  (`useChat({ resume: true })`).
+- **backend/app/** — FastAPI service. `POST /api/chat` starts the session's
+  next turn and streams the AI SDK UI message protocol; other endpoints cover
   sessions, titles, and private blob attachments. See `app/server.py` for the
   endpoint list.
-- **backend/agent/** — the durable agent itself. `driver.py` runs a
-  `run_session` workflow that spawns one child `run_turn` workflow per agent
-  turn and suspends on a hook until it finishes. Tool approvals are workflow
-  hooks too: the turn parks until the user answers, then resumes with the
-  decision. Model calls, stream writes, and session snapshots are all
-  workflow steps, replay-safe via the workflow's deterministic RNG/clock.
+- **backend/agent/** — the durable agent itself. A session is *data* (the
+  latest message-history snapshot plus the durable event stream); between
+  turns nothing runs. Each user message starts one `run_turn` workflow
+  (`turn.py`), whose body is a runloop: everything that happens to a running
+  turn — an approval decision from the UI, the agent task finishing —
+  arrives as a typed command on the turn's durable **inbox** hook, and the
+  loop dispatches. A gated tool parks the turn until the user answers; the
+  decision comes in through the same inbox. Model calls, stream writes, and
+  session snapshots are all workflow steps, replay-safe via the workflow's
+  deterministic RNG/clock.
 - **Storage** (`agent/storage.py`) — one append-only primitive backing
   both durable streams and session snapshots. Uses Postgres when
   `DATABASE_URL` is set, local jsonl files otherwise. Uses Vercel Blob
