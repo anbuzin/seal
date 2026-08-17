@@ -53,8 +53,14 @@ export async function generateSessionTitle(id: string): Promise<Session> {
  * Returns false when the server had nothing to cancel (or errored).
  */
 export async function cancelChat(sessionId: string): Promise<boolean> {
-  const res = await fetch(`/api/chat/${sessionId}/cancel`, { method: "POST" })
-  return res.ok
+  try {
+    const res = await fetch(`/api/chat/${sessionId}/cancel`, { method: "POST" })
+    return res.ok
+  } catch {
+    // Network-level failure (server unreachable, offline, dropped connection):
+    // report "nothing cancelled" so callers fall back to client-side abort.
+    return false
+  }
 }
 
 // ---------------------------------------------------------------------------
