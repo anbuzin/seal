@@ -108,9 +108,10 @@ class MockProvider(models.Provider):
         self,
         model: models.Model,
         messages: list[messages_.Message],
-        params: Any,
         *,
-        protocol: Any = None,
+        tools: Sequence[ai.tools.Tool] | None = None,
+        output_type: type[pydantic.BaseModel] | None = None,
+        params: Any = None,
     ) -> messages_.Message:
         raise NotImplementedError
 

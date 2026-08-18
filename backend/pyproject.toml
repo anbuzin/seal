@@ -5,11 +5,10 @@ description = "Seal – personal AI assistant backend"
 requires-python = ">=3.13,<3.14"
 dependencies = [
     "fastapi[standard]>=0.115.0",
-    "vercel>=0.5.9",
+    "vercel>=0.9.0",
     "asyncpg>=0.29.0",
     "httpx>=0.28.1",
     "ai[otel]>=0.4.1",
-    "vercel",
     "opentelemetry-exporter-otlp-proto-http>=1.30",
 ]
 
@@ -23,6 +22,13 @@ entrypoint = "app.worker:workflow"
 python_version = "3.13"
 strict = true
 plugins = ["pydantic.mypy"]
+
+# vercel ships `vercel._internal` without a py.typed marker, but the typed
+# public modules (vercel.workflow etc.) re-export from it; follow it so
+# BaseHook / @step don't degrade to Any.
+[[tool.mypy.overrides]]
+module = "vercel._internal.*"
+follow_untyped_imports = true
 
 [tool.ty.environment]
 python-version = "3.13"
@@ -46,12 +52,6 @@ exclude-newer = "2 days"
 exclude-newer-package = { ai = false, vercel = false, vercel-cache = false, vercel-headers = false, vercel-internal-telemetry = false, vercel-oidc = false }
 
 [tool.uv.sources]
-vercel = { git = "https://github.com/vercel/vercel-py", branch = "main", subdirectory = "src/vercel" }
-vercel-cache = { git = "https://github.com/vercel/vercel-py", branch = "main", subdirectory = "src/vercel-cache" }
-vercel-headers = { git = "https://github.com/vercel/vercel-py", branch = "main", subdirectory = "src/vercel-headers" }
-vercel-oidc = { git = "https://github.com/vercel/vercel-py", branch = "main", subdirectory = "src/vercel-oidc" }
-vercel-internal-telemetry = { git = "https://github.com/vercel/vercel-py", branch = "main", subdirectory = "src/vercel-internal-telemetry" }
-
 ai = { git = "https://github.com/vercel-labs/ai-python", branch = "main" }
 
 [dependency-groups]
@@ -62,5 +62,7 @@ dev = [
     "pytest-asyncio>=1.4.0",
     "pytest-timeout>=2.4.0",
     "ruff>=0.15.5",
-    "ty~=0.0.37",
+    # ty 0.0.69 mis-flags fields of a ConfigDict(frozen=False) subclass of a
+    # frozen pydantic model as read-only (tests/conftest.py MockProvider).
+    "ty==0.0.44",
 ]

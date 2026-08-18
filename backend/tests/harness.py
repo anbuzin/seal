@@ -85,12 +85,10 @@ class InProcessWorld(wf_local.LocalWorld):
         try:
             if delay:
                 await asyncio.sleep(min(delay, 1.0))
-            if queue_name.startswith("__wkf_workflow_"):
-                handler = wf_runtime.workflow_handler
-            elif queue_name.startswith("__wkf_step_"):
-                handler = wf_runtime.step_handler
-            else:
+            # workflow_handler dispatches both runs and steps (via step_id).
+            if not queue_name.startswith("__wkf_workflow_"):
                 raise RuntimeError(f"unexpected queue: {queue_name}")
+            handler = wf_runtime.workflow_handler
             run_id = getattr(message, "run_id", None) or message.workflow_run_id
             lock = self._locks.setdefault(run_id, asyncio.Lock())
             attempt = 1
