@@ -390,6 +390,7 @@ class DurableAgent(ai.Agent):
                 tool_message = runner.get_tool_message()
 
             if tool_message is not None:
+                # HACK: TODO(sully)
                 # the library computes aggregator model_input only for
                 # generator tools (and backfills only at run start), so a
                 # MessageBundle from the subagent hack would reach the next
