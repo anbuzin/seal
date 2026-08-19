@@ -20,9 +20,9 @@ import random
 from typing import Any
 
 import ai
+import vercel._internal.workflow.runtime as wf_runtime  # noqa: E402
+import vercel._internal.workflow.worlds.local as wf_local  # noqa: E402
 import vercel.workflow  # noqa: E402
-import vercel.workflow._internal.runtime as wf_runtime  # noqa: E402
-import vercel.workflow._internal.worlds.local as wf_local  # noqa: E402
 
 import agent.driver as driver  # noqa: E402
 from agent import proto, stream  # noqa: E402
@@ -116,13 +116,17 @@ class InProcessWorld(wf_local.LocalWorld):
             self.errors.append(error)
 
 
-async def start_session(
-    session_id: str, prompt: str
-) -> vercel.workflow.Run[proto.SessionOutput]:
-    return await vercel.workflow.start(
+async def start_session(session_id: str, prompt: str) -> Any:
+    run = await vercel.workflow.start(
         driver.run_session,
-        proto.SessionInput(session_id=session_id, prompt=prompt),
+        proto.SessionInput(session_id=session_id).model_dump(mode="json"),
     )
+    await wait_for_lifecycle(session_id, proto.SESSION_STARTED)
+    await resume_session(
+        proto.session_inbox_token(session_id),
+        proto.NewUserMessage(prompt=prompt),
+    )
+    return run
 
 
 async def wait_for_lifecycle(
@@ -142,7 +146,7 @@ async def wait_for_lifecycle(
 
 
 async def resume_session(token: str, payload: proto.NewUserMessage) -> None:
-    await _resume_hook(token, proto.SessionHook(payload=payload))
+    await _resume_hook(token, proto.SessionInboxHook(command=payload))
 
 
 async def resume_approval(
@@ -165,8 +169,8 @@ async def _resume_hook(token: str, hook: vercel.workflow.BaseHook) -> None:
             await asyncio.sleep(0.05)
 
 
-async def wait_run[T](run: vercel.workflow.Run[T], timeout: float = 20) -> T:
-    async def poll() -> T:
+async def wait_run(run: Any, timeout: float = 20) -> Any:
+    async def poll() -> Any:
         while await run.status() not in ("completed", "failed", "cancelled"):
             await asyncio.sleep(0.05)
         return await run.return_value()

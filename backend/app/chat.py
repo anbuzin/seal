@@ -38,6 +38,10 @@ from agent import driver, proto, session, stream
 _TERMINAL = {proto.SESSION_WAITING, proto.SESSION_COMPLETED, proto.SESSION_FAILED}
 
 
+class SessionUnavailableError(Exception):
+    """The session cannot accept a new user message right now."""
+
+
 async def active_run_start_index(session_id: str) -> int | None:
     """Return the stream index to resume the in-flight run from, else ``None``.
 
@@ -77,19 +81,22 @@ async def start_or_resume(session_id: str, prompt: str) -> int:
     Returns the stream index to tail from so only the new turn reaches the
     client.
     """
+    if await active_run_start_index(session_id) is not None:
+        raise SessionUnavailableError("A turn is already running")
+
     start_index = await stream.tail_index(session_id) + 1
 
     if await session.read_session(session_id) is None:
         await vercel.workflow.start(
             driver.run_session,
-            proto.SessionInput(session_id=session_id, prompt=prompt),
+            proto.SessionInput(session_id=session_id).model_dump(mode="json"),
         )
-    else:
-        turn_index = await _waiting_turn_index(session_id)
-        await _resume(
-            f"seal-session:{session_id}:{turn_index}",
-            proto.SessionHook(payload=proto.NewUserMessage(prompt=prompt)),
-        )
+        await _wait_for_lifecycle(session_id, proto.SESSION_STARTED)
+
+    await _resume(
+        proto.session_inbox_token(session_id),
+        proto.SessionInboxHook(command=proto.NewUserMessage(prompt=prompt)),
+    )
     return start_index
 
 
@@ -262,6 +269,14 @@ def _upsert(messages: list[ai.messages.Message], message: ai.messages.Message) -
             messages[index] = message
             return
     messages.append(message)
+
+
+async def _wait_for_lifecycle(session_id: str, type_: str) -> None:
+    while True:
+        async for event in stream.replay(session_id):
+            if isinstance(event, proto.LifecycleEvent) and event.type == type_:
+                return
+        await asyncio.sleep(0.05)
 
 
 async def _resume(token: str, hook: vercel.workflow.BaseHook) -> None:

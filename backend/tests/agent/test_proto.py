@@ -34,9 +34,24 @@ def _hook_event() -> events_.HookEvent:
 
 def test_hook_payloads_round_trip() -> None:
     """Each hook's payload survives the resume serialize -> validate round trip."""
-    message = proto.NewUserMessage(prompt="hi", close=False)
-    restored = proto.NewUserMessage.model_validate(message.model_dump(mode="json"))
+    message = proto.SessionInboxHook(
+        command=proto.NewUserMessage(prompt="hi", close=False)
+    )
+    restored = proto.SessionInboxHook.model_validate(message.model_dump(mode="json"))
     assert restored == message
+    assert isinstance(restored.command, proto.NewUserMessage)
+
+    finished = proto.SessionInboxHook(
+        command=proto.TurnFinished(
+            turn_index=2,
+            output=proto.TurnOutput(kind="suspend", messages=[ai.user_message("hi")]),
+        )
+    )
+    restored_finished = proto.SessionInboxHook.model_validate(
+        finished.model_dump(mode="json")
+    )
+    assert restored_finished == finished
+    assert isinstance(restored_finished.command, proto.TurnFinished)
 
     approval = proto.ApprovalHook(
         response=proto.ToolApprovalResponse(

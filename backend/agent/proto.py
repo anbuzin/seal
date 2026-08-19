@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 import ai
 import pydantic
@@ -26,9 +26,12 @@ def approval_hook_token(session_id: str, tool_call_id: str) -> str:
     return f"seal-approval:{session_id}:{TOOL_APPROVAL_HOOK_PREFIX}{tool_call_id}"
 
 
+def session_inbox_token(session_id: str) -> str:
+    return f"seal-session-inbox:{session_id}"
+
+
 class SessionInput(pydantic.BaseModel):
     session_id: str
-    prompt: str
 
 
 class SessionOutput(pydantic.BaseModel):
@@ -41,11 +44,6 @@ class NewUserMessage(pydantic.BaseModel):
     kind: Literal["new_user_message"] = "new_user_message"
     prompt: str | None = None
     close: bool = False
-
-
-# carries the next user message (or a close) to a session parked in ``suspend``.
-class SessionHook(pydantic.BaseModel, vercel.workflow.BaseHook):
-    payload: NewUserMessage
 
 
 # one gated call's decision, delivered on its own per-approval hook.
@@ -67,7 +65,8 @@ class TurnInput(pydantic.BaseModel):
     # gated turns expose bash behind approval + subagent; ungated (subagent
     # children) run bash directly and cannot delegate further.
     gated: bool = True
-    turn_hook_token: str
+    # only subagent turns report directly to their waiting parent tool.
+    parent_hook_token: str | None = None
     # index of this turn within its session (always 0 for subagent turns).
     turn_index: int = 0
     # turn's root span. llm_steps and child turns nest under it.
@@ -89,7 +88,22 @@ class TurnOutput(pydantic.BaseModel):
     error: str | None = None
 
 
-class TurnHook(pydantic.BaseModel, vercel.workflow.BaseHook):
+class TurnFinished(pydantic.BaseModel):
+    kind: Literal["turn_finished"] = "turn_finished"
+    turn_index: int
+    output: TurnOutput
+
+
+type SessionCommand = NewUserMessage | TurnFinished
+
+
+# all work entering the long-lived session is delivered through this inbox.
+class SessionInboxHook(pydantic.BaseModel, vercel.workflow.BaseHook):
+    command: Annotated[SessionCommand, pydantic.Field(discriminator="kind")]
+
+
+# subagents still return directly to their waiting parent tool.
+class SubagentHook(pydantic.BaseModel, vercel.workflow.BaseHook):
     output: TurnOutput
 
 

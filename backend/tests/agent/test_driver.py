@@ -55,8 +55,8 @@ async def test_single_turn_suspends_then_closes(
     assert state.messages[-1].text == "hello there"
     assert_message_invariants(state.messages)
 
-    await _resume("seal-session:s1:0", proto.NewUserMessage(close=True))
-    output = await _wait_run(run)
+    await _resume(proto.session_inbox_token("s1"), proto.NewUserMessage(close=True))
+    output = proto.SessionOutput.model_validate(await _wait_run(run))
     assert output.output == "hello there"
     assert not output.is_error
 
@@ -79,7 +79,9 @@ async def test_resume_appends_user_message_without_duplicating_history(
     await _start("s1", "one")
     await _wait_for_lifecycle("s1", proto.SESSION_WAITING)
 
-    await _resume("seal-session:s1:0", proto.NewUserMessage(prompt="two"))
+    await _resume(
+        proto.session_inbox_token("s1"), proto.NewUserMessage(prompt="two")
+    )
     await _wait_for_lifecycle("s1", proto.SESSION_WAITING, count=2)
 
     state = await session.read_session("s1")
