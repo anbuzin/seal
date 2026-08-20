@@ -107,29 +107,6 @@ async def test_run_parked_on_approval_is_resumable_from_run_start() -> None:
     assert await chat.active_run_start_index("s1") == 0
 
 
-# --- _waiting_turn_index ----------------------------------------------------------
-
-
-async def test_waiting_turn_index_takes_the_latest_waiting_event() -> None:
-    await _write(
-        "s1",
-        stream.session_waiting(turn_index=0),
-        stream.turn_started(turn_index=1),
-        stream.session_waiting(turn_index=1),
-    )
-    assert await chat._waiting_turn_index("s1") == 1
-
-
-async def test_waiting_turn_index_falls_back_to_approval_park() -> None:
-    # a turn parked on a gated tool emits tool_approval.requested, not session.waiting.
-    await _write(
-        "s1",
-        stream.session_waiting(turn_index=0),
-        stream.tool_approval_requested(turn_index=1),
-    )
-    assert await chat._waiting_turn_index("s1") == 1
-
-
 # --- bundle_to_wire ---------------------------------------------------------------
 
 

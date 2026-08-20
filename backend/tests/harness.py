@@ -150,11 +150,11 @@ async def resume_session(token: str, payload: proto.NewUserMessage) -> None:
 
 
 async def resume_approval(
-    session_id: str, response: proto.ToolApprovalResponse, turn_index: int = 0
+    session_id: str, response: proto.ToolApprovalResponse
 ) -> None:
     await _resume_hook(
-        proto.turn_inbox_token(session_id, turn_index),
-        proto.TurnInboxHook(command=proto.TurnApproval(response=response)),
+        proto.session_inbox_token(session_id),
+        proto.SessionInboxHook(command=proto.SubmitToolApproval(response=response)),
     )
 
 

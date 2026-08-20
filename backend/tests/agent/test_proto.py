@@ -53,6 +53,19 @@ def test_hook_payloads_round_trip() -> None:
     assert restored_finished == finished
     assert isinstance(restored_finished.command, proto.TurnFinished)
 
+    submitted_approval = proto.SessionInboxHook(
+        command=proto.SubmitToolApproval(
+            response=proto.ToolApprovalResponse(
+                tool_call_id="tc-1", granted=False, reason="nope"
+            )
+        )
+    )
+    restored_submission = proto.SessionInboxHook.model_validate(
+        submitted_approval.model_dump(mode="json")
+    )
+    assert restored_submission == submitted_approval
+    assert isinstance(restored_submission.command, proto.SubmitToolApproval)
+
     approval = proto.TurnInboxHook(
         command=proto.TurnApproval(
             response=proto.ToolApprovalResponse(

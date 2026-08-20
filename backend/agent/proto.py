@@ -44,6 +44,11 @@ class NewUserMessage(pydantic.BaseModel):
     close: bool = False
 
 
+class SubmitToolApproval(pydantic.BaseModel):
+    kind: Literal["submit_tool_approval"] = "submit_tool_approval"
+    response: ToolApprovalResponse
+
+
 class SessionState(pydantic.BaseModel):
     session_id: str
     messages: list[ai.messages.Message]
@@ -105,7 +110,7 @@ class TurnFinished(pydantic.BaseModel):
     output: TurnOutput
 
 
-type SessionCommand = NewUserMessage | TurnFinished
+type SessionCommand = NewUserMessage | SubmitToolApproval | TurnFinished
 
 
 # all work entering the long-lived session is delivered through this inbox.

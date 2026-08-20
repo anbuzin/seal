@@ -44,6 +44,28 @@ async def save_session(state_data: dict[str, Any]) -> None:
     await session.write_session(proto.SessionState.model_validate(state_data))
 
 
+@workflow.step
+async def forward_tool_approval(
+    session_id: str,
+    turn_index: int,
+    response_data: dict[str, Any],
+) -> None:
+    hook = proto.TurnInboxHook(
+        command=proto.TurnApproval(
+            response=proto.ToolApprovalResponse.model_validate(response_data)
+        )
+    )
+    token = proto.turn_inbox_token(session_id, turn_index)
+    for attempt in range(40):
+        try:
+            await hook.resume(token)
+            return
+        except vercel.workflow.HookNotFoundError:
+            if attempt == 39:
+                raise
+            await asyncio.sleep(0.05)
+
+
 def _last_text(messages: list[ai.messages.Message]) -> str:
     for message in reversed(messages):
         if message.role == "assistant" and message.text:
@@ -137,6 +159,15 @@ async def run_session(session_input: dict[str, Any]) -> dict[str, Any]:
                         messages=state.messages,
                         turn_index=active_turn_index,
                     ).model_dump(mode="json")
+                )
+
+            case proto.SubmitToolApproval():
+                if active_turn_index is None:
+                    continue
+                await forward_tool_approval(
+                    session_id,
+                    active_turn_index,
+                    command.response.model_dump(mode="json"),
                 )
 
             case proto.TurnFinished():
