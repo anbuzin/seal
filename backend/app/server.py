@@ -48,7 +48,7 @@ import fastapi.responses  # noqa: E402
 import pydantic  # noqa: E402
 from vercel.blob import AsyncBlobClient  # noqa: E402
 
-from agent import proto  # noqa: E402
+from agent import proto, session  # noqa: E402
 from app import attachments, chat, sessions  # noqa: E402
 
 
@@ -169,11 +169,31 @@ async def get_session(session_id: str) -> dict[str, object]:
         raise fastapi.HTTPException(status_code=404, detail="Session not found")
     # committed turns only; a turn still parked on an approval is in flight (not
     # persisted) and the UI rebuilds it from the resumed stream (GET /chat/.../stream).
-    ui_messages = ai_sdk.to_ui_messages(await sessions.history(session_id))
+    state = await session.read_session(session_id)
+    history = (
+        state.messages[: state.active_ui_run_message_index]
+        if state is not None and state.active_ui_run_message_index is not None
+        else state.messages
+        if state is not None
+        else []
+    )
+    visible_messages = (
+        [
+            message
+            for message in history
+            if message.role != "system"
+            and message.id not in state.hidden_ui_message_ids
+        ]
+        if state is not None
+        else []
+    )
+    ui_messages = ai_sdk.to_ui_messages(visible_messages)
     serialized = [
         message.model_dump(mode="json", by_alias=True) for message in ui_messages
     ]
-    return {**meta.model_dump(), "messages": serialized}
+    tasks = dict(state.background_tasks) if state is not None else {}
+    projected = chat.project_background_tasks(serialized, tasks)
+    return {**meta.model_dump(), "messages": projected}
 
 
 @app.post("/api/sessions/{session_id}/title")

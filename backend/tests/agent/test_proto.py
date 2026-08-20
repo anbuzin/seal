@@ -53,6 +53,36 @@ def test_hook_payloads_round_trip() -> None:
     assert restored_finished == finished
     assert isinstance(restored_finished.command, proto.TurnFinished)
 
+    background_start = proto.SessionInboxHook(
+        command=proto.StartBackgroundTask(
+            task_id="tc-sub",
+            prompt="research it",
+            name="researcher",
+            parent_turn_index=2,
+        )
+    )
+    restored_background_start = proto.SessionInboxHook.model_validate(
+        background_start.model_dump(mode="json")
+    )
+    assert restored_background_start == background_start
+    assert isinstance(restored_background_start.command, proto.StartBackgroundTask)
+
+    background_finished = proto.SessionInboxHook(
+        command=proto.BackgroundTaskFinished(
+            task_id="tc-sub",
+            output=proto.TurnOutput(
+                kind="suspend", messages=[ai.assistant_message("report")]
+            ),
+        )
+    )
+    restored_background_finished = proto.SessionInboxHook.model_validate(
+        background_finished.model_dump(mode="json")
+    )
+    assert restored_background_finished == background_finished
+    assert isinstance(
+        restored_background_finished.command, proto.BackgroundTaskFinished
+    )
+
     submitted_approval = proto.SessionInboxHook(
         command=proto.SubmitToolApproval(
             response=proto.ToolApprovalResponse(
@@ -166,7 +196,19 @@ def test_session_state_round_trip_is_dump_stable() -> None:
             parts=[ai.tool_result_part("tc-1", tool_name="subagent", result=bundle)],
         ),
     ]
-    state = proto.SessionState(session_id="s1", messages=messages)
+    state = proto.SessionState(
+        session_id="s1",
+        messages=messages,
+        background_tasks={
+            "tc-1": proto.BackgroundTaskState(
+                task_id="tc-1",
+                child_session_id="s1:child:tc-1",
+                name="researcher",
+                status="completed",
+                messages=list(bundle.messages),
+            )
+        },
+    )
 
     once = state.model_dump(mode="json")
     restored = proto.SessionState.model_validate(once)
@@ -177,3 +219,6 @@ def test_session_state_round_trip_is_dump_stable() -> None:
     assert roles == ["system", "user", "assistant", "tool"]
     assert restored.messages[2].tool_calls[0].tool_call_id == "tc-1"
     assert restored.messages[3].tool_results[0].tool_call_id == "tc-1"
+    task = restored.background_tasks["tc-1"]
+    assert task.status == "completed"
+    assert task.messages[-1].text == "child answer"

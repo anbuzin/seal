@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import collections.abc
 import datetime
-from typing import Literal
+from typing import Any, Literal
 
 import pydantic
 
@@ -15,37 +15,44 @@ __all__ = ["get_readable", "get_writable"]
 # lifecycle event constructors
 
 
-def session_started() -> proto.LifecycleEvent:
-    return proto.LifecycleEvent(type=proto.SESSION_STARTED)
+def session_started() -> dict[str, Any]:
+    return proto.LifecycleEvent(type=proto.SESSION_STARTED).model_dump(mode="json")
 
 
-def session_waiting(*, turn_index: int) -> proto.LifecycleEvent:
+def session_waiting(
+    *, turn_index: int, active_background_tasks: int = 0
+) -> dict[str, Any]:
     return proto.LifecycleEvent(
-        type=proto.SESSION_WAITING, data={"turn_index": turn_index}
-    )
+        type=proto.SESSION_WAITING,
+        data={
+            "turn_index": turn_index,
+            "active_background_tasks": active_background_tasks,
+        },
+    ).model_dump(mode="json")
 
 
-def session_completed(*, is_error: bool = False) -> proto.LifecycleEvent:
+def session_completed(*, is_error: bool = False) -> dict[str, Any]:
     return proto.LifecycleEvent(
         type=proto.SESSION_COMPLETED, data={"is_error": is_error}
-    )
+    ).model_dump(mode="json")
 
 
-def turn_started(*, turn_index: int) -> proto.LifecycleEvent:
+def turn_started(*, turn_index: int, background: bool = False) -> dict[str, Any]:
     return proto.LifecycleEvent(
-        type=proto.TURN_STARTED, data={"turn_index": turn_index}
-    )
+        type=proto.TURN_STARTED,
+        data={"turn_index": turn_index, "background": background},
+    ).model_dump(mode="json")
 
 
-def turn_completed(*, turn_index: int, kind: str) -> proto.LifecycleEvent:
+def turn_completed(*, turn_index: int, kind: str) -> dict[str, Any]:
     return proto.LifecycleEvent(
         type=proto.TURN_COMPLETED, data={"turn_index": turn_index, "kind": kind}
-    )
+    ).model_dump(mode="json")
 
 
 def subagent_called(
     *, tool_call_id: str, child_session_id: str, name: str
-) -> proto.LifecycleEvent:
+) -> dict[str, Any]:
     return proto.LifecycleEvent(
         type=proto.SUBAGENT_CALLED,
         data={
@@ -53,28 +60,46 @@ def subagent_called(
             "child_session_id": child_session_id,
             "name": name,
         },
-    )
+    ).model_dump(mode="json")
 
 
-def subagent_completed(*, tool_call_id: str, is_error: bool) -> proto.LifecycleEvent:
+def subagent_event(*, tool_call_id: str, event: dict[str, Any]) -> dict[str, Any]:
+    return proto.LifecycleEvent(
+        type=proto.SUBAGENT_EVENT,
+        data={"tool_call_id": tool_call_id, "event": event},
+    ).model_dump(mode="json")
+
+
+def subagent_completed(
+    *,
+    tool_call_id: str,
+    is_error: bool,
+    messages: list[dict[str, Any]] | None = None,
+    error: str | None = None,
+) -> dict[str, Any]:
     return proto.LifecycleEvent(
         type=proto.SUBAGENT_COMPLETED,
-        data={"tool_call_id": tool_call_id, "is_error": is_error},
-    )
+        data={
+            "tool_call_id": tool_call_id,
+            "is_error": is_error,
+            "messages": messages or [],
+            "error": error,
+        },
+    ).model_dump(mode="json")
 
 
-def tool_approval_requested(*, turn_index: int) -> proto.LifecycleEvent:
+def tool_approval_requested(*, turn_index: int) -> dict[str, Any]:
     # the turn parked: every scheduled tool has finished or is awaiting approval.
     return proto.LifecycleEvent(
         type=proto.TOOL_APPROVAL_REQUESTED, data={"turn_index": turn_index}
-    )
+    ).model_dump(mode="json")
 
 
-def reload_requested() -> proto.LifecycleEvent:
+def reload_requested() -> dict[str, Any]:
     # a retried step just wiped its own aborted first attempt's partial
     # output; a client that already streamed that output needs to reload
     # rather than trust it.
-    return proto.LifecycleEvent(type=proto.RELOAD_REQUESTED)
+    return proto.LifecycleEvent(type=proto.RELOAD_REQUESTED).model_dump(mode="json")
 
 
 DEFAULT_STREAM_NAMESPACE = "default"
@@ -88,13 +113,17 @@ class WritableStreamHandle(pydantic.BaseModel):
     stream_id: str
     namespace: str = DEFAULT_STREAM_NAMESPACE
 
-    async def write(self, event: proto.StreamEvent) -> int:
-        data = event.model_dump(mode="json")
+    async def write(self, event: proto.StreamEvent | dict[str, Any]) -> int:
+        validated = proto.STREAM_EVENT_ADAPTER.validate_python(event)
 
-        # stamp the dump, not the caller's event
-        if isinstance(event, proto.LifecycleEvent) and event.at is None:
-            data["at"] = datetime.datetime.now(datetime.UTC).isoformat()
-        return await storage.store().append(self.stream_id, self.namespace, data)
+        # stamp the event with a timestamp
+        if isinstance(validated, proto.LifecycleEvent) and validated.at is None:
+            validated.at = datetime.datetime.now(datetime.UTC).isoformat()
+        return await storage.store().append(
+            self.stream_id,
+            self.namespace,
+            validated.model_dump(mode="json"),
+        )
 
     async def close(self) -> None:
         await storage.store().close(self.stream_id, self.namespace)

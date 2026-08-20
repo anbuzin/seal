@@ -185,4 +185,5 @@ async def lifecycle(session_id: str) -> list[str]:
         event.type
         async for event in stream.replay(session_id)
         if isinstance(event, proto.LifecycleEvent)
+        and event.type != proto.SUBAGENT_EVENT
     ]

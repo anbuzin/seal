@@ -12,13 +12,9 @@ Two lifecycle features surface to the UI:
     the SDK adapter from the pending hook). The turn parks; the browser replies
     with ``addToolApprovalResponse`` which arrives on the next ``POST /chat`` and
     is forwarded back into the durable hook by :func:`submit_approvals`.
-  * subagents — a delegated child agent runs as its own durable workflow writing
-    to its own stream. We tail that child stream concurrently and republish it as
-    *preliminary* nested-``UIMessage`` output on the parent's ``subagent`` tool
-    call, so the user watches the subagent work live. The driver then stores the
-    child's full transcript (a ``MessageBundle``) as the final tool result; both
-    the live preliminary output and :func:`bundle_to_wire` (used on reload) reduce
-    that transcript to the identical nested ``UIMessage`` shape the UI expects.
+  * subagents — a delegated child runs as background work owned by the session.
+    The tool returns an immediate acknowledgement; when the child finishes, the
+    session injects its report as a new user message and starts another root turn.
 """
 
 from __future__ import annotations
@@ -26,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import collections.abc
 import contextlib
+import typing
 
 import ai
 import ai.ui.ai_sdk as ai_sdk
@@ -35,7 +32,10 @@ import vercel.workflow
 
 from agent import driver, proto, session, stream
 
-_TERMINAL = {proto.SESSION_WAITING, proto.SESSION_COMPLETED, proto.SESSION_FAILED}
+_SESSION_TERMINAL = {
+    proto.SESSION_COMPLETED,
+    proto.SESSION_FAILED,
+}
 
 
 class SessionUnavailableError(Exception):
@@ -61,16 +61,24 @@ async def active_run_start_index(session_id: str) -> int | None:
     """
     run_start: int | None = None
     seen_boundary = True
+    session_opener = False
     index = -1
     async for event in stream.replay(session_id):
         index += 1
         if not isinstance(event, proto.LifecycleEvent):
             continue
-        if event.type in (proto.SESSION_STARTED, proto.TURN_STARTED) and seen_boundary:
-            # first opener after a boundary marks where the next run begins.
+        if event.type == proto.TURN_STARTED and (seen_boundary or session_opener):
             run_start = index
             seen_boundary = False
-        elif event.type in _TERMINAL:
+            session_opener = False
+        elif event.type == proto.SESSION_STARTED and seen_boundary:
+            # Compatibility for a first turn captured before turn.started existed.
+            run_start = index
+            seen_boundary = False
+            session_opener = True
+        elif event.type == proto.SESSION_WAITING:
+            seen_boundary = event.data.get("active_background_tasks", 0) == 0
+        elif event.type in _SESSION_TERMINAL:
             seen_boundary = True
     return None if seen_boundary else run_start
 
@@ -105,15 +113,16 @@ async def submit_approvals(
 ) -> int:
     """Send each UI approval decision through the session's public inbox.
 
-    Returns the stream index to tail the continuation from: the next index after
-    the park, computed *before* resuming so the continuation can't outrun it. The
-    resubmit carries the parked assistant message, so the client keeps streaming
-    into it and the continuation (tool output + answer) folds in.
+    Resume after the durable approval marker, not at the current tail: background
+    child events may arrive while the human is deciding and must still reach the
+    one backend-reconciled UI stream.
     """
     if await active_run_start_index(session_id) is None:
         raise SessionUnavailableError("No turn is waiting for approval")
 
-    start_index = await stream.tail_index(session_id) + 1
+    start_index = (
+        await _latest_event_index(session_id, proto.TOOL_APPROVAL_REQUESTED) + 1
+    )
     token = proto.session_inbox_token(session_id)
     for approval in approvals:
         await _resume(
@@ -123,21 +132,71 @@ async def submit_approvals(
     return start_index
 
 
+def background_task_output(
+    messages: collections.abc.Sequence[ai.messages.Message],
+) -> list[dict[str, object]]:
+    """Return child assistant bubbles in the nested UI shape the tool card renders."""
+    return [
+        message.model_dump(mode="json", by_alias=True)
+        for message in ai_sdk.to_ui_messages(list(messages))
+        if message.role == "assistant"
+    ]
+
+
+def project_background_tasks(
+    ui_messages: list[dict[str, object]],
+    tasks: collections.abc.Mapping[str, proto.BackgroundTaskState],
+) -> list[dict[str, object]]:
+    """Overlay durable task presentation state without changing model history."""
+    for message in ui_messages:
+        parts = message.get("parts")
+        if not isinstance(parts, list):
+            continue
+        for raw_part in parts:
+            if not isinstance(raw_part, dict):
+                continue
+            part = typing.cast(dict[str, object], raw_part)
+            task_id = part.get("toolCallId")
+            task = tasks.get(task_id) if isinstance(task_id, str) else None
+            if task is None:
+                continue
+            if task.status == "failed":
+                part["state"] = "output-error"
+                part["errorText"] = task.error or "Unknown subagent error"
+                part.pop("output", None)
+                part.pop("preliminary", None)
+            else:
+                part["state"] = "output-available"
+                if task.status == "completed" or task.messages:
+                    part["output"] = background_task_output(task.messages)
+                part["preliminary"] = task.status == "running"
+    return ui_messages
+
+
+def _upsert_message(
+    messages: list[ai.messages.Message], message: ai.messages.Message
+) -> None:
+    for index, existing in enumerate(messages):
+        if existing.id == message.id:
+            messages[index] = message
+            return
+    messages.append(message)
+
+
 async def to_sse(
     session_id: str, start_index: int
 ) -> collections.abc.AsyncIterator[str]:
-    """Stream one turn of the session as AI SDK UI SSE chunks.
+    """Stream one logical UI run as AI SDK UI SSE chunks.
 
-    The parent turn is converted by the SDK adapter. Subagent progress is tailed
-    off-thread and interleaved as preliminary tool-output events (the adapter
-    never sees them — they sit on tool calls it already started). All events
-    funnel through one queue so the merge is sequential.
+    A UI run starts with a user turn and remains open across background subagent
+    progress and the automatic root turn that reports the results. All durable
+    events are already ordered on the parent session stream, so the backend can
+    reconcile them before the browser sees a single AI SDK stream.
     """
     queue: asyncio.Queue[ui_events.UIMessageStreamEvent | None] = asyncio.Queue()
-    children: list[asyncio.Task[None]] = []
 
     async def pump_adapter() -> None:
-        events = _turn_events(session_id, start_index, queue, children)
+        events = _ui_run_events(session_id, start_index, queue)
         async for event in ai_sdk.to_stream(events):
             await queue.put(event)
         await queue.put(None)
@@ -148,131 +207,108 @@ async def to_sse(
             line = await queue.get()
             if line is None:
                 break
-            formatted = outbound_stream.format_sse(line)
-            yield formatted
+            yield outbound_stream.format_sse(line)
         yield outbound_stream.format_done_sse()
     finally:
         adapter_task.cancel()
-        for child in children:
-            child.cancel()
     with contextlib.suppress(asyncio.CancelledError):
         await adapter_task
 
 
-async def _turn_events(
+async def _ui_run_events(
     session_id: str,
     start_index: int,
     queue: asyncio.Queue[ui_events.UIMessageStreamEvent | None],
-    children: list[asyncio.Task[None]],
 ) -> collections.abc.AsyncIterator[ai.events.AgentEvent]:
-    """Yield this turn's ``AgentEvent``s, ending at the next turn boundary.
+    """Yield one causally connected UI run from the parent durable stream.
 
-    Lifecycle events stay server-side: ``subagent.called`` spins up a concurrent
-    tail of the child stream (collected in ``children`` so the caller can cancel
-    it; its progress lines go straight onto ``queue``), and the loop returns once
-    the turn parks on an approval or finishes.
-
-    An approval resume just tails the continuation from after the park; its first
-    event is a tool result (no ``turn_id`` → id-less ``start``), so the client
-    folds it into the assistant message it resubmitted.
-
-    ``reload.requested`` is a permanent stream entry, not a one-shot signal --
-    a later connection replaying history past it sees it again. Every connection
-    forwards the reload marker and continues reading, so the client can discard
-    the current step before applying events from the retried step.
+    Root-turn ``AgentEvent`` objects pass through the stock Python AI SDK adapter.
+    Proxied child events update the original subagent tool call directly on the
+    same UI queue. A root turn ending is not a presentation boundary while its
+    background work or automatic follow-up remains active; quiescent
+    ``session.waiting`` is the boundary.
     """
+    active_tasks: set[str] = set()
+    task_messages: dict[str, list[ai.messages.Message]] = {}
+
     async for event in stream.get_readable(session_id, start_index=start_index):
         if not isinstance(event, proto.LifecycleEvent):
-            yield event  # ai.events.AgentEvent
+            yield event
             continue
 
-        if event.type == proto.SUBAGENT_CALLED:
-            children.append(asyncio.create_task(_pump_subagent(event, queue)))
+        task_id = event.data.get("tool_call_id")
+        if event.type == proto.SUBAGENT_CALLED and isinstance(task_id, str):
+            active_tasks.add(task_id)
+            task_messages.setdefault(task_id, [])
+        elif event.type == proto.SUBAGENT_EVENT and isinstance(task_id, str):
+            child_event = proto.STREAM_EVENT_ADAPTER.validate_python(
+                event.data.get("event")
+            )
+            if (
+                isinstance(child_event, proto.LifecycleEvent)
+                and child_event.type == proto.RELOAD_REQUESTED
+            ):
+                task_messages[task_id] = []
+            message = getattr(child_event, "message", None)
+            if isinstance(message, ai.messages.Message):
+                _upsert_message(task_messages.setdefault(task_id, []), message)
+            output = background_task_output(task_messages.get(task_id, []))
+            if output:
+                await queue.put(
+                    ui_events.UIToolOutputAvailableEvent(
+                        tool_call_id=task_id,
+                        output=output,
+                        preliminary=True,
+                    )
+                )
+        elif event.type == proto.SUBAGENT_COMPLETED and isinstance(task_id, str):
+            active_tasks.discard(task_id)
+            if event.data.get("is_error"):
+                await queue.put(
+                    ui_events.UIToolOutputErrorEvent(
+                        tool_call_id=task_id,
+                        error_text=str(
+                            event.data.get("error") or "Unknown subagent error"
+                        ),
+                    )
+                )
+            else:
+                messages = [
+                    ai.messages.Message.model_validate(message)
+                    for message in event.data.get("messages", [])
+                ]
+                task_messages[task_id] = messages
+                await queue.put(
+                    ui_events.UIToolOutputAvailableEvent(
+                        tool_call_id=task_id,
+                        output=background_task_output(messages),
+                        preliminary=False,
+                    )
+                )
         elif event.type == proto.TOOL_APPROVAL_REQUESTED:
-            # turn parks until the human responds on the next /chat request.
             return
         elif event.type == proto.RELOAD_REQUESTED:
-            # Tell the client to discard the current step, then keep reading so
-            # events from the retried step can use the same connection.
             await queue.put(ui_events.UIFinishStepEvent())
             await queue.put(ui_events.UIDataEvent(data_type="reload", data={}))
             await queue.put(ui_events.UIStartStepEvent())
-
-        elif event.type in _TERMINAL:
+        elif event.type == proto.SESSION_WAITING:
+            remaining = event.data.get("active_background_tasks")
+            if remaining == 0 or (remaining is None and not active_tasks):
+                return
+        elif event.type in _SESSION_TERMINAL:
             return
 
 
-def bundle_to_wire(
-    messages: collections.abc.Sequence[ai.messages.Message],
-) -> dict[str, object] | None:
-    """Flatten a subagent transcript into one nested wire ``UIMessage``.
-
-    The child may take several turns; we fold all of its assistant bubbles into a
-    single ``UIMessage`` (anchored on the first) so the whole trajectory renders
-    under the parent's ``subagent`` tool call. Returns ``None`` when the child has
-    produced no assistant message yet.
-    """
-    # TODO: Do we really need all this? It is very similar to stuff we
-    # do in `ai`...
-
-    bubbles = [
-        bubble
-        for bubble in ai_sdk.to_ui_messages(list(messages))
-        if bubble.role == "assistant"
-    ]
-    if not bubbles:
-        return None
-    nested = bubbles[0].model_dump(mode="json", by_alias=True)
-    nested["parts"] = [
-        part
-        for bubble in bubbles
-        for part in bubble.model_dump(mode="json", by_alias=True)["parts"]
-    ]
-    return nested
-
-
-async def _pump_subagent(
-    event: proto.LifecycleEvent,
-    queue: asyncio.Queue[ui_events.UIMessageStreamEvent | None],
-) -> None:
-    """Tail a child session stream, republishing it as preliminary tool output.
-
-    Each child ``AgentEvent`` carrying a message is folded into a growing nested
-    ``UIMessage`` and pushed as a preliminary ``tool-output-available`` SSE line
-    on the parent's ``subagent`` tool call. The final, non-preliminary output is
-    the same nested ``UIMessage``, rebuilt on reload from the driver-stored
-    ``MessageBundle`` via :func:`bundle_to_wire`.
-    """
-    tool_call_id = str(event.data.get("tool_call_id"))
-    child_session_id = str(event.data.get("child_session_id"))
-
-    child_messages: list[ai.messages.Message] = []
-    async for child_event in stream.get_readable(child_session_id, start_index=0):
-        if isinstance(child_event, proto.LifecycleEvent):
-            continue
-        message = getattr(child_event, "message", None)
-        if not isinstance(message, ai.messages.Message):
-            continue
-        _upsert(child_messages, message)
-        nested = bundle_to_wire(child_messages)
-        if nested is None:
-            continue
-        await queue.put(
-            ui_events.UIToolOutputAvailableEvent(
-                tool_call_id=tool_call_id,
-                output=nested,
-                preliminary=True,
-            )
-        )
-
-
-def _upsert(messages: list[ai.messages.Message], message: ai.messages.Message) -> None:
-    """Replace the message with the same id, else append it."""
-    for index, existing in enumerate(messages):
-        if existing.id == message.id:
-            messages[index] = message
-            return
-    messages.append(message)
+async def _latest_event_index(session_id: str, type_: str) -> int:
+    found: int | None = None
+    index = -1
+    async for event in stream.replay(session_id):
+        index += 1
+        if isinstance(event, proto.LifecycleEvent) and event.type == type_:
+            found = index
+    if found is None:
+        raise SessionUnavailableError(f"No {type_} event to resume from")
+    return found
 
 
 async def _wait_for_lifecycle(session_id: str, type_: str) -> None:

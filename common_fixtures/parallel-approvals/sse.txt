@@ -22,7 +22,7 @@ data: {"approvalId": "approve_tc-b", "toolCallId": "tc-b", "type": "tool-approva
 
 data: {"type": "finish-step"}
 
-data: {"type": "finish", "finishReason": "stop", "messageMetadata": {"aiPython": {"sourceMessages": [{"id": "msg_03c8af0bb67a", "role": "assistant", "turnId": null, "partIds": ["text-0", "tc-a", "tc-b"]}, {"id": "msg_6666a431d5e2", "role": "internal", "turnId": null, "partIds": ["part_9a75c8bc5936"]}, {"id": "msg_4e22faddc157", "role": "internal", "turnId": null, "partIds": ["part_2262ce24a1d5"]}]}}}
+data: {"type": "finish", "finishReason": "stop", "messageMetadata": {"aiPython": {"sourceMessages": [{"id": "msg_03c8af0bb67a", "role": "assistant", "turnId": null, "partIds": ["text-0", "tc-a", "tc-b"]}, {"id": "msg_ec679ff3f399", "role": "internal", "turnId": null, "partIds": ["part_c7db42364ce0"]}, {"id": "msg_99bd3b452d78", "role": "internal", "turnId": null, "partIds": ["part_7000c7786369"]}]}}}
 
 data: [DONE]
 

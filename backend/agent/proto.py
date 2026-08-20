@@ -49,9 +49,26 @@ class SubmitToolApproval(pydantic.BaseModel):
     response: ToolApprovalResponse
 
 
+class BackgroundTaskState(pydantic.BaseModel):
+    task_id: str
+    child_session_id: str
+    name: str
+    status: Literal["running", "completed", "failed"] = "running"
+    messages: list[ai.messages.Message] = pydantic.Field(default_factory=list)
+    error: str | None = None
+
+
 class SessionState(pydantic.BaseModel):
     session_id: str
     messages: list[ai.messages.Message]
+    background_tasks: dict[str, BackgroundTaskState] = pydantic.Field(
+        default_factory=dict
+    )
+    hidden_ui_message_ids: set[str] = pydantic.Field(default_factory=set)
+    # While a logical UI run is active, GET /sessions exposes only messages before
+    # this index and the reconnect stream rebuilds the assistant response from its
+    # durable opener. The triggering user message is therefore still visible.
+    active_ui_run_message_index: int | None = None
 
 
 # Turn inputs / outputs
@@ -63,8 +80,9 @@ class TurnInput(pydantic.BaseModel):
     # gated turns expose bash behind approval + subagent; ungated (subagent
     # children) run bash directly and cannot delegate further.
     gated: bool = True
-    # only subagent turns report directly to their waiting parent tool.
-    parent_hook_token: str | None = None
+    # Background turns report completion to the owning root session.
+    parent_session_id: str | None = None
+    background_task_id: str | None = None
     # index of this turn within its session (always 0 for subagent turns).
     turn_index: int = 0
     # turn's root span. llm_steps and child turns nest under it.
@@ -75,6 +93,7 @@ class TurnInput(pydantic.BaseModel):
 # each schedule so a tool can reach it without smuggling args. never journaled.
 class ToolCallContext(pydantic.BaseModel):
     session_id: str
+    turn_index: int
     tool_call_id: str
     # the enclosing turn's root span; a spawned child turn nests under it.
     turn_span: ai.experimental_telemetry.Span | None = None
@@ -110,17 +129,35 @@ class TurnFinished(pydantic.BaseModel):
     output: TurnOutput
 
 
-type SessionCommand = NewUserMessage | SubmitToolApproval | TurnFinished
+class StartBackgroundTask(pydantic.BaseModel):
+    kind: Literal["start_background_task"] = "start_background_task"
+    task_id: str
+    task_kind: Literal["subagent"] = "subagent"
+    prompt: str
+    name: str
+    parent_turn_index: int
+    parent_span: ai.experimental_telemetry.Span | None = None
+
+
+class BackgroundTaskFinished(pydantic.BaseModel):
+    kind: Literal["background_task_finished"] = "background_task_finished"
+    task_id: str
+    task_kind: Literal["subagent"] = "subagent"
+    output: TurnOutput
+
+
+type SessionCommand = (
+    NewUserMessage
+    | SubmitToolApproval
+    | TurnFinished
+    | StartBackgroundTask
+    | BackgroundTaskFinished
+)
 
 
 # all work entering the long-lived session is delivered through this inbox.
 class SessionInboxHook(pydantic.BaseModel, vercel.workflow.BaseHook):
     command: Annotated[SessionCommand, pydantic.Field(discriminator="kind")]
-
-
-# subagents still return directly to their waiting parent tool.
-class SubagentHook(pydantic.BaseModel, vercel.workflow.BaseHook):
-    output: TurnOutput
 
 
 # Durable stream
@@ -132,6 +169,7 @@ SESSION_FAILED = "session.failed"
 TURN_STARTED = "turn.started"
 TURN_COMPLETED = "turn.completed"
 SUBAGENT_CALLED = "subagent.called"
+SUBAGENT_EVENT = "subagent.event"
 SUBAGENT_COMPLETED = "subagent.completed"
 TOOL_APPROVAL_REQUESTED = "tool_approval.requested"
 RELOAD_REQUESTED = "reload.requested"
