@@ -10,7 +10,9 @@ deadlocks (every wait is bounded, so a deadlock is a fast red test).
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import collections.abc
 import os
 
 import ai
@@ -38,7 +40,37 @@ from harness import (
     wait_run as _wait_run,
 )
 
-from agent import proto, session, storage
+from agent import driver, proto, session, storage
+
+
+async def test_buffered_inbox_stays_armed_while_command_is_processed() -> None:
+    first = proto.SessionInboxHook(command=proto.NewUserMessage(prompt="one"))
+    second = proto.SessionInboxHook(command=proto.NewUserMessage(prompt="two"))
+    reads: asyncio.Queue[proto.SessionInboxHook | None] = asyncio.Queue()
+    armed = 0
+
+    async def inbox() -> collections.abc.AsyncIterator[proto.SessionInboxHook]:
+        nonlocal armed
+        while True:
+            armed += 1
+            received = await reads.get()
+            if received is None:
+                return
+            yield received
+
+    await reads.put(first)
+    buffered = driver._buffer_inbox(inbox())
+    assert await anext(buffered) == first
+
+    for _ in range(10):
+        if armed == 2:
+            break
+        await asyncio.sleep(0)
+    assert armed == 2
+
+    await reads.put(second)
+    assert await anext(buffered) == second
+    await buffered.aclose()
 
 
 async def test_single_turn_suspends_then_closes(
@@ -79,9 +111,7 @@ async def test_resume_appends_user_message_without_duplicating_history(
     await _start("s1", "one")
     await _wait_for_lifecycle("s1", proto.SESSION_WAITING)
 
-    await _resume(
-        proto.session_inbox_token("s1"), proto.NewUserMessage(prompt="two")
-    )
+    await _resume(proto.session_inbox_token("s1"), proto.NewUserMessage(prompt="two"))
     await _wait_for_lifecycle("s1", proto.SESSION_WAITING, count=2)
 
     state = await session.read_session("s1")

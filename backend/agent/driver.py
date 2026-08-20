@@ -1,3 +1,6 @@
+import asyncio
+import collections.abc
+import contextlib
 from typing import Any
 
 import ai
@@ -48,6 +51,35 @@ def _last_text(messages: list[ai.messages.Message]) -> str:
     return ""
 
 
+async def _buffer_inbox(
+    inbox: collections.abc.AsyncIterator[proto.SessionInboxHook],
+) -> collections.abc.AsyncGenerator[proto.SessionInboxHook]:
+    queue: asyncio.Queue[proto.SessionInboxHook | Exception | None] = asyncio.Queue()
+
+    async def pump() -> None:
+        try:
+            async for received in inbox:
+                await queue.put(received)
+        except Exception as error:
+            await queue.put(error)
+        finally:
+            await queue.put(None)
+
+    task = asyncio.create_task(pump())
+    try:
+        while True:
+            received = await queue.get()
+            if received is None:
+                return
+            if isinstance(received, Exception):
+                raise received
+            yield received
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+
 @workflow.workflow
 @ai.messages.use_random(vercel.workflow.random)
 @ai.experimental_telemetry.use_time(vercel.workflow.time_ns)
@@ -71,7 +103,7 @@ async def run_session(session_input: dict[str, Any]) -> dict[str, Any]:
     active_turn_index: int | None = None
     next_turn_index = 0
 
-    async for received in inbox:
+    async for received in _buffer_inbox(inbox):
         command = received.command
         completed_turn_index: int | None = None
 
