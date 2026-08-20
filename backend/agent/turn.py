@@ -452,7 +452,22 @@ async def notify_subagent_finished(token: str, output_data: dict[str, Any]) -> N
             await asyncio.sleep(0.05)
 
 
-# runs one agent turn, parking on a durable hook per gated tool call
+@workflow.step
+async def notify_agent_finished(token: str, output_data: dict[str, Any]) -> None:
+    hook = proto.TurnInboxHook(
+        command=proto.AgentFinished(output=proto.TurnOutput.model_validate(output_data))
+    )
+    for attempt in range(40):
+        try:
+            await hook.resume(token)
+            return
+        except vercel.workflow.HookNotFoundError:
+            if attempt == 39:
+                raise
+            await asyncio.sleep(0.05)
+
+
+# runs one agent turn; its agent task and external controls meet at one inbox
 @workflow.workflow
 # Draw message/part ids from the workflow's deterministic RNG so they're
 # stable across replay. ``vercel.workflow.random`` is a factory resolved on
@@ -475,19 +490,6 @@ async def run_turn(turn_input: dict[str, Any]) -> None:
         turn_span=_turn_input.turn_span,
     )
 
-    async def mediate(approval_event: Any, hook_id: str) -> None:
-        # bridge a durable ApprovalHook back into the ai-library approval hook so
-        # the gated tool proceeds in this same agent run.
-        decision = await approval_event
-        if decision is not None:
-            ai.resolve_hook(
-                hook_id,
-                {
-                    "granted": decision.response.granted,
-                    "reason": decision.response.reason,
-                },
-            )
-
     # collect spans that happen inside the workflow body, and send them
     # once in a separate step.
     collector = (
@@ -495,6 +497,10 @@ async def run_turn(turn_input: dict[str, Any]) -> None:
         if _turn_input.turn_span is not None
         else None
     )
+    inbox_token = proto.turn_inbox_token(session_id, turn_index)
+    inbox = proto.TurnInboxHook.wait(token=inbox_token)
+    output: proto.TurnOutput | None = None
+
     try:
         model = ai.get_model(MODEL_ID)
         async with (
@@ -505,48 +511,76 @@ async def run_turn(turn_input: dict[str, Any]) -> None:
         ):
             agent.tg = tg
 
-            async for event in run:
-                if (
-                    isinstance(event, ai.events.HookEvent)
-                    and event.hook.status == "pending"
-                    and event.hook.hook_type == ai.agents.TOOL_APPROVAL_HOOK_TYPE
-                    and (tool_call_id := event.hook.tool_call_id) is not None
-                ):
-                    # HookEvents ride the runtime queue, not runner.events(),
-                    # so the loop never wrote this; write it here so the UI
-                    # gets the approval request part.
-                    await write_event(session_id, event.model_dump(mode="json"))
-                    tg.create_task(
-                        mediate(
-                            proto.ApprovalHook.wait(
-                                token=proto.approval_hook_token(
-                                    session_id, tool_call_id
-                                )
-                            ),
-                            event.hook.hook_id,
-                        )
+            async def drive_agent_run() -> None:
+                try:
+                    async for event in run:
+                        if (
+                            isinstance(event, ai.events.HookEvent)
+                            and event.hook.status == "pending"
+                            and event.hook.hook_type
+                            == ai.agents.TOOL_APPROVAL_HOOK_TYPE
+                        ):
+                            # HookEvents ride the runtime queue, not runner.events(),
+                            # so the loop never wrote this; write it here so the UI
+                            # gets the approval request part.
+                            await write_event(session_id, event.model_dump(mode="json"))
+                        elif isinstance(event, ai.events.RunBlocked):
+                            await write_event(
+                                session_id,
+                                stream.tool_approval_requested(turn_index=turn_index),
+                            )
+                    result = proto.TurnOutput(kind="suspend", messages=run.messages)
+                except Exception as error:
+                    result = proto.TurnOutput(
+                        kind="error",
+                        messages=messages,
+                        error=f"{type(error).__name__}: {error}",
                     )
-                elif isinstance(event, ai.events.RunBlocked):
-                    # the run is blocked on approvals; tell the client we're
-                    # waiting on a human.
-                    await write_event(
-                        session_id,
-                        stream.tool_approval_requested(turn_index=turn_index),
+                    print(
+                        f"[seal] error in run_turn:\n{traceback.format_exc()}",
+                        flush=True,
                     )
+                await notify_agent_finished(inbox_token, result.model_dump(mode="json"))
 
-            messages = run.messages
+            inbox_queue: asyncio.Queue[proto.TurnInboxHook] = asyncio.Queue()
+
+            async def pump_inbox() -> None:
+                async for received in inbox:
+                    await inbox_queue.put(received)
+
+            # Arm the durable inbox before the agent can reach RunBlocked. The
+            # pump immediately re-awaits it after every delivery, while command
+            # processing happens independently through the local queue.
+            inbox_task = tg.create_task(pump_inbox())
+            tg.create_task(drive_agent_run())
+
+            while True:
+                received = await inbox_queue.get()
+                match received.command:
+                    case proto.TurnApproval(response=response):
+                        ai.resolve_hook(
+                            f"{proto.TOOL_APPROVAL_HOOK_PREFIX}{response.tool_call_id}",
+                            {
+                                "granted": response.granted,
+                                "reason": response.reason,
+                            },
+                        )
+                    case proto.AgentFinished(output=result):
+                        output = result
+                        inbox_task.cancel()
+                        break
     except Exception as error:
+        print(f"[seal] error in run_turn:\n{traceback.format_exc()}", flush=True)
         output = proto.TurnOutput(
             kind="error",
             messages=messages,
             error=f"{type(error).__name__}: {error}",
         )
-        print(
-            f"[seal] error in run_turn:\n{traceback.format_exc()}",
-            flush=True,
-        )
-    else:
-        output = proto.TurnOutput(kind="suspend", messages=messages)
+
+    # Do not dispose in finally: workflow suspension unwinds this invocation.
+    # The inbox must survive replay and is disposed only after AgentFinished.
+    inbox.dispose()
+    assert output is not None
 
     # deliver the body's collected spans. only complete records ship: a span
     # still open here would dangle in the shipping process's adapter.

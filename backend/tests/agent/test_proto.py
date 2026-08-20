@@ -53,13 +53,29 @@ def test_hook_payloads_round_trip() -> None:
     assert restored_finished == finished
     assert isinstance(restored_finished.command, proto.TurnFinished)
 
-    approval = proto.ApprovalHook(
-        response=proto.ToolApprovalResponse(
-            tool_call_id="tc-1", granted=False, reason="nope"
+    approval = proto.TurnInboxHook(
+        command=proto.TurnApproval(
+            response=proto.ToolApprovalResponse(
+                tool_call_id="tc-1", granted=False, reason="nope"
+            )
         )
     )
-    restored_hook = proto.ApprovalHook.model_validate(approval.model_dump(mode="json"))
+    restored_hook = proto.TurnInboxHook.model_validate(approval.model_dump(mode="json"))
     assert restored_hook == approval
+    assert isinstance(restored_hook.command, proto.TurnApproval)
+
+    agent_finished = proto.TurnInboxHook(
+        command=proto.AgentFinished(
+            output=proto.TurnOutput(
+                kind="suspend", messages=[ai.assistant_message("done")]
+            )
+        )
+    )
+    restored_finished = proto.TurnInboxHook.model_validate(
+        agent_finished.model_dump(mode="json")
+    )
+    assert restored_finished == agent_finished
+    assert isinstance(restored_finished.command, proto.AgentFinished)
 
 
 # --- stream events ---------------------------------------------------------------

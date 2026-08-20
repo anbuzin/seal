@@ -103,18 +103,30 @@ async def start_or_resume(session_id: str, prompt: str) -> int:
 async def submit_approvals(
     session_id: str, approvals: list[proto.ToolApprovalResponse]
 ) -> int:
-    """Forward each UI approval decision into its own parked hook.
+    """Forward each UI approval decision through the active turn's inbox.
 
     Returns the stream index to tail the continuation from: the next index after
     the park, computed *before* resuming so the continuation can't outrun it. The
     resubmit carries the parked assistant message, so the client keeps streaming
     into it and the continuation (tool output + answer) folds in.
     """
+    turn_index: int | None = None
+    async for event in stream.replay(session_id):
+        if not isinstance(event, proto.LifecycleEvent):
+            continue
+        if event.type == proto.TURN_STARTED:
+            turn_index = int(event.data["turn_index"])
+        elif event.type in _TERMINAL:
+            turn_index = None
+    if turn_index is None:
+        raise SessionUnavailableError("No turn is waiting for approval")
+
     start_index = await stream.tail_index(session_id) + 1
+    token = proto.turn_inbox_token(session_id, turn_index)
     for approval in approvals:
         await _resume(
-            proto.approval_hook_token(session_id, approval.tool_call_id),
-            proto.ApprovalHook(response=approval),
+            token,
+            proto.TurnInboxHook(command=proto.TurnApproval(response=approval)),
         )
     return start_index
 

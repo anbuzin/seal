@@ -20,14 +20,12 @@ class ToolApprovalResponse(pydantic.BaseModel):
 TOOL_APPROVAL_HOOK_PREFIX = "approve_"
 
 
-# the durable hook a gated call parks on; its trailing segment is exactly the ai
-# ``HookPart.hook_id``. tokens are global, so the session id keeps them unique.
-def approval_hook_token(session_id: str, tool_call_id: str) -> str:
-    return f"seal-approval:{session_id}:{TOOL_APPROVAL_HOOK_PREFIX}{tool_call_id}"
-
-
 def session_inbox_token(session_id: str) -> str:
     return f"seal-session-inbox:{session_id}"
+
+
+def turn_inbox_token(session_id: str, turn_index: int) -> str:
+    return f"seal-turn-inbox:{session_id}:{turn_index}"
 
 
 class SessionInput(pydantic.BaseModel):
@@ -44,11 +42,6 @@ class NewUserMessage(pydantic.BaseModel):
     kind: Literal["new_user_message"] = "new_user_message"
     prompt: str | None = None
     close: bool = False
-
-
-# one gated call's decision, delivered on its own per-approval hook.
-class ApprovalHook(pydantic.BaseModel, vercel.workflow.BaseHook):
-    response: ToolApprovalResponse
 
 
 class SessionState(pydantic.BaseModel):
@@ -86,6 +79,24 @@ class TurnOutput(pydantic.BaseModel):
     kind: Literal["suspend", "error"]
     messages: list[ai.messages.Message]
     error: str | None = None
+
+
+class TurnApproval(pydantic.BaseModel):
+    kind: Literal["turn_approval"] = "turn_approval"
+    response: ToolApprovalResponse
+
+
+class AgentFinished(pydantic.BaseModel):
+    kind: Literal["agent_finished"] = "agent_finished"
+    output: TurnOutput
+
+
+type TurnCommand = TurnApproval | AgentFinished
+
+
+# all work entering one active turn is delivered through its private inbox.
+class TurnInboxHook(pydantic.BaseModel, vercel.workflow.BaseHook):
+    command: Annotated[TurnCommand, pydantic.Field(discriminator="kind")]
 
 
 class TurnFinished(pydantic.BaseModel):
