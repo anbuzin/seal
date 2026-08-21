@@ -84,11 +84,11 @@ def test_hook_payloads_round_trip() -> None:
             )
         )
     )
-    restored_finished = proto.TurnInboxHook.model_validate(
+    restored_agent_finished = proto.TurnInboxHook.model_validate(
         agent_finished.model_dump(mode="json")
     )
-    assert restored_finished == agent_finished
-    assert isinstance(restored_finished.command, proto.AgentFinished)
+    assert restored_agent_finished == agent_finished
+    assert isinstance(restored_agent_finished.command, proto.AgentFinished)
 
 
 # --- stream events ---------------------------------------------------------------

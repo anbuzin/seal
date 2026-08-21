@@ -506,30 +506,40 @@ async def run_turn(turn_input: dict[str, Any]) -> None:
         async with (
             ai.experimental_telemetry.use_sink(collector),
             ai.experimental_telemetry.use_span(_turn_input.turn_span),
-            agent.run(model, messages) as run,
             ai.util.TaskGroup() as tg,
         ):
             agent.tg = tg
+            hook_registry = ai.HookRegistry()
 
             async def drive_agent_run() -> None:
                 try:
-                    async for event in run:
-                        if (
-                            isinstance(event, ai.events.HookEvent)
-                            and event.hook.status == "pending"
-                            and event.hook.hook_type
-                            == ai.agents.TOOL_APPROVAL_HOOK_TYPE
-                        ):
-                            # HookEvents ride the runtime queue, not runner.events(),
-                            # so the loop never wrote this; write it here so the UI
-                            # gets the approval request part.
-                            await write_event(session_id, event.model_dump(mode="json"))
-                        elif isinstance(event, ai.events.RunBlocked):
-                            await write_event(
-                                session_id,
-                                stream.tool_approval_requested(turn_index=turn_index),
-                            )
-                    result = proto.TurnOutput(kind="suspend", messages=run.messages)
+                    # Open, iterate, and close the run in one task. Telemetry spans
+                    # use task-local context and cannot be closed by the parent task.
+                    async with agent.run(
+                        model, messages, hook_registry=hook_registry
+                    ) as run:
+                        async for event in run:
+                            if (
+                                isinstance(event, ai.events.HookEvent)
+                                and event.hook.status == "pending"
+                                and event.hook.hook_type
+                                == ai.agents.TOOL_APPROVAL_HOOK_TYPE
+                            ):
+                                # HookEvents ride the runtime queue, not
+                                # runner.events(), so the loop never wrote this;
+                                # write it here so the UI
+                                # gets the approval request part.
+                                await write_event(
+                                    session_id, event.model_dump(mode="json")
+                                )
+                            elif isinstance(event, ai.events.RunBlocked):
+                                await write_event(
+                                    session_id,
+                                    stream.tool_approval_requested(
+                                        turn_index=turn_index
+                                    ),
+                                )
+                        result = proto.TurnOutput(kind="suspend", messages=run.messages)
                 except Exception as error:
                     result = proto.TurnOutput(
                         kind="error",
@@ -564,6 +574,7 @@ async def run_turn(turn_input: dict[str, Any]) -> None:
                                 "granted": response.granted,
                                 "reason": response.reason,
                             },
+                            registry=hook_registry,
                         )
                     case proto.AgentFinished(output=result):
                         output = result
