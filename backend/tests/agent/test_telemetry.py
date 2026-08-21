@@ -256,7 +256,7 @@ async def test_turn_with_telemetry_suspends_then_closes(
     run = await start_session("s1", "hi")
     await wait_for_lifecycle("s1", proto.SESSION_WAITING)
     await resume_session("seal-session:s1:0", proto.NewUserMessage(close=True))
-    output = proto.SessionOutput.model_validate(await wait_run(run))
+    output = await wait_run(run)
     assert not output.is_error
 
     spans = {s.name: s for s in telemetry_on.get_finished_spans()}

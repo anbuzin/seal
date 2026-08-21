@@ -56,7 +56,7 @@ async def test_single_turn_suspends_then_closes(
     assert_message_invariants(state.messages)
 
     await _resume("seal-session:s1:0", proto.NewUserMessage(close=True))
-    output = proto.SessionOutput.model_validate(await _wait_run(run))
+    output = await _wait_run(run)
     assert output.output == "hello there"
     assert not output.is_error
 

@@ -20,9 +20,9 @@ import random
 from typing import Any
 
 import ai
-import vercel._internal.workflow.runtime as wf_runtime  # noqa: E402
-import vercel._internal.workflow.worlds.local as wf_local  # noqa: E402
 import vercel.workflow  # noqa: E402
+import vercel.workflow._internal.runtime as wf_runtime  # noqa: E402
+import vercel.workflow._internal.worlds.local as wf_local  # noqa: E402
 
 import agent.driver as driver  # noqa: E402
 from agent import proto, stream  # noqa: E402
@@ -116,12 +116,12 @@ class InProcessWorld(wf_local.LocalWorld):
             self.errors.append(error)
 
 
-async def start_session(session_id: str, prompt: str) -> Any:
+async def start_session(
+    session_id: str, prompt: str
+) -> vercel.workflow.Run[proto.SessionOutput]:
     return await vercel.workflow.start(
         driver.run_session,
-        proto.SessionInput(session_id=session_id, prompt=prompt).model_dump(
-            mode="json"
-        ),
+        proto.SessionInput(session_id=session_id, prompt=prompt),
     )
 
 
@@ -165,8 +165,8 @@ async def _resume_hook(token: str, hook: vercel.workflow.BaseHook) -> None:
             await asyncio.sleep(0.05)
 
 
-async def wait_run(run: Any, timeout: float = 20) -> Any:
-    async def poll() -> Any:
+async def wait_run[T](run: vercel.workflow.Run[T], timeout: float = 20) -> T:
+    async def poll() -> T:
         while await run.status() not in ("completed", "failed", "cancelled"):
             await asyncio.sleep(0.05)
         return await run.return_value()
