@@ -15,17 +15,18 @@ dependencies = [
 [tool.vercel]
 entrypoint = "app.server:app"
 
-[[tool.vercel.workflows]]
-entrypoint = "app.worker:workflow"
+# rotor drives its worker from a queue subscriber (the queue is the clock;
+# SQL is authoritative). This replaces the [[tool.vercel.workflows]] block.
+[[tool.vercel.subscribers]]
+entrypoint = "app.worker:worker"
 
 [tool.mypy]
 python_version = "3.13"
 strict = true
 plugins = ["pydantic.mypy"]
 
-# vercel ships `vercel._internal` without a py.typed marker, but the typed
-# public modules (vercel.workflow etc.) re-export from it; follow it so
-# BaseHook / @step don't degrade to Any.
+# vercel ships `vercel._internal` without a py.typed marker; the blob client
+# re-exports from it.
 [[tool.mypy.overrides]]
 module = "vercel._internal.*"
 follow_untyped_imports = true

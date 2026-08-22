@@ -1,9 +1,10 @@
 """Session metadata (id, title, timestamps).
 
-History is owned by the durable agent (``session.read_session`` / the durable
-event stream); this store only tracks the lightweight metadata the UI needs to
-list, title, and delete chats. Postgres when ``DATABASE_URL`` is set, otherwise
-one JSON file per session for local dev.
+History is owned by the durable agent (the ``Session`` process's checkpoint,
+read lease-free through its ``history`` query); this store only tracks the
+lightweight metadata the UI needs to list, title, and delete chats. Postgres
+when ``DATABASE_URL`` is set, otherwise one JSON file per session for local
+dev.
 """
 
 from __future__ import annotations
@@ -19,7 +20,8 @@ import ai
 import pydantic
 
 import db
-from agent import session
+from agent.processes import Session
+from agent.runtime import client
 
 _TITLE_PROMPT = (
     "Generate a concise 3-6 word title for a conversation that starts with "
@@ -217,9 +219,14 @@ async def delete_session(session_id: str) -> bool:
 
 
 async def history(session_id: str) -> list[ai.messages.Message]:
-    """Return the durable agent's persisted message history for a session."""
-    state = await session.read_session(session_id)
-    return state.messages if state is not None else []
+    """Return the durable agent's committed transcript for a session."""
+    import rotor
+
+    try:
+        value, _revision = await client().query(session_id, Session.history)
+    except rotor.ProcessNotFound:
+        return []
+    return [ai.messages.Message.model_validate(m) for m in value]
 
 
 async def first_user_text(session_id: str) -> str | None:

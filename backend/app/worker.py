@@ -1,48 +1,39 @@
 """Worker entrypoint for the durable agent.
 
-Importing `agent` constructs the `Workflows()` registry, which registers the queue
-handlers that actually drive `run_session` / `run_turn` to completion.
+The worker is the only place handlers run; the FastAPI service is a pure
+control plane (start/send/resolve/observe). Locally, ``python -m app.worker``
+serves a polling worker; on Vercel the same object is driven by the queue
+subscriber declared in ``pyproject.toml`` (rotor auto-detects the platform).
 
-The preamble (env defaults, log settup) must run before the
-workflow libraries are imported, so it lives at module top.
+Gone from the workflow port: the ``Workflows()`` registry import dance, the
+``WORKFLOW_LOCAL_DATA_DIR``/``SEAL_STREAMS_DIR`` env plumbing, and the
+per-step HTTP access-log suppression (there is no HTTP POST per step
+anymore — a worker leases a process and drains its mailbox).
 """
 
 from __future__ import annotations
 
 import logging
-import os
 
-# the vercel runtime forces the root logger to INFO, and httpx logs every
-# request at INFO; the worker's constant HTTP traffic makes that unreadable.
 logging.getLogger("httpx").setLevel(logging.WARNING)
-# every queue delivery is an HTTP POST to this worker, so uvicorn's access log
-# prints a line per step. the dev runtime applies its uvicorn dictConfig *after*
-# importing this module, resetting the logger's level — but dictConfig never
-# removes attached filters, so a filter is what survives.
-logging.getLogger("uvicorn.access").addFilter(lambda record: False)
-# uvicorn's reloader passes watch_filter=None to watchfiles and applies its
-# *.py filter only afterward, so every .workflow-data/.seal write logs an INFO
-# "N changes detected" without causing a reload; drop those count lines.
-logging.getLogger("watchfiles.main").setLevel(logging.WARNING)
 
-
-_BACKEND_DIR = os.path.dirname(os.path.dirname(__file__))
-os.environ.setdefault(
-    "WORKFLOW_LOCAL_DATA_DIR",
-    os.path.join(_BACKEND_DIR, ".workflow-data"),
-)
-os.environ.setdefault(
-    "SEAL_STREAMS_DIR",
-    os.path.join(_BACKEND_DIR, ".seal"),
-)
+from rotor import Worker  # noqa: E402
 
 from agent import telemetry  # noqa: E402
+from agent.processes import AgentBase, Session, Subagent  # noqa: E402
+from agent.tools import run_tool  # noqa: E402
 
-# no lifespan surface here to flush from explicitly; the provider's atexit
-# hook flushes the batch exporter when uvicorn exits gracefully.
 telemetry.install("seal-agent")
 
-# Importing the driver pulls in turn/session/stream.
-import agent.driver  # noqa: E402, F401
-import agent.turn  # noqa: E402, F401
-from agent import workflow as workflow  # noqa: E402, F401
+worker = Worker()
+worker.register(Session)
+worker.register(Subagent)
+worker.register(run_tool)
+
+_ = AgentBase  # the shared base is never registered: it is never spawned
+
+
+if __name__ == "__main__":
+    import asyncio
+
+    asyncio.run(worker.serve())

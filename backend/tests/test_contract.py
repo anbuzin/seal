@@ -18,39 +18,51 @@ followed by ``UPDATE_FIXTURES=1 pnpm test`` in ``frontend/``.
 
 Comparisons are exact except for two normalizations: generated ids
 (``msg_*``/``part_*``) are canonicalized in encounter order, and preliminary
-subagent progress lines are dropped — concurrent child pumps make their
+subagent progress lines are dropped — concurrent children make their
 interleaving genuinely unspecified, and their content is covered by
 ``ui_messages.json``.
+
+NOTE(draft): the engine under these tests is now rotor's LocalRuntime; the
+subagent tool result on the wire changed from a MessageBundle to the child's
+answer text (the nested transcript rides the subagent.completed lifecycle
+chunk instead), so the fixtures need one UPDATE_FIXTURES regeneration.
 """
 
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import json
 import os
 import pathlib
 import re
 from typing import Any
 
-import ai
 import ai.types.messages as messages_
 import ai.ui.ai_sdk as ai_sdk
 import httpx
 import pytest
-from conftest import MockProvider, assert_message_invariants, text_msg
-from harness import (
-    InProcessWorld,
-    start_session,
-    wait_for_lifecycle,
+from conftest import (
+    MockProvider,
+    assert_message_invariants,
+    drain_until_idle,
+    text_msg,
 )
+from rotor.testing import LocalRuntime
 
-from agent import proto, session
 from app import chat, server, sessions
 
 FIXTURES_DIR = pathlib.Path(__file__).resolve().parents[2] / "common_fixtures"
 UPDATE = bool(os.environ.get("UPDATE_FIXTURES"))
 
 _VOLATILE_ID = re.compile(r"^(msg|part|turn|run)_[0-9a-f]+$")
+
+
+@dataclasses.dataclass(frozen=True)
+class ToolApprovalResponse:
+    tool_call_id: str
+    granted: bool
+    reason: str | None = None
 
 
 def _canon(value: Any, mapping: dict[str, str] | None = None) -> Any:
@@ -71,7 +83,7 @@ def _canon(value: Any, mapping: dict[str, str] | None = None) -> Any:
 def _sse_projection(lines: list[str]) -> list[Any]:
     """The deterministic part of an SSE capture.
 
-    Drops preliminary subagent progress (concurrent pumps, unspecified
+    Drops preliminary subagent progress (concurrent children, unspecified
     interleaving) and canonicalizes ids; everything else — event order,
     types, deltas, approval ids — must match exactly.
     """
@@ -98,21 +110,25 @@ def _assistant(text: str, *calls: tuple[str, str, str]) -> messages_.Message:
 
 
 async def _capture_run(
-    session_id: str, prompt: str, park_event: str
+    rt: LocalRuntime, session_id: str, prompt: str
 ) -> tuple[list[str], list[dict[str, Any]]]:
-    """Start a session, stream it like a POST /chat would, run until parked."""
+    """Start a session, stream it like a POST /chat would, run until parked.
+
+    ``chat.to_sse`` ends on its own at the turn's boundary (idle, or parked
+    on approvals) — there is no lifecycle event to wait for by name.
+    """
 
     async def collect() -> list[str]:
-        return [line async for line in chat.to_sse(session_id, 0)]
+        return [line async for line in chat.to_sse(session_id)]
 
     capture = asyncio.create_task(collect())
-    await start_session(session_id, prompt)
-    await wait_for_lifecycle(session_id, park_event)
+    await asyncio.sleep(0)  # let the live subscription attach first
+    await chat.start_or_resume(session_id, prompt)
+    await drain_until_idle(rt)
     sse = await asyncio.wait_for(capture, 10)
 
     # the history exactly as the UI receives it on reload: through the real
-    # GET /sessions/{id} endpoint (which also rebuilds subagent MessageBundles
-    # into the nested UIMessage shape — server-side logic this test covers).
+    # GET /sessions/{id} endpoint.
     await sessions.create_session(session_id)
     transport = httpx.ASGITransport(app=server.app)
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
@@ -151,7 +167,7 @@ def _check_or_update(
 
 async def _submit_approval_request_fixture(
     scenario: str, session_id: str
-) -> dict[str, proto.ToolApprovalResponse]:
+) -> dict[str, ToolApprovalResponse]:
     """Feed the client-generated approval POST back through the server path.
 
     Returns the approvals by tool_call_id so the caller can assert effects.
@@ -172,7 +188,7 @@ async def _submit_approval_request_fixture(
     )
 
     responses = [
-        proto.ToolApprovalResponse(
+        ToolApprovalResponse(
             tool_call_id=approval.tool_call_id,
             granted=approval.granted,
             reason=approval.reason,
@@ -183,8 +199,18 @@ async def _submit_approval_request_fixture(
     return {response.tool_call_id: response for response in responses}
 
 
+async def _results(session_id: str) -> dict[str, messages_.ToolResultPart]:
+    history = await chat.history(session_id)
+    assert_message_invariants(history)
+    return {
+        part.tool_call_id: part
+        for message in history
+        for part in message.tool_results
+    }
+
+
 async def test_parallel_approvals(
-    world: InProcessWorld, scripted_model: MockProvider
+    rt: LocalRuntime, scripted_model: MockProvider
 ) -> None:
     scripted_model.responses = [
         [
@@ -197,33 +223,23 @@ async def test_parallel_approvals(
         [text_msg("both handled")],
     ]
 
-    sse, ui_messages = await _capture_run(
-        "s1", "run both commands", proto.TOOL_APPROVAL_REQUESTED
-    )
-
+    sse, ui_messages = await _capture_run(rt, "s1", "run both commands")
     _check_or_update("parallel-approvals", sse, ui_messages)
 
     # the client answers: grant tc-a, deny tc-b (fixture generated by frontend)
     approvals = await _submit_approval_request_fixture("parallel-approvals", "s1")
     assert approvals["tc-a"].granted and not approvals["tc-b"].granted
 
-    await wait_for_lifecycle("s1", proto.SESSION_WAITING)
-    state = await session.read_session("s1")
-    assert state is not None
-    assert_message_invariants(state.messages)
-    results = {
-        part.tool_call_id: part
-        for message in state.messages
-        for part in message.tool_results
-    }
+    await drain_until_idle(rt)
+    results = await _results("s1")
     assert results["tc-a"].result == "alpha-out\n"
     assert not results["tc-a"].is_error
     assert results["tc-b"].is_error
-    assert "Rejected" in str(results["tc-b"].result)
+    assert "Denied" in str(results["tc-b"].result)
 
 
 async def test_parallel_subagents(
-    world: InProcessWorld, scripted_model: MockProvider
+    rt: LocalRuntime, scripted_model: MockProvider
 ) -> None:
     scripted_model.responses = [
         [
@@ -240,29 +256,18 @@ async def test_parallel_subagents(
         "task-beta": [text_msg("beta report")],
     }
 
-    sse, ui_messages = await _capture_run(
-        "s1", "delegate to two helpers", proto.SESSION_WAITING
-    )
+    sse, ui_messages = await _capture_run(rt, "s1", "delegate to two helpers")
 
-    state = await session.read_session("s1")
-    assert state is not None
-    assert_message_invariants(state.messages)
-
-    # each child's transcript landed on its own tool call (no cross-wiring)
-    results = {
-        part.tool_call_id: part
-        for message in state.messages
-        for part in message.tool_results
-    }
-    for tc_id, expected in [("tc-sa", "alpha report"), ("tc-sb", "beta report")]:
-        bundle = ai.agents.MessageBundle.model_validate(results[tc_id].result)
-        assert bundle.messages[-1].text == expected
+    # each child's answer landed on its own tool call (no cross-wiring)
+    results = await _results("s1")
+    assert "alpha report" in str(results["tc-sa"].result)
+    assert "beta report" in str(results["tc-sb"].result)
 
     _check_or_update("parallel-subagents", sse, ui_messages)
 
 
 async def test_mixed_subagents_and_approvals(
-    world: InProcessWorld, scripted_model: MockProvider
+    rt: LocalRuntime, scripted_model: MockProvider
 ) -> None:
     scripted_model.responses = [
         [
@@ -276,9 +281,7 @@ async def test_mixed_subagents_and_approvals(
     ]
     scripted_model.keyed_responses = {"task-gamma": [text_msg("gamma report")]}
 
-    sse, ui_messages = await _capture_run(
-        "s1", "delegate and run", proto.TOOL_APPROVAL_REQUESTED
-    )
+    sse, ui_messages = await _capture_run(rt, "s1", "delegate and run")
     _check_or_update("mixed-subagents-approvals", sse, ui_messages)
 
     approvals = await _submit_approval_request_fixture(
@@ -286,15 +289,7 @@ async def test_mixed_subagents_and_approvals(
     )
     assert approvals["tc-cmd"].granted
 
-    await wait_for_lifecycle("s1", proto.SESSION_WAITING)
-    state = await session.read_session("s1")
-    assert state is not None
-    assert_message_invariants(state.messages)
-    results = {
-        part.tool_call_id: part
-        for message in state.messages
-        for part in message.tool_results
-    }
+    await drain_until_idle(rt)
+    results = await _results("s1")
     assert results["tc-cmd"].result == "gamma-out\n"
-    bundle = ai.agents.MessageBundle.model_validate(results["tc-sub"].result)
-    assert bundle.messages[-1].text == "gamma report"
+    assert "gamma report" in str(results["tc-sub"].result)

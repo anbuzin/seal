@@ -1,15 +1,20 @@
 """Shared test setup.
 
-Every test runs against an isolated temp store (jsonl streams, session
-metadata, workflow data); ``DATABASE_URL`` is cleared so the jsonl/file
-backends are always selected.
+Every test runs against an isolated in-process rotor runtime
+(``rotor.testing.LocalRuntime``: in-memory sqlite store, memory blob store,
+memory live transport, virtual clock). ``DATABASE_URL`` is cleared so the
+session-metadata store selects its file backend.
 
 ``mock_llm`` scripts model responses for tests that drive the agent loop:
-it attaches a queue of complete messages to ``MOCK_MODEL``'s provider, and
-each ``ai.stream`` call pops one response and replays it as a realistic
-event stream (Start/Delta/End triples bookended by StreamStart/StreamEnd).
-This is the only test double in the suite — everything else (storage,
-streams, hooks, workflows, the UI adapter) is real.
+it attaches a queue of complete messages to a mock provider, and each
+``ai.stream`` call pops one response and replays it as a realistic event
+stream (Start/Delta/End triples bookended by StreamStart/StreamEnd). This is
+the only test double in the suite — everything else (the processes, hooks,
+spool, verdict facts, the UI adapter) is real.
+
+Gone from the workflow port: the ``InProcessWorld`` bridge harness and the
+``WORKFLOW_LOCAL_DATA_DIR``/``SEAL_STREAMS_DIR`` isolation. Draining the
+runtime *is* the engine; there is nothing to bridge.
 """
 
 from __future__ import annotations
@@ -23,28 +28,24 @@ import pydantic
 import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-sys.path.insert(0, str(Path(__file__).resolve().parent))  # for `import harness`
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import ai  # noqa: E402
 import ai.models as models  # noqa: E402
 import ai.types.events as events_  # noqa: E402
 import ai.types.messages as messages_  # noqa: E402
-import harness  # noqa: E402
-import vercel._internal.workflow.world as wf_world  # noqa: E402
+from rotor.testing import LocalRuntime  # noqa: E402
 
-import agent  # noqa: E402
-from agent import storage  # noqa: E402
+from agent import runtime as runtime_module  # noqa: E402
+from agent.processes import Session, Subagent  # noqa: E402
+from agent.tools import run_tool  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
 def _isolate_storage(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     monkeypatch.delenv("DATABASE_URL", raising=False)
-    monkeypatch.setenv("SEAL_STREAMS_DIR", str(tmp_path / "streams"))
     monkeypatch.setenv("SEAL_SESSIONS_DIR", str(tmp_path / "sessions"))
-    monkeypatch.setenv("WORKFLOW_LOCAL_DATA_DIR", str(tmp_path / "workflow-data"))
-    storage._locks.clear()
     yield
-    storage._locks.clear()
 
 
 # --- scripted model -------------------------------------------------------------
@@ -62,8 +63,6 @@ class MockProvider(models.Provider):
     the wrong tool call.
     """
 
-    # Provider is now a frozen pydantic model; opt this test double back into
-    # mutability and keep the scripted state out of serialization/hashing.
     model_config = pydantic.ConfigDict(frozen=False)
 
     provider_class_id: Literal["mock"] = "mock"
@@ -165,20 +164,6 @@ def mock_llm() -> Iterator[MockProvider]:
     MOCK_PROVIDER.calls = []
 
 
-# --- in-process engine fixtures ---------------------------------------------------
-
-
-@pytest.fixture
-async def world() -> AsyncGenerator[harness.InProcessWorld]:
-    bridged = harness.InProcessWorld(agent.workflow)
-    wf_world.set_world(bridged)
-    yield bridged
-    for task in list(bridged._tasks):
-        task.cancel()
-    wf_world.set_world(None)
-    assert bridged.errors == [], f"workflow delivery errors: {bridged.errors}"
-
-
 @pytest.fixture
 def scripted_model(
     monkeypatch: pytest.MonkeyPatch, mock_llm: MockProvider
@@ -186,6 +171,30 @@ def scripted_model(
     model = models.Model(id="mock-model", provider=mock_llm)
     monkeypatch.setattr(ai, "get_model", lambda model_id=None, **kwargs: model)
     return mock_llm
+
+
+# --- in-process runtime -----------------------------------------------------------
+
+
+@pytest.fixture
+async def rt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> AsyncGenerator[LocalRuntime]:
+    """The whole engine, in memory: store, worker, live channel, spool,
+    virtual clock. ``await rt.drain()`` handles everything actionable."""
+    async with LocalRuntime(Session, Subagent, run_tool) as runtime:
+        # point the app's shared client at this runtime's backends
+        monkeypatch.setattr(runtime_module, "_client", runtime.client)
+        yield runtime
+
+
+async def drain_until_idle(runtime: LocalRuntime, *, rounds: int = 50) -> None:
+    """Drain repeatedly until a full pass handles nothing (fan-outs settle
+    across multiple drains: verdicts enqueue the next Generate)."""
+    for _ in range(rounds):
+        if await runtime.drain() == 0:
+            return
+    raise AssertionError("runtime did not go idle")
 
 
 # --- message builders -----------------------------------------------------------
