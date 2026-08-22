@@ -1,13 +1,12 @@
 # seal
 
-A personal AI assistant built as a **durable agent**: every agent run is a
-Vercel workflow, so turns survive restarts, streams can be resumed mid-run,
-and tool calls can park indefinitely waiting for human approval.
+A personal AI assistant built as a **durable agent**: every conversation is
+one durable process, so turns survive restarts, streams can be resumed
+mid-generation, and tool calls can park indefinitely waiting for human
+approval.
 
 Seal is an example app for the [AI SDK for Python](https://ai-python.dev)
-(the `ai` package) and for
-[Workflows with Python](https://vercel.com/docs/workflows/python)
-(`vercel.workflow`).
+(the `ai` package), built on rotor's `DurableProcess` runtime (`rotorcore`).
 
 The agent (Claude via the AI Gateway) has three tools: `bash`,
 `web_fetch`, and `subagent`. Bash runs are gated behind an approval UI
@@ -19,23 +18,26 @@ silly, but this is a demo app.)
 - **frontend/** — React + Vite chat UI using the AI SDK (`useChat`) and
   [AI Elements](https://elements.ai-sdk.dev). Reconnecting to a session
   re-tails the in-flight stream (`useChat({ resume: true })`).
-- **backend/app/** — FastAPI service. `POST /api/chat` starts (or resumes) a
-  run and streams the AI SDK UI message protocol; other endpoints cover
-  sessions, titles, and private blob attachments. See `app/server.py` for the
-  endpoint list.
-- **backend/agent/** — the durable agent itself. `driver.py` runs a
-  `run_session` workflow that spawns one child `run_turn` workflow per agent
-  turn and suspends on a hook until it finishes. Tool approvals are workflow
-  hooks too: the turn parks until the user answers, then resumes with the
-  decision. Model calls, stream writes, and session snapshots are all
-  workflow steps, replay-safe via the workflow's deterministic RNG/clock.
-- **Storage** (`agent/storage.py`) — one append-only primitive backing
-  both durable streams and session snapshots. Uses Postgres when
-  `DATABASE_URL` is set, local jsonl files otherwise. Uses Vercel Blob
-  to store attachments when available.
+- **backend/app/** — FastAPI service. `POST /api/chat` starts (or messages)
+  the session process and streams the AI SDK UI message protocol; other
+  endpoints cover sessions, titles, and private blob attachments. See
+  `app/server.py` for the endpoint list.
+- **backend/agent/** — the durable agent itself. Each conversation is one
+  keyed `Session` process (`processes.py`): every model turn is one atomic
+  activation, each tool call runs as a keyed `run_tool` child with its own
+  retry policy, approvals are durable hooks the turn parks on (parking an
+  idle process costs nothing), and subagents are child processes in the
+  same scope. Handlers are plain async Python — there is no replay and no
+  determinism contract.
+- **Streaming & state** — tokens stream over rotor's live channel with
+  spooled write-through, so a reconnect mid-generation replays the current
+  turn (`replay_inflight`); the transcript is the process checkpoint, read
+  lease-free through a query; approval capabilities ride the durable
+  records ledger. Vercel Blob stores attachments when available.
 
 Deployment is two Vercel services (see `vercel.json`): the frontend and the
-backend, with the workflow worker declared in `backend/pyproject.toml`.
+backend, with the rotor worker driven by the queue subscriber declared in
+`backend/pyproject.toml`.
 
 ## Development
 

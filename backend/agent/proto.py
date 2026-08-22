@@ -1,128 +1,110 @@
+"""Wire protocol of the durable agent.
+
+Three planes, matching rotor's channels:
+
+* **Mailbox messages** (``UserMessage``, ``Generate``) — how turns are
+  driven. A user prompt is just a message: sending to an idle session
+  starts the next turn, sending mid-turn queues it for the turn after.
+  There is no "session is busy" error path and no hook-registration race.
+* **The hook model** (``Approval``) — the durable gate one gated tool call
+  parks on. Resolution requires the minted token, so a ``HookResolved``
+  arriving in an arm *is* the security check.
+* **The provisional stream envelope** — everything published with
+  ``rotor.stream()`` while an activation runs. The stream is the rumor;
+  the transcript checkpoint and the ``record()`` ledger are the facts.
+  Chunks carry either one model event or one lifecycle marker.
+
+What this file replaced from the workflow port: ``TurnHook``, ``SessionHook``,
+``ApprovalHook``, the hook token naming conventions, ``TurnInput``/``TurnOutput``
+(state now lives on the process), and ``ToolCallContext`` (arms have ``self``).
+"""
+
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any
 
 import ai
-import pydantic
-import vercel.workflow
+from rotor import Resolution, message
 
-# Session inputs / outputs
+# ── mailbox messages ─────────────────────────────────────────────────────
 
 
-# external decision for a single gated tool call.
-class ToolApprovalResponse(pydantic.BaseModel):
-    tool_call_id: str
+@message
+class UserMessage:
+    """One user prompt for a session that already exists."""
+
+    text: str
+
+
+@message
+class Generate:
+    """One model turn, self-sent. ``attempt`` rides the message so model
+    retries are an ``except`` clause plus a timer, not retry machinery."""
+
+    attempt: int = 0
+
+
+@message
+class Interrupt:
+    """Stop generating. Sent with ``preempt=True``: the in-flight model turn
+    aborts uncommitted (its tokens are retracted), this jumps the queue, and
+    the arm swallows the turn that would otherwise re-run."""
+
+
+@message
+class Approval(Resolution):
+    """The resolution model for a gated tool call's hook."""
+
     granted: bool
-    reason: str | None = None
+    reason: str = ""
 
 
-# ai SDK gates a tool behind a hook labelled ``approve_{tool_call_id}``.
-TOOL_APPROVAL_HOOK_PREFIX = "approve_"
+# ── provisional stream envelope ──────────────────────────────────────────
 
-
-# the durable hook a gated call parks on; its trailing segment is exactly the ai
-# ``HookPart.hook_id``. tokens are global, so the session id keeps them unique.
-def approval_hook_token(session_id: str, tool_call_id: str) -> str:
-    return f"seal-approval:{session_id}:{TOOL_APPROVAL_HOOK_PREFIX}{tool_call_id}"
-
-
-class SessionInput(pydantic.BaseModel):
-    session_id: str
-    prompt: str
-
-
-class SessionOutput(pydantic.BaseModel):
-    session_id: str
-    output: str
-    is_error: bool = False
-
-
-class NewUserMessage(pydantic.BaseModel):
-    kind: Literal["new_user_message"] = "new_user_message"
-    prompt: str | None = None
-    close: bool = False
-
-
-# carries the next user message (or a close) to a session parked in ``suspend``.
-class SessionHook(pydantic.BaseModel, vercel.workflow.BaseHook):
-    payload: NewUserMessage
-
-
-# one gated call's decision, delivered on its own per-approval hook.
-class ApprovalHook(pydantic.BaseModel, vercel.workflow.BaseHook):
-    response: ToolApprovalResponse
-
-
-class SessionState(pydantic.BaseModel):
-    session_id: str
-    messages: list[ai.messages.Message]
-
-
-# Turn inputs / outputs
-
-
-class TurnInput(pydantic.BaseModel):
-    session_id: str
-    messages: list[ai.messages.Message]
-    # gated turns expose bash behind approval + subagent; ungated (subagent
-    # children) run bash directly and cannot delegate further.
-    gated: bool = True
-    turn_hook_token: str
-    # index of this turn within its session (always 0 for subagent turns).
-    turn_index: int = 0
-    # turn's root span. llm_steps and child turns nest under it.
-    turn_span: ai.experimental_telemetry.Span | None = None
-
-
-# in-process context of the running tool call, set by the agent loop around
-# each schedule so a tool can reach it without smuggling args. never journaled.
-class ToolCallContext(pydantic.BaseModel):
-    session_id: str
-    tool_call_id: str
-    # the enclosing turn's root span; a spawned child turn nests under it.
-    turn_span: ai.experimental_telemetry.Span | None = None
-
-
-class TurnOutput(pydantic.BaseModel):
-    kind: Literal["suspend", "error"]
-    messages: list[ai.messages.Message]
-    error: str | None = None
-
-
-class TurnHook(pydantic.BaseModel, vercel.workflow.BaseHook):
-    output: TurnOutput
-
-
-# Durable stream
-
-SESSION_NAMESPACE = "session"
-
-SESSION_STARTED = "session.started"
-SESSION_WAITING = "session.waiting"
-SESSION_COMPLETED = "session.completed"
-SESSION_FAILED = "session.failed"
+# lifecycle marker types (rumor plane, drives the SSE connection)
 TURN_STARTED = "turn.started"
-TURN_COMPLETED = "turn.completed"
+SESSION_WAITING = "session.waiting"
+ASSISTANT_MESSAGE = "assistant.message"
+TOOL_APPROVAL_REQUESTED = "tool_approval.requested"
+TOOL_RESULT = "tool.result"
 SUBAGENT_CALLED = "subagent.called"
 SUBAGENT_COMPLETED = "subagent.completed"
-TOOL_APPROVAL_REQUESTED = "tool_approval.requested"
-RELOAD_REQUESTED = "reload.requested"
-DEFAULT_STREAM_NAMESPACE = "default"
-DEFAULT_STREAM_POLL_INTERVAL = 0.05
-WRITABLE_STREAM_HANDLE_TYPE = "seal.durable_agent.writable_stream"
+
+# durable record kinds (fact plane, ``record()`` / ``client.tail()``)
+TURN_RECORD = "turn"
+APPROVAL_RECORD = "approval_requested"
+MODEL_RETRY_RECORD = "model_retry"
 
 
-class LifecycleEvent(pydantic.BaseModel):
-    kind: Literal["lifecycle"] = "lifecycle"
-    type: str
-    data: dict[str, Any] = pydantic.Field(default_factory=dict)
-    # ISO 8601 UTC string. None when constructed inside a workflow body
-    # (datetime is sandbox-restricted); stamped by the write function.
-    at: str | None = None
+def model_chunk(event: Any) -> dict[str, Any]:
+    """Envelope one AI SDK model stream event for ``rotor.stream()``."""
+    return {"kind": "model", "event": event.model_dump(mode="json")}
 
 
-type StreamEvent = ai.events.AgentEvent | LifecycleEvent
+def lifecycle_chunk(type_: str, **data: Any) -> dict[str, Any]:
+    """Envelope one lifecycle marker for ``rotor.stream()``."""
+    return {"kind": "lifecycle", "type": type_, "data": data}
 
-STREAM_EVENT_ADAPTER: pydantic.TypeAdapter[StreamEvent] = pydantic.TypeAdapter(
-    StreamEvent
-)
+
+# ── tool result shaping ──────────────────────────────────────────────────
+# A verdict fact carries the reason, never the question; the Fanout deposit
+# (the original ToolCallPart dump) supplies tool_call_id/tool_name here.
+
+
+def tool_result(call: dict[str, Any], value: Any, *, kind: str = "json") -> dict[str, Any]:
+    return ai.messages.ToolResultPart(
+        tool_call_id=call["tool_call_id"],
+        tool_name=call["tool_name"],
+        result=value,
+        result_kind=kind,
+    ).model_dump(mode="json")
+
+
+def error_result(call: dict[str, Any], reason: Any) -> dict[str, Any]:
+    return tool_result(call, str(reason), kind="error")
+
+
+def denied_result(call: dict[str, Any], reason: str | None) -> dict[str, Any]:
+    return tool_result(
+        call, f"Denied by user: {reason or 'no reason given'}", kind="error"
+    )

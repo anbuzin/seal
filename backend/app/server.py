@@ -3,6 +3,7 @@
 Endpoints:
 
   POST /api/chat                     run a turn, stream the AI SDK UI message stream
+  POST /api/chat/{id}/stop           interrupt the in-flight turn (preempt)
   GET  /api/chat/{id}/stream         resume an in-flight stream
   GET  /api/sessions                 list sessions
   POST /api/sessions                 create a session
@@ -11,44 +12,33 @@ Endpoints:
   DELETE /api/sessions/{id}          delete a session
   POST /api/upload, GET /api/files/{p}   private blob upload + proxy
 
-The workflow worker (``worker.py``) drives the run.
+This service is a pure control plane: it starts sessions, sends messages,
+resolves approval hooks, and observes streams. Handlers run only on the
+rotor worker (``worker.py``).
 """
 
 from __future__ import annotations
 
 import collections.abc
+import contextlib
 import logging
-import os
 
-# uvicorn's reloader passes watch_filter=None to watchfiles and applies its
-# *.py filter only afterward, so every .workflow-data/.seal write logs an INFO
-# "N changes detected" without causing a reload; drop those count lines.
 logging.getLogger("watchfiles.main").setLevel(logging.WARNING)
-
-_BACKEND_DIR = os.path.dirname(os.path.dirname(__file__))
-os.environ.setdefault(
-    "WORKFLOW_LOCAL_DATA_DIR",
-    os.path.join(_BACKEND_DIR, ".workflow-data"),
-)
-os.environ.setdefault(
-    "SEAL_STREAMS_DIR",
-    os.path.join(_BACKEND_DIR, ".seal"),
-)
 
 from agent import telemetry  # noqa: E402
 
 _telemetry = telemetry.install("seal-backend")
-
-import contextlib  # noqa: E402
 
 import ai.ui.ai_sdk as ai_sdk  # noqa: E402
 import fastapi  # noqa: E402
 import fastapi.middleware.cors  # noqa: E402
 import fastapi.responses  # noqa: E402
 import pydantic  # noqa: E402
+from rotor import MailboxClosed, ProcessNotFound  # noqa: E402
 from vercel.blob import AsyncBlobClient  # noqa: E402
 
 from agent import proto  # noqa: E402
+from agent.runtime import client  # noqa: E402
 from app import attachments, chat, sessions  # noqa: E402
 
 
@@ -58,8 +48,6 @@ async def lifespan(_app: fastapi.FastAPI) -> collections.abc.AsyncIterator[None]
     try:
         yield
     finally:
-        # flush the telemetry batch exporter before teardown so short-lived
-        # (dev-reload) processes don't drop tail spans.
         if _telemetry is not None:
             _telemetry.shutdown()
 
@@ -92,51 +80,57 @@ async def post_chat(request: ChatRequest) -> fastapi.responses.StreamingResponse
     messages, approvals = ai_sdk.to_messages(request.messages)
     await sessions.touch(request.session_id)
 
-    # ``sendAutomaticallyWhen`` resubmits the full history after the user responds
-    # to an approval, so the trailing message is the assistant turn that holds the
-    # answered tool part — not a new user message. That case resumes the parked
-    # turn with the decisions; a trailing user message starts a fresh turn.
+    # ``sendAutomaticallyWhen`` resubmits the full history after the user
+    # responds to an approval, so the trailing message is the assistant turn
+    # holding the answered tool part — not a new user message. That case
+    # resolves the durable hooks; a trailing user message starts (or queues
+    # into) a turn.
     is_approval_resume = bool(approvals) and not (
         messages and messages[-1].role == "user"
     )
 
-    if is_approval_resume:
-        start_index = await chat.submit_approvals(
-            request.session_id,
-            [
-                proto.ToolApprovalResponse(
-                    tool_call_id=approval.tool_call_id,
-                    granted=approval.granted,
-                    reason=approval.reason,
-                )
-                for approval in approvals
-            ],
-        )
-    else:
-        prompt = next(
-            (m.text for m in reversed(messages) if m.role == "user" and m.text), None
-        )
-        if prompt is None:
-            raise fastapi.HTTPException(
-                status_code=400, detail="No user message to run"
+    try:
+        if is_approval_resume:
+            await chat.submit_approvals(request.session_id, list(approvals))
+        else:
+            prompt = next(
+                (m.text for m in reversed(messages) if m.role == "user" and m.text),
+                None,
             )
-        start_index = await chat.start_or_resume(request.session_id, prompt)
+            if prompt is None:
+                raise fastapi.HTTPException(
+                    status_code=400, detail="No user message to run"
+                )
+            await chat.start_or_resume(request.session_id, prompt)
+    except MailboxClosed as exc:
+        raise fastapi.HTTPException(status_code=410, detail=str(exc)) from exc
 
     return fastapi.responses.StreamingResponse(
-        chat.to_sse(request.session_id, start_index),
+        chat.to_sse(request.session_id),
         headers=ai_sdk.UI_MESSAGE_STREAM_HEADERS,
     )
 
 
+@app.post("/api/chat/{session_id}/stop")
+async def stop_chat(session_id: str) -> dict[str, str]:
+    """Interrupt the in-flight turn: preempt revokes the lease, the running
+    activation aborts uncommitted, and its provisional tokens are retracted.
+    (The workflow port had no interruption story.)"""
+    try:
+        await client().send(session_id, proto.Interrupt(), preempt=True)
+    except (ProcessNotFound, MailboxClosed) as exc:
+        raise fastapi.HTTPException(status_code=404, detail=str(exc)) from exc
+    return {"status": "stopping"}
+
+
 @app.get("/api/chat/{session_id}/stream")
 async def resume_chat(session_id: str) -> fastapi.responses.Response:
-    # ``useChat({ resume: true })`` GETs this on mount. Re-tail the durable
-    # stream from the in-flight run's start; 204 when nothing is running.
-    start_index = await chat.active_run_start_index(session_id)
-    if start_index is None:
+    # ``useChat({ resume: true })`` GETs this on mount. The spool replays the
+    # in-flight turn's tokens; 204 when nothing is running or parked.
+    if not await chat.in_flight(session_id):
         return fastapi.responses.Response(status_code=204)
     return fastapi.responses.StreamingResponse(
-        chat.to_sse(session_id, start_index),
+        chat.to_sse(session_id),
         headers=ai_sdk.UI_MESSAGE_STREAM_HEADERS,
     )
 
@@ -164,8 +158,8 @@ async def get_session(session_id: str) -> dict[str, object]:
     meta = await sessions.get_session(session_id)
     if meta is None:
         raise fastapi.HTTPException(status_code=404, detail="Session not found")
-    # committed turns only; a turn still parked on an approval is in flight (not
-    # persisted) and the UI rebuilds it from the resumed stream (GET /chat/.../stream).
+    # committed turns only; an in-flight turn is rebuilt from the resumed
+    # stream (GET /chat/.../stream), token-for-token via the spool replay.
     ui_messages = ai_sdk.to_ui_messages(await sessions.history(session_id))
     serialized = [
         message.model_dump(mode="json", by_alias=True) for message in ui_messages
@@ -198,6 +192,9 @@ async def generate_title(session_id: str) -> sessions.SessionMeta:
 async def delete_session(session_id: str) -> dict[str, str]:
     if not await sessions.delete_session(session_id):
         raise fastapi.HTTPException(status_code=404, detail="Session not found")
+    # the durable process (and its non-detached subagents) go with the chat
+    with contextlib.suppress(ProcessNotFound):
+        await client().cancel(session_id, by="delete_session")
     return {"status": "deleted"}
 
 
@@ -215,8 +212,8 @@ async def upload(file: fastapi.UploadFile) -> UploadResponse:
     content = await file.read()
     media_type = file.content_type or "application/octet-stream"
     filename = file.filename or "attachment"
-    async with AsyncBlobClient() as client:
-        result = await client.put(
+    async with AsyncBlobClient() as client_:
+        result = await client_.put(
             f"attachments/{filename}",
             content,
             access="private",
@@ -232,8 +229,8 @@ async def upload(file: fastapi.UploadFile) -> UploadResponse:
 
 @app.get("/api/files/{pathname:path}")
 async def get_file(pathname: str) -> fastapi.responses.Response:
-    async with AsyncBlobClient() as client:
-        result = await client.get(pathname, access="private")
+    async with AsyncBlobClient() as client_:
+        result = await client_.get(pathname, access="private")
     return fastapi.responses.Response(
         content=result.content,
         media_type=result.content_type or "application/octet-stream",
