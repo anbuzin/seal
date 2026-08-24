@@ -51,12 +51,10 @@ export function ChatView({
   sessionId,
   initialMessages,
   onFinishReply,
-  onInterrupted,
 }: {
   sessionId: string
   initialMessages: UIMessage[]
   onFinishReply: () => void
-  onInterrupted: () => Promise<void>
 }) {
   const [isUploading, setIsUploading] = useState(false)
   const [isInterrupting, setIsInterrupting] = useState(false)
@@ -86,18 +84,14 @@ export function ChatView({
     const interruptFinished = interruptFinishedRef.current
     if (interruptFinished === null) return
 
-    void (async () => {
-      try {
-        await interruptFinished
-        await onInterrupted()
-      } finally {
-        if (interruptFinishedRef.current === interruptFinished) {
-          interruptFinishedRef.current = null
-          setIsInterrupting(false)
-        }
+    const finishInterrupt = () => {
+      if (interruptFinishedRef.current === interruptFinished) {
+        interruptFinishedRef.current = null
+        setIsInterrupting(false)
       }
-    })()
-  }, [onFinishReply, onInterrupted])
+    }
+    void interruptFinished.then(finishInterrupt, finishInterrupt)
+  }, [onFinishReply])
 
   const { messages, sendMessage, status, error, addToolApprovalResponse } =
     useChat<ChatUIMessage>({
