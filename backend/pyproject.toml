@@ -23,13 +23,6 @@ python_version = "3.13"
 strict = true
 plugins = ["pydantic.mypy"]
 
-# vercel ships `vercel._internal` without a py.typed marker, but the typed
-# public modules (vercel.workflow etc.) re-export from it; follow it so
-# BaseHook / @step don't degrade to Any.
-[[tool.mypy.overrides]]
-module = "vercel._internal.*"
-follow_untyped_imports = true
-
 [tool.ty.environment]
 python-version = "3.13"
 root = ["./"]
@@ -53,6 +46,15 @@ exclude-newer-package = { ai = false, vercel = false, vercel-cache = false, verc
 
 [tool.uv.sources]
 ai = { git = "https://github.com/vercel-labs/ai-python", branch = "main" }
+vercel = { git = "https://github.com/vercel/vercel-py", branch = "pydantic-arguments", subdirectory = "src/vercel" }
+vercel-cache = { git = "https://github.com/vercel/vercel-py", branch = "pydantic-arguments", subdirectory = "src/vercel-cache" }
+vercel-headers = { git = "https://github.com/vercel/vercel-py", branch = "pydantic-arguments", subdirectory = "src/vercel-headers" }
+vercel-internal-core = { git = "https://github.com/vercel/vercel-py", branch = "pydantic-arguments", subdirectory = "src/vercel-internal-core" }
+vercel-internal-telemetry = { git = "https://github.com/vercel/vercel-py", branch = "pydantic-arguments", subdirectory = "src/vercel-internal-telemetry" }
+vercel-oidc = { git = "https://github.com/vercel/vercel-py", branch = "pydantic-arguments", subdirectory = "src/vercel-oidc" }
+vercel-queue = { git = "https://github.com/vercel/vercel-py", branch = "pydantic-arguments", subdirectory = "src/vercel-queue" }
+vercel-sandbox = { git = "https://github.com/vercel/vercel-py", branch = "pydantic-arguments", subdirectory = "src/vercel-sandbox" }
+vercel-workflow = { git = "https://github.com/vercel/vercel-py", branch = "pydantic-arguments", subdirectory = "src/vercel-workflow" }
 
 [dependency-groups]
 dev = [

@@ -30,7 +30,7 @@ import ai.models as models  # noqa: E402
 import ai.types.events as events_  # noqa: E402
 import ai.types.messages as messages_  # noqa: E402
 import harness  # noqa: E402
-import vercel._internal.workflow.world as wf_world  # noqa: E402
+import vercel.workflow._internal.world as wf_world  # noqa: E402
 
 import agent  # noqa: E402
 from agent import storage  # noqa: E402

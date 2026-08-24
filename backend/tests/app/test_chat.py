@@ -23,7 +23,7 @@ from agent import proto, stream
 from app import chat
 
 
-async def _write(session_id: str, *events: dict[str, Any] | proto.StreamEvent) -> None:
+async def _write(session_id: str, *events: proto.StreamEvent) -> None:
     writer = await stream.get_writable(session_id)
     for event in events:
         await writer.write(event)

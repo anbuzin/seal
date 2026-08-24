@@ -95,8 +95,6 @@ class TurnHook(pydantic.BaseModel, vercel.workflow.BaseHook):
 
 # Durable stream
 
-SESSION_NAMESPACE = "session"
-
 SESSION_STARTED = "session.started"
 SESSION_WAITING = "session.waiting"
 SESSION_COMPLETED = "session.completed"
@@ -107,9 +105,6 @@ SUBAGENT_CALLED = "subagent.called"
 SUBAGENT_COMPLETED = "subagent.completed"
 TOOL_APPROVAL_REQUESTED = "tool_approval.requested"
 RELOAD_REQUESTED = "reload.requested"
-DEFAULT_STREAM_NAMESPACE = "default"
-DEFAULT_STREAM_POLL_INTERVAL = 0.05
-WRITABLE_STREAM_HANDLE_TYPE = "seal.durable_agent.writable_stream"
 
 
 class LifecycleEvent(pydantic.BaseModel):
