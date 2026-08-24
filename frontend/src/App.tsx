@@ -41,6 +41,7 @@ export default function App() {
               sessionId={mgr.sessionId}
               initialMessages={mgr.initialMessages}
               onFinishReply={mgr.triggerTitle}
+              onInterrupted={mgr.reloadSession}
             />
           )}
         </SidebarInset>

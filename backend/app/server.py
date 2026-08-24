@@ -131,6 +131,19 @@ async def post_chat(request: ChatRequest) -> fastapi.responses.StreamingResponse
     )
 
 
+@app.post("/api/sessions/{session_id}/interrupt")
+async def interrupt_chat(session_id: str) -> dict[str, str]:
+    try:
+        await chat.interrupt(session_id)
+    except chat.SessionUnavailableError as error:
+        raise fastapi.HTTPException(status_code=409, detail=str(error)) from None
+    except TimeoutError:
+        raise fastapi.HTTPException(
+            status_code=504, detail="Interruption acknowledgement timed out"
+        ) from None
+    return {"status": "interrupted"}
+
+
 @app.get("/api/chat/{session_id}/stream")
 async def resume_chat(session_id: str) -> fastapi.responses.Response:
     # ``useChat({ resume: true })`` GETs this on mount. Re-tail the durable

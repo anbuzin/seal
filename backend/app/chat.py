@@ -35,6 +35,7 @@ from agent import driver, proto, session, stream
 _SESSION_TERMINAL = {
     proto.SESSION_COMPLETED,
     proto.SESSION_FAILED,
+    proto.SESSION_INTERRUPTED,
 }
 
 
@@ -108,6 +109,27 @@ async def start_or_resume(session_id: str, prompt: str) -> int:
     return start_index
 
 
+async def interrupt(session_id: str) -> None:
+    if await session.read_session(session_id) is None:
+        raise SessionUnavailableError("Session is not running")
+
+    start_index = await stream.tail_index(session_id) + 1
+    await _resume(
+        proto.session_inbox_token(session_id),
+        proto.SessionInboxHook(command=proto.InterruptSession()),
+    )
+
+    async with asyncio.timeout(30):
+        async for event in stream.get_readable(session_id, start_index=start_index):
+            if (
+                isinstance(event, proto.LifecycleEvent)
+                and event.type == proto.SESSION_INTERRUPTED
+            ):
+                return
+
+    raise RuntimeError("Session stream closed before interruption was acknowledged")
+
+
 async def submit_approvals(
     session_id: str, approvals: list[proto.ToolApprovalResponse]
 ) -> int:
@@ -165,6 +187,10 @@ def project_background_tasks(
                 part["errorText"] = task.error or "Unknown subagent error"
                 part.pop("output", None)
                 part.pop("preliminary", None)
+            elif task.status == "interrupted":
+                part["state"] = "output-available"
+                part["output"] = background_task_output(task.messages)
+                part["preliminary"] = False
             else:
                 part["state"] = "output-available"
                 if task.status == "completed" or task.messages:
@@ -263,7 +289,20 @@ async def _ui_run_events(
                 )
         elif event.type == proto.SUBAGENT_COMPLETED and isinstance(task_id, str):
             active_tasks.discard(task_id)
-            if event.data.get("is_error"):
+            messages = [
+                ai.messages.Message.model_validate(message)
+                for message in event.data.get("messages", [])
+            ]
+            if event.data.get("error") == "Interrupted by user":
+                task_messages[task_id] = messages
+                await queue.put(
+                    ui_events.UIToolOutputAvailableEvent(
+                        tool_call_id=task_id,
+                        output=background_task_output(messages),
+                        preliminary=False,
+                    )
+                )
+            elif event.data.get("is_error"):
                 await queue.put(
                     ui_events.UIToolOutputErrorEvent(
                         tool_call_id=task_id,
@@ -273,10 +312,6 @@ async def _ui_run_events(
                     )
                 )
             else:
-                messages = [
-                    ai.messages.Message.model_validate(message)
-                    for message in event.data.get("messages", [])
-                ]
                 task_messages[task_id] = messages
                 await queue.put(
                     ui_events.UIToolOutputAvailableEvent(

@@ -195,5 +195,6 @@ export function useSessionManager() {
     newSession,
     deleteSession,
     triggerTitle,
+    reloadSession: () => loadSession(sessionId),
   } as const
 }

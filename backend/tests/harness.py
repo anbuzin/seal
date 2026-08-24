@@ -160,6 +160,13 @@ async def resume_approval(
     )
 
 
+async def interrupt_session(session_id: str) -> None:
+    await _resume_hook(
+        proto.session_inbox_token(session_id),
+        proto.SessionInboxHook(command=proto.InterruptSession()),
+    )
+
+
 async def _resume_hook(token: str, hook: vercel.workflow.BaseHook) -> None:
     for attempt in range(100):
         try:

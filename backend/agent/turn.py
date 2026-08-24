@@ -1,6 +1,9 @@
 import asyncio
 import contextvars
 import dataclasses
+import json
+import os
+import signal
 import traceback
 from collections.abc import AsyncGenerator, Sequence
 from typing import Any, ClassVar
@@ -9,7 +12,7 @@ import ai
 import pydantic
 import vercel.workflow
 
-from agent import proto, stream, util, workflow
+from agent import control, proto, stream, util, workflow
 
 MODEL_ID = "gateway:anthropic/claude-sonnet-4.6"
 IMAGE_MODEL_ID = "gateway:google/gemini-3.1-flash-image"
@@ -58,20 +61,26 @@ class EagerToolHook(pydantic.BaseModel, vercel.workflow.BaseHook):
     payload: ai.messages.ToolCallPart
 
 
-@workflow.step
+@control.cancellable_step
 async def llm_step(
     model_id: str,
-    messages: list[ai.messages.Message],
-    tools: list[ai.Tool],
-    session_id: str | None,
+    messages_data: list[dict[str, object]],
+    tools_data: list[dict[str, object]],
+    *,
+    session_id: str,
+    turn_index: int,
     tool_token: str | None = None,
-    turn_span: ai.experimental_telemetry.Span | None = None,
+    turn_span_data: dict[str, object] | None = None,
     parent_session_id: str | None = None,
     background_task_id: str | None = None,
-) -> ai.messages.Message:
+) -> dict[str, object]:
     model = ai.get_model(model_id)
+    messages = [
+        ai.messages.Message.model_validate(message) for message in messages_data
+    ]
+    tools = [ai.Tool.model_validate(tool) for tool in tools_data]
 
-    writer = await stream.get_writable(session_id) if session_id else None
+    writer = await stream.get_writable(session_id)
     parent_writer = (
         await stream.get_writable(parent_session_id) if parent_session_id else None
     )
@@ -86,11 +95,16 @@ async def llm_step(
             await parent_writer.write(
                 stream.subagent_event(
                     tool_call_id=background_task_id,
-                    event=reload_event.model_dump(mode="json"),
+                    event=reload_event,
                 )
             )
 
     # parent this step's spans under the turn's span
+    turn_span = (
+        ai.experimental_telemetry.Span.model_validate(turn_span_data)
+        if turn_span_data
+        else None
+    )
     async with (
         ai.experimental_telemetry.use_span(turn_span),
         ai.stream(model, messages, tools=tools) as model_stream,
@@ -111,17 +125,17 @@ async def llm_step(
             if tool_token and isinstance(e, ai.types.events.ToolEnd):
                 await EagerToolHook(payload=e.tool_call).resume(tool_token)
 
-    return model_stream.message
+    return model_stream.message.model_dump(mode="json")
 
 
 @workflow.step
 async def write_event(
     # writes one stream event (agent or lifecycle) to the durable stream
     session_id: str,
-    event: proto.StreamEvent,
+    event_data: dict[str, object],
 ) -> None:
     writer = await stream.get_writable(session_id)
-    await writer.write(event)
+    await writer.write(event_data)
 
 
 # closes a durable event stream once the owning session is terminal.
@@ -132,7 +146,7 @@ async def close_stream(session_id: str) -> None:
 
 
 @ai.tool(require_approval=True)
-@workflow.step(max_retries=0)
+@control.cancellable_step
 async def bash(command: str, timeout: int | None = None) -> str:
     proc = await asyncio.create_subprocess_exec(
         "bash",
@@ -140,13 +154,27 @@ async def bash(command: str, timeout: int | None = None) -> str:
         command,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
+        start_new_session=True,
     )
     try:
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except TimeoutError:
-        proc.kill()
-        await proc.communicate()
+        os.killpg(proc.pid, signal.SIGTERM)
+        try:
+            await asyncio.wait_for(proc.communicate(), timeout=0.5)
+        except TimeoutError:
+            os.killpg(proc.pid, signal.SIGKILL)
+            await proc.communicate()
         return f"Command timed out after {timeout}s."
+    except asyncio.CancelledError:
+        if proc.returncode is None:
+            os.killpg(proc.pid, signal.SIGTERM)
+            try:
+                await asyncio.wait_for(proc.communicate(), timeout=0.5)
+            except TimeoutError:
+                os.killpg(proc.pid, signal.SIGKILL)
+                await proc.communicate()
+        raise
 
     output = stdout.decode() if stdout else ""
     if proc.returncode != 0:
@@ -162,7 +190,7 @@ bash_ungated = dataclasses.replace(
 
 
 @ai.tool
-@workflow.step
+@control.cancellable_step
 async def web_fetch(
     url: str,
     method: str = "GET",
@@ -194,25 +222,35 @@ async def web_fetch(
     return "\n".join(parts)
 
 
-@ai.tool
-@workflow.step
-async def generate_image(prompt: str) -> ai.messages.ContentOutput:
-    """Generate an image from a text prompt. Describe the desired image in detail."""
+@control.cancellable_step
+async def image_step(prompt: str) -> dict[str, object]:
+    # the ai library has no direct image-generation API yet, so this
+    # runs a model that emits images inline with its response.
     model = ai.get_model(IMAGE_MODEL_ID)
     messages = [ai.system_message(IMAGE_SYSTEM_PROMPT), ai.user_message(prompt)]
     async with ai.stream(model, messages) as model_stream:
         async for _ in model_stream:
             pass
     message = model_stream.message
+
     if not message.images:
-        return ai.content_output(message.text or "The image model returned no image.")
+        return ai.content_output(
+            message.text or "The image model returned no image.",
+        ).model_dump(mode="json")
     return ai.content_output(
         *(
             part
             for part in message.parts
             if isinstance(part, ai.messages.TextPart | ai.messages.FilePart)
         )
-    )
+    ).model_dump(mode="json")
+
+
+@ai.tool
+async def generate_image(prompt: str) -> ai.messages.ContentOutput:
+    """Generate an image from a text prompt. Describe the desired image in
+    detail, including subject, style, and composition."""
+    return ai.messages.ContentOutput.model_validate(await image_step(prompt))
 
 
 # the running tool call's context, set by the loop around each schedule so a
@@ -225,9 +263,11 @@ tool_call_context: contextvars.ContextVar[proto.ToolCallContext] = (
 
 @workflow.step
 async def request_background_task(
-    session_id: str, command: proto.StartBackgroundTask
+    session_id: str, command_data: dict[str, object]
 ) -> None:
-    hook = proto.SessionInboxHook(command=command)
+    hook = proto.SessionInboxHook(
+        command=proto.StartBackgroundTask.model_validate(command_data)
+    )
     token = proto.session_inbox_token(session_id)
     for attempt in range(40):
         try:
@@ -252,7 +292,7 @@ async def subagent(prompt: str, name: str | None = None) -> str:
             name=name or "subagent",
             parent_turn_index=call.turn_index,
             parent_span=call.turn_span,
-        ),
+        ).model_dump(mode="json"),
     )
     return "Subagent is running in the background and will update you later."
 
@@ -290,13 +330,17 @@ class DurableAgent(ai.Agent):
     async def loop(self, context: ai.Context) -> AsyncGenerator[ai.events.AgentEvent]:
         model_id = context.model.id
         session_id = self.session_id
+        turn_span_data = (
+            self.turn_span.model_dump(mode="json") if self.turn_span else None
+        )
+
         tool_token = f"seal-early-tool:{session_id}"
         live_tool_calls = {}
 
         def launch_tool(tool_call: ai.messages.ToolCallPart) -> None:
             # Launch a tool in a task under the right context, track
             # it in the live call table.
-            token = tool_call_context.set(
+            call_token = tool_call_context.set(
                 proto.ToolCallContext(
                     session_id=session_id or "",
                     turn_index=self.turn_index,
@@ -304,10 +348,14 @@ class DurableAgent(ai.Agent):
                     turn_span=self.turn_span,
                 )
             )
+            cancellation_token = control.cancellation_context.set(
+                (session_id or "", self.turn_index)
+            )
             live_tool_calls[tool_call.tool_call_id] = self.tg.create_task(
                 context.resolve(tool_call)()
             )
-            tool_call_context.reset(token)
+            control.cancellation_context.reset(cancellation_token)
+            tool_call_context.reset(call_token)
 
         eager_tool_hook = EagerToolHook.wait(token=tool_token)
 
@@ -327,16 +375,20 @@ class DurableAgent(ai.Agent):
         while context.keep_running():
             live_tool_calls.clear()
 
-            assistant_message = await llm_step(
+            assert session_id is not None
+            result = await llm_step(
                 model_id,
-                context.messages,
-                context.tools,
-                session_id,
-                tool_token,
-                self.turn_span,
-                self.parent_session_id,
-                self.background_task_id,
+                [message.model_dump(mode="json") for message in context.messages],
+                [tool.model_dump(mode="json") for tool in context.tools],
+                session_id=session_id,
+                turn_index=self.turn_index,
+                tool_token=tool_token,
+                turn_span_data=turn_span_data,
+                parent_session_id=self.parent_session_id,
+                background_task_id=self.background_task_id,
             )
+
+            assistant_message = ai.messages.Message.model_validate(result)
             context.add(assistant_message)
             # llm_step streamed this turn out-of-band (straight to the durable
             # stream), so yield the final StreamEnd here for run-blocked
@@ -372,8 +424,9 @@ class DurableAgent(ai.Agent):
                     # write tool-running events from the producer side so they land
                     # in loop order (results before the next turn's answer); run_turn
                     # only writes HookEvents, which ride the runtime queue instead.
+                    event_data = event.model_dump(mode="json")
                     if session_id is not None:
-                        await write_event(session_id, event)
+                        await write_event(session_id, event_data)
                     if (
                         self.parent_session_id is not None
                         and self.background_task_id is not None
@@ -382,7 +435,7 @@ class DurableAgent(ai.Agent):
                             self.parent_session_id,
                             stream.subagent_event(
                                 tool_call_id=self.background_task_id,
-                                event=event.model_dump(mode="json"),
+                                event=event_data,
                             ),
                         )
                     yield event
@@ -397,21 +450,21 @@ class DurableAgent(ai.Agent):
 
 
 @workflow.step
-async def ship_spans(spans: list[ai.experimental_telemetry.Span]) -> None:
+async def ship_spans(spans_data: list[dict[str, Any]]) -> None:
     # re-deliver spans collected in the workflow body to the real adapters.
-    await ai.experimental_telemetry.push_all(spans)
+    await ai.experimental_telemetry.push_all(spans_data)
 
 
 @workflow.step
 async def notify_turn_finished(
-    session_id: str, turn_index: int, output: proto.TurnOutput
+    session_id: str, turn_index: int, output_data: dict[str, Any]
 ) -> None:
     # resume() is a side effect, so it must run in a step. the session may not
     # have suspended on its inbox again yet, so retry while it is missing.
     hook = proto.SessionInboxHook(
         command=proto.TurnFinished(
             turn_index=turn_index,
-            output=output,
+            output=proto.TurnOutput.model_validate(output_data),
         )
     )
     token = proto.session_inbox_token(session_id)
@@ -427,12 +480,12 @@ async def notify_turn_finished(
 
 @workflow.step
 async def notify_background_task_finished(
-    session_id: str, task_id: str, output: proto.TurnOutput
+    session_id: str, task_id: str, output_data: dict[str, Any]
 ) -> None:
     hook = proto.SessionInboxHook(
         command=proto.BackgroundTaskFinished(
             task_id=task_id,
-            output=output,
+            output=proto.TurnOutput.model_validate(output_data),
         )
     )
     token = proto.session_inbox_token(session_id)
@@ -447,8 +500,70 @@ async def notify_background_task_finished(
 
 
 @workflow.step
-async def notify_agent_finished(token: str, output: proto.TurnOutput) -> None:
-    hook = proto.TurnInboxHook(command=proto.AgentFinished(output=output))
+async def partial_messages(
+    session_id: str,
+    start_index: int,
+    input_messages_data: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    messages = [
+        ai.messages.Message.model_validate(message) for message in input_messages_data
+    ]
+    index_by_id = {message.id: index for index, message in enumerate(messages)}
+    async for event in stream.replay(session_id, start_index=start_index):
+        if isinstance(event, proto.LifecycleEvent):
+            continue
+        message = getattr(event, "message", None)
+        if not isinstance(message, ai.messages.Message) or message.role == "internal":
+            continue
+        existing = index_by_id.get(message.id)
+        if existing is None:
+            index_by_id[message.id] = len(messages)
+            messages.append(message)
+        else:
+            messages[existing] = message
+
+    answered = {
+        result.tool_call_id
+        for message in messages
+        if message.role == "tool"
+        for result in message.tool_results
+    }
+    pending: list[ai.messages.ToolCallPart] = []
+    normalized: list[ai.messages.Message] = []
+    for message in messages:
+        parts: list[ai.messages.Part] = []
+        for part in message.parts:
+            if isinstance(part, ai.messages.ToolCallPart):
+                try:
+                    json.loads(part.tool_args)
+                except (json.JSONDecodeError, TypeError):
+                    part = part.model_copy(update={"tool_args": "{}"})
+                if part.tool_call_id not in answered:
+                    pending.append(part)
+            parts.append(part)
+        normalized.append(message.model_copy(update={"parts": parts}))
+    if pending:
+        normalized.append(
+            ai.tool_message(
+                *(
+                    ai.tool_result_part(
+                        part.tool_call_id,
+                        tool_name=part.tool_name,
+                        result="Interrupted by user",
+                        is_error=True,
+                    )
+                    for part in pending
+                )
+            )
+        )
+    return [message.model_dump(mode="json") for message in normalized]
+
+
+@workflow.step
+async def notify_agent_finished(token: str, output_data: dict[str, Any]) -> None:
+    hook = proto.TurnInboxHook(
+        command=proto.AgentFinished(output=proto.TurnOutput.model_validate(output_data))
+    )
     for attempt in range(40):
         try:
             await hook.resume(token)
@@ -466,29 +581,30 @@ async def notify_agent_finished(token: str, output: proto.TurnOutput) -> None:
 # entry (only valid inside the workflow).
 @ai.messages.use_random(vercel.workflow.random)
 @ai.experimental_telemetry.use_time(vercel.workflow.time_ns)
-async def run_turn(turn_input: proto.TurnInput) -> None:
-    messages = turn_input.messages
-    session_id = turn_input.session_id
-    turn_index = turn_input.turn_index
+async def run_turn(turn_input: dict[str, Any]) -> None:
+    _turn_input = proto.TurnInput.model_validate(turn_input)
+    messages = _turn_input.messages
+    session_id = _turn_input.session_id
+    turn_index = _turn_input.turn_index
 
     # messages should already contain either the user message
     # or the tool result message, so no need to do anything
 
-    extra_tools = [bash, subagent] if turn_input.gated else [bash_ungated]
+    extra_tools = [bash, subagent] if _turn_input.gated else [bash_ungated]
     agent = DurableAgent(
         tools=extra_tools,
         session_id=session_id,
         turn_index=turn_index,
-        turn_span=turn_input.turn_span,
-        parent_session_id=turn_input.parent_session_id,
-        background_task_id=turn_input.background_task_id,
+        turn_span=_turn_input.turn_span,
+        parent_session_id=_turn_input.parent_session_id,
+        background_task_id=_turn_input.background_task_id,
     )
 
     # collect spans that happen inside the workflow body, and send them
     # once in a separate step.
     collector = (
         ai.experimental_telemetry.DictSink()
-        if turn_input.turn_span is not None
+        if _turn_input.turn_span is not None
         else None
     )
     inbox_token = proto.turn_inbox_token(session_id, turn_index)
@@ -499,7 +615,7 @@ async def run_turn(turn_input: proto.TurnInput) -> None:
         model = ai.get_model(MODEL_ID)
         async with (
             ai.experimental_telemetry.use_sink(collector),
-            ai.experimental_telemetry.use_span(turn_input.turn_span),
+            ai.experimental_telemetry.use_span(_turn_input.turn_span),
             ai.util.TaskGroup() as tg,
         ):
             agent.tg = tg
@@ -523,7 +639,9 @@ async def run_turn(turn_input: proto.TurnInput) -> None:
                                 # runner.events(), so the loop never wrote this;
                                 # write it here so the UI
                                 # gets the approval request part.
-                                await write_event(session_id, event)
+                                await write_event(
+                                    session_id, event.model_dump(mode="json")
+                                )
                             elif isinstance(event, ai.events.RunBlocked):
                                 await write_event(
                                     session_id,
@@ -532,6 +650,22 @@ async def run_turn(turn_input: proto.TurnInput) -> None:
                                     ),
                                 )
                         result = proto.TurnOutput(kind="suspend", messages=run.messages)
+                except control.StepInterrupted:
+                    messages_data = await partial_messages(
+                        session_id,
+                        _turn_input.stream_start_index,
+                        [
+                            message.model_dump(mode="json")
+                            for message in _turn_input.messages
+                        ],
+                    )
+                    result = proto.TurnOutput(
+                        kind="interrupted",
+                        messages=[
+                            ai.messages.Message.model_validate(message)
+                            for message in messages_data
+                        ],
+                    )
                 except Exception as error:
                     result = proto.TurnOutput(
                         kind="error",
@@ -542,7 +676,7 @@ async def run_turn(turn_input: proto.TurnInput) -> None:
                         f"[seal] error in run_turn:\n{traceback.format_exc()}",
                         flush=True,
                     )
-                await notify_agent_finished(inbox_token, result)
+                await notify_agent_finished(inbox_token, result.model_dump(mode="json"))
 
             inbox_queue: asyncio.Queue[proto.TurnInboxHook] = asyncio.Queue()
 
@@ -568,6 +702,34 @@ async def run_turn(turn_input: proto.TurnInput) -> None:
                             },
                             registry=hook_registry,
                         )
+                    case proto.InterruptTurn():
+                        # Tool tasks are siblings of the agent driver in this task
+                        # group. Cancelling only agent_task can therefore leave an
+                        # approval/tool sibling alive and make TaskGroup.__aexit__
+                        # wait forever. The durable control signal was written
+                        # before this command, so active steps also stop themselves.
+                        running = [task for task in tg._tasks if not task.done()]
+                        for task in running:
+                            task.cancel()
+                        if running:
+                            await asyncio.gather(*running, return_exceptions=True)
+                        messages_data = await partial_messages(
+                            session_id,
+                            _turn_input.stream_start_index,
+                            [
+                                message.model_dump(mode="json")
+                                for message in _turn_input.messages
+                            ],
+                        )
+                        output = proto.TurnOutput(
+                            kind="interrupted",
+                            messages=[
+                                ai.messages.Message.model_validate(message)
+                                for message in messages_data
+                            ],
+                        )
+                        inbox_task.cancel()
+                        break
                     case proto.AgentFinished(output=result):
                         output = result
                         inbox_task.cancel()
@@ -588,11 +750,11 @@ async def run_turn(turn_input: proto.TurnInput) -> None:
     # deliver the body's collected spans. only complete records ship: a span
     # still open here would dangle in the shipping process's adapter.
     if collector is not None:
-        finished = list(collector.finished_spans)
-        if turn_input.turn_span is not None:
+        finished = [s.model_dump(mode="json") for s in collector.finished_spans]
+        if _turn_input.turn_span is not None:
             # complete the turn span here (pure data ops on workflow time) so
             # it ships with the rest instead of riding the resume step.
-            turn_span = turn_input.turn_span.stamp_end(
+            turn_span = _turn_input.turn_span.stamp_end(
                 error=ai.experimental_telemetry.SpanError(
                     type="TurnError", message=output.error
                 )
@@ -600,19 +762,21 @@ async def run_turn(turn_input: proto.TurnInput) -> None:
                 else None
             )
             turn_span.set_attrs({"session.id": session_id, "turn_index": turn_index})
-            finished.append(turn_span)
+            finished.append(turn_span.model_dump(mode="json"))
         if finished:
             await ship_spans(finished)
 
     if (
-        turn_input.parent_session_id is not None
-        and turn_input.background_task_id is not None
+        _turn_input.parent_session_id is not None
+        and _turn_input.background_task_id is not None
     ):
         await notify_background_task_finished(
-            turn_input.parent_session_id,
-            turn_input.background_task_id,
-            output,
+            _turn_input.parent_session_id,
+            _turn_input.background_task_id,
+            output.model_dump(mode="json"),
         )
     else:
         # root turns report back through the session's stable inbox.
-        await notify_turn_finished(session_id, turn_index, output)
+        await notify_turn_finished(
+            session_id, turn_index, output.model_dump(mode="json")
+        )

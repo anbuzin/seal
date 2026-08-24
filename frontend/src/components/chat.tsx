@@ -51,12 +51,15 @@ export function ChatView({
   sessionId,
   initialMessages,
   onFinishReply,
+  onInterrupted,
 }: {
   sessionId: string
   initialMessages: UIMessage[]
   onFinishReply: () => void
+  onInterrupted: () => Promise<void>
 }) {
   const [isUploading, setIsUploading] = useState(false)
+  const [isInterrupting, setIsInterrupting] = useState(false)
   // UI-only for now: the backend model is still hardcoded (see lib/models.ts).
   const [model, setModel] = useState(DEFAULT_MODEL)
 
@@ -93,6 +96,22 @@ export function ChatView({
   })
 
   const isStreaming = status === "submitted" || status === "streaming"
+
+  const handleStop = useCallback(async () => {
+    stop()
+    setIsInterrupting(true)
+    try {
+      const response = await fetch(`/api/sessions/${sessionId}/interrupt`, {
+        method: "POST",
+      })
+      if (!response.ok) {
+        throw new Error(`Interrupt failed: ${response.statusText}`)
+      }
+      await onInterrupted()
+    } finally {
+      setIsInterrupting(false)
+    }
+  }, [onInterrupted, sessionId, stop])
 
   const handleSubmit = useCallback(
     async ({ text, files }: { text: string; files: FileUIPart[] }) => {
@@ -174,9 +193,9 @@ export function ChatView({
           models={MODELS}
           model={model}
           onModelChange={setModel}
-          isBusy={isStreaming || isUploading}
+          isBusy={isStreaming || isUploading || isInterrupting}
           onSubmit={handleSubmit}
-          onStop={() => void stop()}
+          onStop={() => void handleStop()}
         />
       </div>
     </div>

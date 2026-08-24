@@ -10,6 +10,7 @@ deadlocks (every wait is bounded, so a deadlock is a fast red test).
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import os
 
@@ -18,6 +19,9 @@ import pytest
 from conftest import MockProvider, assert_message_invariants, text_msg, tool_call_msg
 from harness import (
     InProcessWorld,
+)
+from harness import (
+    interrupt_session as _interrupt,
 )
 from harness import (
     lifecycle as _lifecycle,
@@ -69,6 +73,34 @@ async def test_single_turn_suspends_then_closes(
     ]
     _, closed = await storage.store().info("s1", "default")
     assert closed
+
+
+async def test_interrupt_waiting_turn_preserves_history_and_allows_resume(
+    world: InProcessWorld, scripted_model: MockProvider
+) -> None:
+    scripted_model.responses = [[text_msg("first answer")], [text_msg("second answer")]]
+
+    await _start("s1", "one")
+    await _wait_for_lifecycle("s1", proto.SESSION_WAITING)
+    await _interrupt("s1")
+    await _wait_for_lifecycle("s1", proto.SESSION_INTERRUPTED)
+
+    interrupted = await session.read_session("s1")
+    assert interrupted is not None
+    assert interrupted.messages[-1].text == "first answer"
+    assert interrupted.active_ui_run_message_index is None
+
+    await _resume(proto.session_inbox_token("s1"), proto.NewUserMessage(prompt="two"))
+    await _wait_for_lifecycle("s1", proto.SESSION_WAITING, count=2)
+
+    resumed = await session.read_session("s1")
+    assert resumed is not None
+    assert [message.text for message in resumed.messages if message.role == "user"] == [
+        "one",
+        "two",
+    ]
+    assert resumed.messages[-1].text == "second answer"
+    assert_message_invariants(resumed.messages)
 
 
 async def test_resume_appends_user_message_without_duplicating_history(
@@ -149,6 +181,44 @@ async def test_gated_tool_approval_runs_in_one_turn(
         proto.TURN_COMPLETED,
         proto.SESSION_WAITING,
     ]
+
+
+async def test_interrupt_approval_wait_reconciles_history_without_running_tool(
+    world: InProcessWorld, scripted_model: MockProvider
+) -> None:
+    scripted_model.responses = [
+        [
+            tool_call_msg(
+                tc_id="tc-1",
+                name="bash",
+                args='{"command": "touch /tmp/seal-should-not-run"}',
+                text="waiting for approval",
+            )
+        ]
+    ]
+
+    await _start("s1", "run it")
+    await _wait_for_lifecycle("s1", proto.TOOL_APPROVAL_REQUESTED)
+    calls_before_interrupt = scripted_model.call_count
+
+    await _interrupt("s1")
+    await _wait_for_lifecycle("s1", proto.SESSION_INTERRUPTED)
+
+    state = await session.read_session("s1")
+    assert state is not None
+    assert state.active_ui_run_message_index is None
+    assert scripted_model.call_count == calls_before_interrupt == 1
+    assert [message.role for message in state.messages] == [
+        "system",
+        "user",
+        "assistant",
+        "tool",
+    ]
+    [result] = state.messages[-1].tool_results
+    assert result.tool_call_id == "tc-1"
+    assert result.result == "Interrupted by user"
+    assert result.result_kind == "error"
+    assert_message_invariants(state.messages)
 
 
 async def test_parallel_gated_tools_park_then_run(
@@ -274,6 +344,43 @@ async def test_subagent_returns_immediately_then_wakes_parent_with_user_message(
     assert proxied
     assert any(event.data["event"].get("kind") == "text_delta" for event in proxied)
     assert scripted_model.call_count == 4
+
+
+async def test_interrupt_background_child_suppresses_parent_followup(
+    world: InProcessWorld, scripted_model: MockProvider
+) -> None:
+    scripted_model.responses = [
+        [
+            tool_call_msg(
+                tc_id="tc-sub",
+                name="subagent",
+                args='{"prompt": "child-blocked", "name": "helper"}',
+                text="delegating",
+            )
+        ],
+        [text_msg("working in the background")],
+    ]
+    scripted_model.keyed_responses = {"child-blocked": [text_msg("child answer")]}
+
+    await _start("s1", "delegate")
+    await _wait_for_lifecycle("s1", proto.SUBAGENT_CALLED)
+    await _interrupt("s1")
+    await _wait_for_lifecycle("s1", proto.SESSION_INTERRUPTED)
+    calls_after_ack = scripted_model.call_count
+    await asyncio.sleep(0.1)
+
+    state = await session.read_session("s1")
+    assert state is not None
+    assert state.background_tasks["tc-sub"].status == "interrupted"
+    assert state.active_ui_run_message_index is None
+    assert scripted_model.call_count == calls_after_ack
+    assert not any(
+        message.role == "user"
+        and message.text
+        and message.text.startswith('Background subagent "helper"')
+        for message in state.messages
+    )
+    assert_message_invariants(state.messages)
 
 
 async def test_generate_image_returns_multipart_result(
