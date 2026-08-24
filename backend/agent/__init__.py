@@ -15,6 +15,6 @@ workflow = vercel.workflow.Workflows(
                 else set()
             )
         ),
-        cleanups=vercel.workflow.sandbox.ALL_CLEANUPS,
+        share_sandboxes=True,
     )
 )
