@@ -33,7 +33,7 @@ import ai.ui.ai_sdk.outbound_stream as outbound_stream
 import ai.ui.ai_sdk.ui_events as ui_events
 import vercel.workflow
 
-from agent import driver, proto, session, stream
+from agent import proto, stream
 
 _TERMINAL = {proto.SESSION_WAITING, proto.SESSION_COMPLETED, proto.SESSION_FAILED}
 
@@ -42,8 +42,8 @@ async def active_run_start_index(session_id: str) -> int | None:
     """Return the stream index to resume the in-flight run from, else ``None``.
 
     A *run* is the whole agent turn the SDK adapter folds into a single UI
-    message (one ``UIStartEvent``). It begins at its opener (``session.started``
-    / ``turn.started``) and ends only at a *terminal* boundary (``session.*``) —
+    message (one ``UIStartEvent``). It begins at its first ``turn.started`` and
+    ends only at a *terminal* boundary (``session.*``) —
     a ``tool_approval.requested`` park is mid-run, not the end of one, because the
     same ``run_turn`` resumes in place once the approval lands.
 
@@ -62,7 +62,7 @@ async def active_run_start_index(session_id: str) -> int | None:
         index += 1
         if not isinstance(event, proto.LifecycleEvent):
             continue
-        if event.type in (proto.SESSION_STARTED, proto.TURN_STARTED) and seen_boundary:
+        if event.type == proto.TURN_STARTED and seen_boundary:
             # first opener after a boundary marks where the next run begins.
             run_start = index
             seen_boundary = False
@@ -71,25 +71,20 @@ async def active_run_start_index(session_id: str) -> int | None:
     return None if seen_boundary else run_start
 
 
-async def start_or_resume(session_id: str, prompt: str) -> int:
-    """Start a new session or resume a parked one.
+async def submit_prompt(session_id: str, prompt: str) -> int:
+    """Deliver the next user message to the parked session.
 
+    The session workflow is born parked, so the first message and every later
+    one land the same way: a resume of the ``seal-session:{id}:{turn}`` hook.
     Returns the stream index to tail from so only the new turn reaches the
     client.
     """
     start_index = await stream.tail_index(session_id) + 1
-
-    if await session.read_session(session_id) is None:
-        await vercel.workflow.start(
-            driver.run_session,
-            proto.SessionInput(session_id=session_id, prompt=prompt),
-        )
-    else:
-        turn_index = await _waiting_turn_index(session_id)
-        await _resume(
-            f"seal-session:{session_id}:{turn_index}",
-            proto.SessionHook(payload=proto.NewUserMessage(prompt=prompt)),
-        )
+    turn_index = await _waiting_turn_index(session_id)
+    await _resume(
+        f"seal-session:{session_id}:{turn_index}",
+        proto.SessionHook(payload=proto.NewUserMessage(prompt=prompt)),
+    )
     return start_index
 
 
@@ -277,10 +272,12 @@ async def _resume(token: str, hook: vercel.workflow.BaseHook) -> None:
 
 
 async def _waiting_turn_index(session_id: str) -> int:
-    """The turn the session is currently parked on (latest ``session.waiting``).
+    """The park the session's hook is registered under (its hook token index).
 
-    Falls back to the latest ``tool_approval.requested`` turn, since a turn parked
-    on a gated tool emits that rather than ``session.waiting``.
+    The latest ``session.waiting`` carries it; a brand-new session has none and
+    is parked on index 0. Falls back to the latest ``tool_approval.requested``
+    turn, since a turn parked on a gated tool emits that rather than
+    ``session.waiting``.
     """
     turn_index = 0
     async for event in stream.replay(session_id):

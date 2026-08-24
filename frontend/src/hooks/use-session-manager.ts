@@ -9,7 +9,6 @@
  */
 
 import type { UIMessage } from "ai"
-import { nanoid } from "nanoid"
 import { useCallback, useRef, useState } from "react"
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 
@@ -52,13 +51,11 @@ export function useSessionManager() {
   const qc = useQueryClient()
 
   // ---- Current session ID ------------------------------------------------
-  // The id for this load is computed exactly once: a stored one, or a fresh
-  // nanoid. Because it's fixed, StrictMode's double-invoked bootstrap uses the
-  // *same* id both times, and the create is idempotent (POST is ON CONFLICT DO
-  // NOTHING), so the two calls collapse to a single session row -- no guard
-  // needed. The initializer is pure, so the discarded second nanoid is harmless.
-  const [sessionId, setSessionId] = useState<string>(
-    () => readStoredSessionId() ?? nanoid()
+  // Session ids are server-minted (the id is the session workflow's run id),
+  // so a fresh load has no id until bootstrap either validates the stored one
+  // or creates a session. Null until then; the app gates rendering on it.
+  const [sessionId, setSessionId] = useState<string | null>(() =>
+    readStoredSessionId()
   )
 
   // ---- Messages for the active session -----------------------------------
@@ -75,8 +72,6 @@ export function useSessionManager() {
   const createMutation = useMutation({
     mutationFn: createSessionOnServer,
     onSuccess: (session) => {
-      // The idempotent create can resolve twice (StrictMode) with the same row,
-      // so upsert into the list instead of blindly prepending a duplicate.
       qc.setQueryData<Session[]>(SESSIONS_KEY, (old = []) =>
         old.some((s) => s.id === session.id) ? old : [session, ...old]
       )
@@ -118,40 +113,49 @@ export function useSessionManager() {
     }
   }, [])
 
-  /** Create and activate an empty session with the given id (idempotent). */
-  const createFreshSession = useCallback(
-    async (id: string) => {
-      await createMutation.mutateAsync(id)
-      writeStoredSessionId(id)
-      setSessionId(id)
-      setInitialMessages([])
-    },
-    [createMutation]
-  )
+  /** Create and activate an empty session; the server assigns the id. */
+  const createFreshSession = useCallback(async () => {
+    const session = await createMutation.mutateAsync()
+    writeStoredSessionId(session.id)
+    setSessionId(session.id)
+    setInitialMessages([])
+  }, [createMutation])
 
   /** Public action: create a new session (with loading state). */
   const newSession = useCallback(async () => {
     setIsReady(false)
-    await createFreshSession(nanoid())
+    await createFreshSession()
     titleTriggeredRef.current = null
     setIsReady(true)
   }, [createFreshSession])
 
   // ---- Bootstrap (call once from App useEffect) --------------------------
 
+  // Creating a session is no longer idempotent (every POST mints a new run),
+  // so StrictMode's double-invoked bootstrap must share one flight.
+  const bootstrapRef = useRef<Promise<void> | null>(null)
+
   const bootstrap = useCallback(async () => {
-    // sessionId is fixed for this load, so StrictMode's two bootstrap calls act
-    // on the same id: loading is idempotent, and if it isn't on the server yet
-    // the create is too -- they converge on one row.
-    writeStoredSessionId(sessionId)
+    bootstrapRef.current ??= (async () => {
+      const stored = readStoredSessionId()
+      if (stored !== null) {
+        try {
+          const msgs = await fetchSessionMessages(stored)
+          setInitialMessages(msgs)
+          setSessionId(stored)
+          return
+        } catch {
+          // stale id (deleted session / wiped server): fall through to create.
+        }
+      }
+      await createFreshSession()
+    })()
     try {
-      const msgs = await fetchSessionMessages(sessionId)
-      setInitialMessages(msgs)
-    } catch {
-      await createFreshSession(sessionId)
+      await bootstrapRef.current
+    } finally {
+      setIsReady(true)
     }
-    setIsReady(true)
-  }, [sessionId, createFreshSession])
+  }, [createFreshSession])
 
   // ---- Title generation (call from onFinish) -----------------------------
 

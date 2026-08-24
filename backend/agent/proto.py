@@ -26,11 +26,6 @@ def approval_hook_token(session_id: str, tool_call_id: str) -> str:
     return f"seal-approval:{session_id}:{TOOL_APPROVAL_HOOK_PREFIX}{tool_call_id}"
 
 
-class SessionInput(pydantic.BaseModel):
-    session_id: str
-    prompt: str
-
-
 class SessionOutput(pydantic.BaseModel):
     session_id: str
     output: str

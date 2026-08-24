@@ -16,6 +16,7 @@ The workflow worker (``worker.py``) drives the run.
 
 from __future__ import annotations
 
+import asyncio
 import collections.abc
 import logging
 import os
@@ -46,9 +47,10 @@ import fastapi  # noqa: E402
 import fastapi.middleware.cors  # noqa: E402
 import fastapi.responses  # noqa: E402
 import pydantic  # noqa: E402
+import vercel.workflow  # noqa: E402
 from vercel.blob import AsyncBlobClient  # noqa: E402
 
-from agent import proto  # noqa: E402
+from agent import driver, proto  # noqa: E402
 from app import attachments, chat, sessions  # noqa: E402
 
 
@@ -120,7 +122,7 @@ async def post_chat(request: ChatRequest) -> fastapi.responses.StreamingResponse
             raise fastapi.HTTPException(
                 status_code=400, detail="No user message to run"
             )
-        start_index = await chat.start_or_resume(request.session_id, prompt)
+        start_index = await chat.submit_prompt(request.session_id, prompt)
 
     return fastapi.responses.StreamingResponse(
         chat.to_sse(request.session_id, start_index),
@@ -145,7 +147,6 @@ async def resume_chat(session_id: str) -> fastapi.responses.Response:
 
 
 class CreateSessionRequest(pydantic.BaseModel):
-    id: str
     title: str | None = None
 
 
@@ -156,7 +157,23 @@ async def list_sessions() -> list[sessions.SessionMeta]:
 
 @app.post("/api/sessions", status_code=201)
 async def create_session(body: CreateSessionRequest) -> sessions.SessionMeta:
-    return await sessions.create_session(body.id, title=body.title)
+    # a session IS a run: start the (born-parked) session workflow and hand
+    # its run id back as the session id. Do not return until the initial hook
+    # exists: workflow.start only queues the worker, and an immediate first
+    # message must not race hook registration.
+    run = await vercel.workflow.start(driver.run_session)
+    hook_token = f"seal-session:{run.run_id}:0"
+    while True:
+        try:
+            await vercel.workflow.get_hook_by_token(hook_token)
+            break
+        except vercel.workflow.HookNotFoundError:
+            if await run.status() in ("completed", "failed", "cancelled"):
+                raise fastapi.HTTPException(
+                    status_code=503, detail="Session workflow failed to initialize"
+                ) from None
+            await asyncio.sleep(0.05)
+    return await sessions.create_session(run.run_id, title=body.title)
 
 
 @app.get("/api/sessions/{session_id}")

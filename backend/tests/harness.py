@@ -117,12 +117,14 @@ class InProcessWorld(wf_local.LocalWorld):
 
 
 async def start_session(
-    session_id: str, prompt: str
+    prompt: str,
 ) -> vercel.workflow.Run[proto.SessionOutput]:
-    return await vercel.workflow.start(
-        driver.run_session,
-        proto.SessionInput(session_id=session_id, prompt=prompt),
+    """Start a born-parked session and deliver its first user message."""
+    run = await vercel.workflow.start(driver.run_session)
+    await resume_session(
+        f"seal-session:{run.run_id}:0", proto.NewUserMessage(prompt=prompt)
     )
+    return run
 
 
 async def wait_for_lifecycle(

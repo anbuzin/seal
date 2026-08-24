@@ -253,9 +253,10 @@ async def test_turn_with_telemetry_suspends_then_closes(
 ) -> None:
     scripted_model.responses = [[text_msg("hello there")]]
 
-    run = await start_session("s1", "hi")
-    await wait_for_lifecycle("s1", proto.SESSION_WAITING)
-    await resume_session("seal-session:s1:0", proto.NewUserMessage(close=True))
+    run = await start_session("hi")
+    sid = run.run_id
+    await wait_for_lifecycle(sid, proto.SESSION_WAITING)
+    await resume_session(f"seal-session:{sid}:1", proto.NewUserMessage(close=True))
     output = await wait_run(run)
     assert not output.is_error
 
@@ -273,7 +274,7 @@ async def test_turn_with_telemetry_suspends_then_closes(
     assert agent_run.parent is not None
     assert agent_run.parent.span_id == turn.context.span_id
     assert turn.attributes is not None
-    assert turn.attributes["session.id"] == "s1"
+    assert turn.attributes["session.id"] == sid
     assert turn.attributes["openinference.span.kind"] == "AGENT"
     assert "input.value" not in turn.attributes
     assert "output.value" not in turn.attributes
@@ -296,16 +297,17 @@ async def test_gated_tool_approval_with_telemetry(
         [text_msg("done")],
     ]
 
-    await start_session("s1", "run it")
+    run = await start_session("run it")
+    sid = run.run_id
     # the approval request must still reach the stream with telemetry on.
-    await wait_for_lifecycle("s1", proto.TOOL_APPROVAL_REQUESTED)
+    await wait_for_lifecycle(sid, proto.TOOL_APPROVAL_REQUESTED)
 
     await resume_approval(
-        "s1", proto.ToolApprovalResponse(tool_call_id="tc-1", granted=True)
+        sid, proto.ToolApprovalResponse(tool_call_id="tc-1", granted=True)
     )
-    await wait_for_lifecycle("s1", proto.SESSION_WAITING)
+    await wait_for_lifecycle(sid, proto.SESSION_WAITING)
 
-    state = await session.read_session("s1")
+    state = await session.read_session(sid)
     assert state is not None
     [tool_message] = [m for m in state.messages if m.role == "tool"]
     [result] = tool_message.tool_results

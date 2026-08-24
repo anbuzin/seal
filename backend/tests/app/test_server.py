@@ -14,9 +14,14 @@ an approval response).
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import ai.ui.ai_sdk as ai_sdk
+import pytest
+import vercel.workflow
+
+from app import server
 
 
 def _ui(role: str, *parts: dict[str, Any], id: str = "m1") -> ai_sdk.UIMessage:
@@ -59,3 +64,38 @@ def test_trailing_user_message_starts_a_new_turn_even_with_past_approvals() -> N
     )
     assert messages[-1].role == "user"
     assert messages[-1].text == "now do more"
+
+
+async def test_create_session_waits_for_initial_hook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Run:
+        run_id = "session-1"
+
+        async def status(self) -> str:
+            return "pending"
+
+    async def start(*args: object, **kwargs: object) -> Run:
+        return Run()
+
+    attempts = 0
+
+    async def get_hook_by_token(token: str) -> object:
+        nonlocal attempts
+        assert token == "seal-session:session-1:0"
+        attempts += 1
+        if attempts <= 40:
+            raise vercel.workflow.HookNotFoundError
+        return object()
+
+    async def sleep(delay: float) -> None:
+        assert delay == 0.05
+
+    monkeypatch.setattr(vercel.workflow, "start", start)
+    monkeypatch.setattr(vercel.workflow, "get_hook_by_token", get_hook_by_token)
+    monkeypatch.setattr(asyncio, "sleep", sleep)
+
+    created = await server.create_session(server.CreateSessionRequest())
+
+    assert created.id == "session-1"
+    assert attempts == 41

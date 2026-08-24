@@ -26,11 +26,12 @@ export async function fetchSessions(): Promise<Session[]> {
   return res.json()
 }
 
-export async function createSessionOnServer(id: string): Promise<Session> {
+/** Create a session; the server mints the id (it is the workflow run id). */
+export async function createSessionOnServer(): Promise<Session> {
   const res = await fetch("/api/sessions", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ id }),
+    body: JSON.stringify({}),
   })
   if (!res.ok) throw new Error("Failed to create session")
   return res.json()

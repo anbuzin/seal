@@ -49,6 +49,11 @@ async def test_no_stream_means_nothing_to_resume() -> None:
     assert await chat.active_run_start_index("s1") is None
 
 
+async def test_born_parked_session_is_not_resumable() -> None:
+    await _write("s1", stream.session_started())
+    assert await chat.active_run_start_index("s1") is None
+
+
 async def test_completed_run_is_not_resumable() -> None:
     await _write(
         "s1",
@@ -80,8 +85,8 @@ async def test_multi_turn_run_resumes_from_run_start_not_inner_turn() -> None:
     # from the inner turn.started would replay a partial message and duplicate.
     await _write(
         "s1",
-        stream.session_started(),  # 0 ← run opens here
-        stream.turn_started(turn_index=0),  # 1
+        stream.session_started(),  # 0
+        stream.turn_started(turn_index=0),  # 1 ← run opens here
         *_text_events("delegating"),  # 2-6
         stream.turn_completed(turn_index=0, kind="suspend"),  # 7
         stream.subagent_called(
@@ -91,7 +96,7 @@ async def test_multi_turn_run_resumes_from_run_start_not_inner_turn() -> None:
         stream.turn_started(turn_index=1),  # 10 (inner turn, same run)
         events_.StreamStart(),  # 11
     )
-    assert await chat.active_run_start_index("s1") == 0
+    assert await chat.active_run_start_index("s1") == 1
 
 
 async def test_run_parked_on_approval_is_resumable_from_run_start() -> None:
@@ -104,7 +109,7 @@ async def test_run_parked_on_approval_is_resumable_from_run_start() -> None:
         *_text_events("need approval"),
         stream.tool_approval_requested(turn_index=0),
     )
-    assert await chat.active_run_start_index("s1") == 0
+    assert await chat.active_run_start_index("s1") == 1
 
 
 # --- _waiting_turn_index ----------------------------------------------------------
