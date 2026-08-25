@@ -5,6 +5,7 @@ import contextlib
 import ai
 import vercel.workflow
 
+import agent.control as control
 import agent.proto as proto
 import agent.session as session
 import agent.stream as stream
@@ -38,12 +39,17 @@ async def save_session(state: proto.SessionState) -> None:
 
 
 @workflow.step
-async def forward_tool_approval(
+async def next_stream_index(session_id: str) -> int:
+    return await stream.tail_index(session_id) + 1
+
+
+@workflow.step
+async def forward_turn_command(
     session_id: str,
     turn_index: int,
-    response: proto.ToolApprovalResponse,
+    command: proto.TurnCommand,
 ) -> None:
-    hook = proto.TurnInboxHook(command=proto.TurnApproval(response=response))
+    hook = proto.TurnInboxHook(command=command)
     token = proto.turn_inbox_token(session_id, turn_index)
     for attempt in range(40):
         try:
@@ -53,6 +59,20 @@ async def forward_tool_approval(
             if attempt == 39:
                 raise
             await asyncio.sleep(0.05)
+
+
+@workflow.step
+async def forward_interrupt(session_id: str, turn_index: int) -> None:
+    await control.interrupt(session_id, turn_index)
+    hook = proto.TurnInboxHook(command=proto.InterruptTurn())
+    token = proto.turn_inbox_token(session_id, turn_index)
+    for attempt in range(40):
+        try:
+            await hook.resume(token)
+            return
+        except vercel.workflow.HookNotFoundError:
+            if attempt < 39:
+                await asyncio.sleep(0.05)
 
 
 def _last_text(messages: list[ai.messages.Message]) -> str:
@@ -119,6 +139,7 @@ async def run_session(session_input: proto.SessionInput) -> proto.SessionOutput:
     }
     pending_user_messages: list[tuple[str, bool]] = []
     pending_background_updates: list[str] = []
+    interrupting = False
 
     async for received in _buffer_inbox(inbox):
         command = received.command
@@ -142,14 +163,38 @@ async def run_session(session_input: proto.SessionInput) -> proto.SessionOutput:
             case proto.SubmitToolApproval():
                 if active_turn_index is None:
                     continue
-                await forward_tool_approval(
+                await forward_turn_command(
                     session_id,
                     active_turn_index,
-                    command.response,
+                    proto.TurnApproval(response=command.response),
                 )
 
+            case proto.InterruptSession():
+                if interrupting:
+                    continue
+                interrupting = True
+                pending_user_messages.clear()
+                pending_background_updates.clear()
+                targets = [
+                    (child_session_id, 0)
+                    for _, child_session_id in background_tasks.values()
+                ]
+                if active_turn_index is not None:
+                    targets.append((session_id, active_turn_index))
+                await asyncio.gather(
+                    *(
+                        forward_interrupt(target_session_id, target_turn_index)
+                        for target_session_id, target_turn_index in targets
+                    )
+                )
+                if not targets:
+                    interrupting = False
+                    state.active_ui_run_message_index = None
+                    await save_session(state)
+                    await turn.write_event(session_id, stream.session_interrupted())
+
             case proto.StartBackgroundTask():
-                if command.task_id in background_tasks:
+                if interrupting or command.task_id in background_tasks:
                     continue
                 child_session_id = f"{session_id}:child:{command.task_id}"
                 background_tasks[command.task_id] = (command.name, child_session_id)
@@ -167,6 +212,7 @@ async def run_session(session_input: proto.SessionInput) -> proto.SessionOutput:
                         name=command.name,
                     ),
                 )
+                child_stream_start_index = await next_stream_index(child_session_id)
                 await spawn_turn_workflow(
                     proto.TurnInput(
                         session_id=child_session_id,
@@ -177,6 +223,7 @@ async def run_session(session_input: proto.SessionInput) -> proto.SessionOutput:
                         gated=False,
                         parent_session_id=session_id,
                         background_task_id=command.task_id,
+                        stream_start_index=child_stream_start_index,
                     ),
                     command.parent_span,
                 )
@@ -187,6 +234,7 @@ async def run_session(session_input: proto.SessionInput) -> proto.SessionOutput:
                     continue
                 name, child_session_id = task
                 is_error = command.output.kind == "error"
+                is_interrupted = command.output.kind == "interrupted"
                 error = command.output.error if is_error else None
                 child_messages = [
                     message
@@ -197,7 +245,13 @@ async def run_session(session_input: proto.SessionInput) -> proto.SessionOutput:
                     task_id=command.task_id,
                     child_session_id=child_session_id,
                     name=name,
-                    status="failed" if is_error else "completed",
+                    status=(
+                        "interrupted"
+                        if is_interrupted
+                        else "failed"
+                        if is_error
+                        else "completed"
+                    ),
                     messages=child_messages,
                     error=error,
                 )
@@ -211,21 +265,22 @@ async def run_session(session_input: proto.SessionInput) -> proto.SessionOutput:
                             message.model_dump(mode="json")
                             for message in child_messages
                         ],
-                        error=error,
+                        error="Interrupted by user" if is_interrupted else error,
                     ),
                 )
                 await turn.close_stream(child_session_id)
-                if is_error:
-                    report = error or "Unknown subagent error"
-                    pending_background_updates.append(
-                        f'Background subagent "{name}" failed:\n\n{report}'
-                    )
-                else:
-                    pending_background_updates.append(
-                        f'Background subagent "{name}" finished:\n\n'
-                        f"{_last_text(command.output.messages)}"
-                    )
-                if not background_tasks:
+                if not is_interrupted:
+                    if is_error:
+                        report = error or "Unknown subagent error"
+                        pending_background_updates.append(
+                            f'Background subagent "{name}" failed:\n\n{report}'
+                        )
+                    else:
+                        pending_background_updates.append(
+                            f'Background subagent "{name}" finished:\n\n'
+                            f"{_last_text(command.output.messages)}"
+                        )
+                if not background_tasks and not interrupting:
                     pending_user_messages.extend(
                         (update, True) for update in pending_background_updates
                     )
@@ -259,6 +314,14 @@ async def run_session(session_input: proto.SessionInput) -> proto.SessionOutput:
                         is_error=True,
                     )
 
+        if interrupting and active_turn_index is None and not background_tasks:
+            interrupting = False
+            pending_background_updates.clear()
+            state.active_ui_run_message_index = None
+            await save_session(state)
+            await turn.write_event(session_id, stream.session_interrupted())
+            continue
+
         if active_turn_index is None and pending_user_messages:
             queued_messages = pending_user_messages.copy()
             pending_user_messages.clear()
@@ -286,11 +349,13 @@ async def run_session(session_input: proto.SessionInput) -> proto.SessionOutput:
                     background=all(background for _, background in queued_messages),
                 ),
             )
+            turn_stream_start_index = await next_stream_index(session_id)
             await spawn_turn_workflow(
                 proto.TurnInput(
                     session_id=session_id,
                     messages=state.messages,
                     turn_index=active_turn_index,
+                    stream_start_index=turn_stream_start_index,
                 )
             )
         elif completed_turn_index is not None:

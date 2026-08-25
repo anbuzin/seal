@@ -1,6 +1,9 @@
 import asyncio
 import contextvars
 import dataclasses
+import json
+import os
+import signal
 import traceback
 from collections.abc import AsyncGenerator, Sequence
 from typing import Any, ClassVar
@@ -9,7 +12,7 @@ import ai
 import pydantic
 import vercel.workflow
 
-from agent import proto, stream, util, workflow
+from agent import control, proto, stream, util, workflow
 
 MODEL_ID = "gateway:anthropic/claude-sonnet-4.6"
 IMAGE_MODEL_ID = "gateway:google/gemini-3.1-flash-image"
@@ -58,12 +61,14 @@ class EagerToolHook(pydantic.BaseModel, vercel.workflow.BaseHook):
     payload: ai.messages.ToolCallPart
 
 
-@workflow.step
+@control.cancellable_step
 async def llm_step(
     model_id: str,
     messages: list[ai.messages.Message],
     tools: list[ai.Tool],
-    session_id: str | None,
+    *,
+    session_id: str,
+    turn_index: int,
     tool_token: str | None = None,
     turn_span: ai.experimental_telemetry.Span | None = None,
     parent_session_id: str | None = None,
@@ -71,7 +76,7 @@ async def llm_step(
 ) -> ai.messages.Message:
     model = ai.get_model(model_id)
 
-    writer = await stream.get_writable(session_id) if session_id else None
+    writer = await stream.get_writable(session_id)
     parent_writer = (
         await stream.get_writable(parent_session_id) if parent_session_id else None
     )
@@ -132,7 +137,7 @@ async def close_stream(session_id: str) -> None:
 
 
 @ai.tool(require_approval=True)
-@workflow.step(max_retries=0)
+@control.cancellable_step
 async def bash(command: str, timeout: int | None = None) -> str:
     proc = await asyncio.create_subprocess_exec(
         "bash",
@@ -140,13 +145,27 @@ async def bash(command: str, timeout: int | None = None) -> str:
         command,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
+        start_new_session=True,
     )
     try:
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except TimeoutError:
-        proc.kill()
-        await proc.communicate()
+        os.killpg(proc.pid, signal.SIGTERM)
+        try:
+            await asyncio.wait_for(proc.communicate(), timeout=0.5)
+        except TimeoutError:
+            os.killpg(proc.pid, signal.SIGKILL)
+            await proc.communicate()
         return f"Command timed out after {timeout}s."
+    except asyncio.CancelledError:
+        if proc.returncode is None:
+            os.killpg(proc.pid, signal.SIGTERM)
+            try:
+                await asyncio.wait_for(proc.communicate(), timeout=0.5)
+            except TimeoutError:
+                os.killpg(proc.pid, signal.SIGKILL)
+                await proc.communicate()
+        raise
 
     output = stdout.decode() if stdout else ""
     if proc.returncode != 0:
@@ -162,7 +181,7 @@ bash_ungated = dataclasses.replace(
 
 
 @ai.tool
-@workflow.step
+@control.cancellable_step
 async def web_fetch(
     url: str,
     method: str = "GET",
@@ -195,7 +214,7 @@ async def web_fetch(
 
 
 @ai.tool
-@workflow.step
+@control.cancellable_step
 async def generate_image(prompt: str) -> ai.messages.ContentOutput:
     """Generate an image from a text prompt. Describe the desired image in detail."""
     model = ai.get_model(IMAGE_MODEL_ID)
@@ -296,7 +315,7 @@ class DurableAgent(ai.Agent):
         def launch_tool(tool_call: ai.messages.ToolCallPart) -> None:
             # Launch a tool in a task under the right context, track
             # it in the live call table.
-            token = tool_call_context.set(
+            call_token = tool_call_context.set(
                 proto.ToolCallContext(
                     session_id=session_id or "",
                     turn_index=self.turn_index,
@@ -304,10 +323,14 @@ class DurableAgent(ai.Agent):
                     turn_span=self.turn_span,
                 )
             )
+            cancellation_token = control.cancellation_context.set(
+                (session_id or "", self.turn_index)
+            )
             live_tool_calls[tool_call.tool_call_id] = self.tg.create_task(
                 context.resolve(tool_call)()
             )
-            tool_call_context.reset(token)
+            control.cancellation_context.reset(cancellation_token)
+            tool_call_context.reset(call_token)
 
         eager_tool_hook = EagerToolHook.wait(token=tool_token)
 
@@ -327,15 +350,17 @@ class DurableAgent(ai.Agent):
         while context.keep_running():
             live_tool_calls.clear()
 
+            assert session_id is not None
             assistant_message = await llm_step(
                 model_id,
                 context.messages,
                 context.tools,
-                session_id,
-                tool_token,
-                self.turn_span,
-                self.parent_session_id,
-                self.background_task_id,
+                session_id=session_id,
+                turn_index=self.turn_index,
+                tool_token=tool_token,
+                turn_span=self.turn_span,
+                parent_session_id=self.parent_session_id,
+                background_task_id=self.background_task_id,
             )
             context.add(assistant_message)
             # llm_step streamed this turn out-of-band (straight to the durable
@@ -447,6 +472,64 @@ async def notify_background_task_finished(
 
 
 @workflow.step
+async def partial_messages(
+    session_id: str,
+    start_index: int,
+    input_messages: list[ai.messages.Message],
+) -> list[ai.messages.Message]:
+    messages = input_messages
+    index_by_id = {message.id: index for index, message in enumerate(messages)}
+    async for event in stream.replay(session_id, start_index=start_index):
+        if isinstance(event, proto.LifecycleEvent):
+            continue
+        message = getattr(event, "message", None)
+        if not isinstance(message, ai.messages.Message) or message.role == "internal":
+            continue
+        existing = index_by_id.get(message.id)
+        if existing is None:
+            index_by_id[message.id] = len(messages)
+            messages.append(message)
+        else:
+            messages[existing] = message
+
+    answered = {
+        result.tool_call_id
+        for message in messages
+        if message.role == "tool"
+        for result in message.tool_results
+    }
+    pending: list[ai.messages.ToolCallPart] = []
+    normalized: list[ai.messages.Message] = []
+    for message in messages:
+        parts: list[ai.messages.Part] = []
+        for part in message.parts:
+            if isinstance(part, ai.messages.ToolCallPart):
+                try:
+                    json.loads(part.tool_args)
+                except (json.JSONDecodeError, TypeError):
+                    part = part.model_copy(update={"tool_args": "{}"})
+                if part.tool_call_id not in answered:
+                    pending.append(part)
+            parts.append(part)
+        normalized.append(message.model_copy(update={"parts": parts}))
+    if pending:
+        normalized.append(
+            ai.tool_message(
+                *(
+                    ai.tool_result_part(
+                        part.tool_call_id,
+                        tool_name=part.tool_name,
+                        result="Interrupted by user",
+                        is_error=True,
+                    )
+                    for part in pending
+                )
+            )
+        )
+    return normalized
+
+
+@workflow.step
 async def notify_agent_finished(token: str, output: proto.TurnOutput) -> None:
     hook = proto.TurnInboxHook(command=proto.AgentFinished(output=output))
     for attempt in range(40):
@@ -532,6 +615,16 @@ async def run_turn(turn_input: proto.TurnInput) -> None:
                                     ),
                                 )
                         result = proto.TurnOutput(kind="suspend", messages=run.messages)
+                except control.StepInterrupted:
+                    messages_data = await partial_messages(
+                        session_id,
+                        turn_input.stream_start_index,
+                        turn_input.messages,
+                    )
+                    result = proto.TurnOutput(
+                        kind="interrupted",
+                        messages=messages_data,
+                    )
                 except Exception as error:
                     result = proto.TurnOutput(
                         kind="error",
@@ -568,6 +661,28 @@ async def run_turn(turn_input: proto.TurnInput) -> None:
                             },
                             registry=hook_registry,
                         )
+                    case proto.InterruptTurn():
+                        # Tool tasks are siblings of the agent driver in this task
+                        # group. Cancelling only agent_task can therefore leave an
+                        # approval/tool sibling alive and make TaskGroup.__aexit__
+                        # wait forever. The durable control signal was written
+                        # before this command, so active steps also stop themselves.
+                        running = [task for task in tg._tasks if not task.done()]
+                        for task in running:
+                            task.cancel()
+                        if running:
+                            await asyncio.gather(*running, return_exceptions=True)
+                        messages_data = await partial_messages(
+                            session_id,
+                            turn_input.stream_start_index,
+                            turn_input.messages,
+                        )
+                        output = proto.TurnOutput(
+                            kind="interrupted",
+                            messages=messages_data,
+                        )
+                        inbox_task.cancel()
+                        break
                     case proto.AgentFinished(output=result):
                         output = result
                         inbox_task.cancel()

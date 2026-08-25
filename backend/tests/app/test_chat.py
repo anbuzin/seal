@@ -18,7 +18,7 @@ import ai
 import ai.types.events as events_
 import ai.types.messages as messages_
 
-from agent import proto, stream
+from agent import proto, session, stream
 from app import chat
 
 
@@ -90,6 +90,36 @@ async def test_background_followup_resumes_from_the_logical_run_opener() -> None
     assert await chat.active_run_start_index("s1") == 1
 
 
+async def test_interrupt_waits_for_durable_acknowledgement(monkeypatch: Any) -> None:
+    await session.write_session(
+        proto.SessionState(session_id="s1", messages=[ai.user_message("hi")])
+    )
+    resumed = asyncio.Event()
+
+    async def resume(_token: str, _hook: Any) -> None:
+        resumed.set()
+
+    monkeypatch.setattr(chat, "_resume", resume)
+    task = asyncio.create_task(chat.interrupt("s1"))
+    await resumed.wait()
+    await asyncio.sleep(0)
+    assert not task.done()
+
+    await _write("s1", stream.session_interrupted())
+    await asyncio.wait_for(task, timeout=1)
+
+
+async def test_interrupted_run_is_not_resumable() -> None:
+    await _write(
+        "s1",
+        stream.session_started(),
+        stream.turn_started(turn_index=0),
+        *_text_events("partial"),
+        stream.session_interrupted(),
+    )
+    assert await chat.active_run_start_index("s1") is None
+
+
 async def test_run_parked_on_approval_is_resumable_from_run_start() -> None:
     # a turn parked on an approval is mid-run, so a cold reload re-tails from the
     # opener to rebuild the same UI message (the live POST resume folds instead).
@@ -146,6 +176,24 @@ async def test_to_sse_streams_background_followup_in_one_ui_run() -> None:
     ]
     assert [delta["delta"] for delta in deltas] == ["hello world", "next turn"]
     assert lines[-1].startswith("data:")
+    assert "[DONE]" in lines[-1]
+
+
+async def test_to_sse_ends_on_interruption() -> None:
+    await _write(
+        "s1",
+        stream.session_started(),
+        stream.turn_started(turn_index=0),
+        *_text_events("partial"),
+        stream.session_interrupted(),
+    )
+    lines = await _collect_sse("s1")
+    deltas = [
+        payload
+        for payload in _sse_payloads(lines)
+        if payload.get("type") == "text-delta"
+    ]
+    assert [delta["delta"] for delta in deltas] == ["partial"]
     assert "[DONE]" in lines[-1]
 
 
@@ -270,6 +318,39 @@ async def test_to_sse_replays_reload_marker() -> None:
     deltas = [p for p in payloads if p.get("type") == "text-delta"]
     assert [delta["delta"] for delta in deltas] == ["done"]
     assert "[DONE]" in lines[-1]
+
+
+def test_project_interrupted_background_task_keeps_partial_output() -> None:
+    ui_messages: list[dict[str, Any]] = [
+        {
+            "id": "a1",
+            "role": "assistant",
+            "parts": [
+                {
+                    "type": "tool-subagent",
+                    "toolCallId": "tc-1",
+                    "state": "output-available",
+                    "output": "started",
+                }
+            ],
+        }
+    ]
+    task = proto.BackgroundTaskState(
+        task_id="tc-1",
+        child_session_id="s1:child:tc-1",
+        name="helper",
+        status="interrupted",
+        messages=[ai.assistant_message("partial child answer")],
+    )
+
+    projected = chat.project_background_tasks(ui_messages, {"tc-1": task})
+    parts = projected[0]["parts"]
+    assert isinstance(parts, list)
+    part = cast(dict[str, Any], parts[0])
+    output = cast(list[dict[str, Any]], part["output"])
+    output_parts = cast(list[dict[str, Any]], output[0]["parts"])
+    assert output_parts[0]["text"] == "partial child answer"
+    assert part["preliminary"] is False
 
 
 def test_project_background_task_updates_original_tool_part() -> None:

@@ -49,11 +49,15 @@ class SubmitToolApproval(pydantic.BaseModel):
     response: ToolApprovalResponse
 
 
+class InterruptSession(pydantic.BaseModel):
+    kind: Literal["interrupt_session"] = "interrupt_session"
+
+
 class BackgroundTaskState(pydantic.BaseModel):
     task_id: str
     child_session_id: str
     name: str
-    status: Literal["running", "completed", "failed"] = "running"
+    status: Literal["running", "completed", "failed", "interrupted"] = "running"
     messages: list[ai.messages.Message] = pydantic.Field(default_factory=list)
     error: str | None = None
 
@@ -85,6 +89,8 @@ class TurnInput(pydantic.BaseModel):
     background_task_id: str | None = None
     # index of this turn within its session (always 0 for subagent turns).
     turn_index: int = 0
+    # first default-stream event owned by this turn, for interrupted reconstruction.
+    stream_start_index: int = 0
     # turn's root span. llm_steps and child turns nest under it.
     turn_span: ai.experimental_telemetry.Span | None = None
 
@@ -100,7 +106,7 @@ class ToolCallContext(pydantic.BaseModel):
 
 
 class TurnOutput(pydantic.BaseModel):
-    kind: Literal["suspend", "error"]
+    kind: Literal["suspend", "error", "interrupted"]
     messages: list[ai.messages.Message]
     error: str | None = None
 
@@ -110,12 +116,16 @@ class TurnApproval(pydantic.BaseModel):
     response: ToolApprovalResponse
 
 
+class InterruptTurn(pydantic.BaseModel):
+    kind: Literal["interrupt_turn"] = "interrupt_turn"
+
+
 class AgentFinished(pydantic.BaseModel):
     kind: Literal["agent_finished"] = "agent_finished"
     output: TurnOutput
 
 
-type TurnCommand = TurnApproval | AgentFinished
+type TurnCommand = TurnApproval | InterruptTurn | AgentFinished
 
 
 # all work entering one active turn is delivered through its private inbox.
@@ -149,6 +159,7 @@ class BackgroundTaskFinished(pydantic.BaseModel):
 type SessionCommand = (
     NewUserMessage
     | SubmitToolApproval
+    | InterruptSession
     | TurnFinished
     | StartBackgroundTask
     | BackgroundTaskFinished
@@ -166,6 +177,7 @@ SESSION_STARTED = "session.started"
 SESSION_WAITING = "session.waiting"
 SESSION_COMPLETED = "session.completed"
 SESSION_FAILED = "session.failed"
+SESSION_INTERRUPTED = "session.interrupted"
 TURN_STARTED = "turn.started"
 TURN_COMPLETED = "turn.completed"
 SUBAGENT_CALLED = "subagent.called"

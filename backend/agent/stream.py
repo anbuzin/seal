@@ -31,6 +31,10 @@ def session_waiting(
     )
 
 
+def session_interrupted() -> proto.LifecycleEvent:
+    return proto.LifecycleEvent(type=proto.SESSION_INTERRUPTED)
+
+
 def session_completed(*, is_error: bool = False) -> proto.LifecycleEvent:
     return proto.LifecycleEvent(
         type=proto.SESSION_COMPLETED, data={"is_error": is_error}
