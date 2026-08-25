@@ -5,6 +5,8 @@ import collections.abc
 import contextlib
 import contextvars
 import functools
+import inspect
+import typing
 from typing import Any
 
 import pydantic
@@ -51,15 +53,24 @@ async def wait_for_interrupt(session_id: str, turn_index: int) -> None:
         await asyncio.sleep(CONTROL_POLL_INTERVAL)
 
 
-def cancellable_step(
-    func: collections.abc.Callable[..., collections.abc.Coroutine[Any, Any, Any]],
-) -> collections.abc.Callable[..., collections.abc.Coroutine[Any, Any, Any]]:
+def cancellable_step[T](
+    func: collections.abc.Callable[..., collections.abc.Coroutine[Any, Any, T]],
+) -> collections.abc.Callable[..., collections.abc.Coroutine[Any, Any, T]]:
+    signature = inspect.signature(func)
+    hints = typing.get_type_hints(func, include_extras=True)
+    return_type = hints.get("return", Any)
+    result_type = pydantic.create_model(
+        f"_{getattr(func, '__name__', 'cancellable_step')}_cancellable_result",
+        interrupted=(bool, ...),
+        value=(return_type | None, None),
+    )
+
     async def run_step(
         *args: Any,
         _cancel_session_id: str,
         _cancel_turn_index: int,
         **kwargs: Any,
-    ) -> dict[str, Any]:
+    ) -> Any:
         body = asyncio.create_task(func(*args, **kwargs))
         watcher = asyncio.create_task(
             wait_for_interrupt(_cancel_session_id, _cancel_turn_index)
@@ -72,23 +83,55 @@ def cancellable_step(
                 body.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await body
-                return {"interrupted": True, "value": None}
+                return result_type(interrupted=True)
 
             watcher.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await watcher
-            return {"interrupted": False, "value": await body}
+            return result_type(interrupted=False, value=await body)
         finally:
             for task in (body, watcher):
                 if not task.done():
                     task.cancel()
 
-    # Workflow argument binding must see the private cancellation arguments.
-    # Copy only the registration identity; functools.wraps would hide them.
+    # Preserve the wrapped function's typed workflow boundary while adding the
+    # private cancellation arguments required by the durable wrapper.
+    parameters = [
+        parameter.replace(annotation=hints.get(name, parameter.annotation))
+        for name, parameter in signature.parameters.items()
+    ]
+    parameters.extend(
+        [
+            inspect.Parameter(
+                "_cancel_session_id",
+                inspect.Parameter.KEYWORD_ONLY,
+                annotation=str,
+            ),
+            inspect.Parameter(
+                "_cancel_turn_index",
+                inspect.Parameter.KEYWORD_ONLY,
+                annotation=int,
+            ),
+        ]
+    )
+    typed_signature = signature.replace(
+        parameters=parameters,
+        return_annotation=result_type,
+    )
+    run_step.__annotations__ = {
+        **hints,
+        "_cancel_session_id": str,
+        "_cancel_turn_index": int,
+        "return": result_type,
+    }
     run_step.__module__ = func.__module__
     run_step.__name__ = getattr(func, "__name__", "cancellable_step")
     run_step.__qualname__ = getattr(func, "__qualname__", run_step.__name__)
     durable_step = workflow.step(max_retries=0)(run_step)
+    durable_step._signature = typed_signature
+    durable_step.codec = type(durable_step.codec)(
+        run_step, typed_signature, run_step.__qualname__
+    )
 
     @functools.wraps(func)
     async def dispatch(*args: Any, **kwargs: Any) -> Any:
@@ -109,9 +152,9 @@ def cancellable_step(
             _cancel_turn_index=turn_index,
             **kwargs,
         )
-        if result["interrupted"]:
+        if result.interrupted:
             raise StepInterrupted
-        return result["value"]
+        return result.value
 
     async def run_locally(*args: Any, **kwargs: Any) -> Any:
         try:
@@ -126,10 +169,13 @@ def cancellable_step(
             _cancel_turn_index=turn_index,
             **kwargs,
         )
-        if result["interrupted"]:
+        if result.interrupted:
             raise StepInterrupted
-        return result["value"]
+        return result.value
 
     # Match workflow Step's useful local testing seam.
     setattr(dispatch, "func", run_locally)  # noqa: B010
-    return dispatch
+    return typing.cast(
+        collections.abc.Callable[..., collections.abc.Coroutine[Any, Any, T]],
+        dispatch,
+    )

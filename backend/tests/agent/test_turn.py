@@ -73,14 +73,11 @@ async def test_partial_messages_closes_interrupted_tool_call() -> None:
     writer = await stream.get_writable("s1")
     await writer.write(events_.StreamEnd(message=assistant))
 
-    messages_data = await turn.partial_messages.func(
+    messages = await turn.partial_messages.func(
         "s1",
         0,
-        [user.model_dump(mode="json")],
+        [user],
     )
-    messages = [
-        ai.messages.Message.model_validate(message) for message in messages_data
-    ]
 
     assert [message.role for message in messages] == ["user", "assistant", "tool"]
     [result] = messages[-1].tool_results
@@ -92,7 +89,7 @@ async def test_partial_messages_closes_interrupted_tool_call() -> None:
 def test_cancellable_steps_stack_with_tools() -> None:
     assert cast(Any, turn.bash.fn).__name__ == "bash"
     assert cast(Any, turn.web_fetch.fn).__name__ == "web_fetch"
-    assert cast(Any, turn.image_step).__name__ == "image_step"
+    assert cast(Any, turn.generate_image.fn).__name__ == "generate_image"
     assert turn.bash.validator is not None
     assert set(turn.bash.validator.model_fields) == {"command", "timeout"}
 
