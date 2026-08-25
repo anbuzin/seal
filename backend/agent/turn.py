@@ -11,7 +11,7 @@ import vercel.workflow
 
 from agent import proto, stream, util, workflow
 
-MODEL_ID = "gateway:anthropic/claude-sonnet-4.6"
+MODEL_ID = "gateway:openai/gpt-5.6-luna"
 IMAGE_MODEL_ID = "gateway:google/gemini-3.1-flash-image"
 SYSTEM_PROMPT = (
     "You are Seal, a coding assistant. Use bash, web_fetch, and subagent to "
