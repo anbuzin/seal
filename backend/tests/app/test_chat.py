@@ -6,7 +6,9 @@ duplicated assistant message in the UI), ``to_sse`` decides when a stream
 terminates (wrong answer = hang or truncated turn), and ``bundle_to_wire``
 is the single source of truth for the nested subagent shape.
 
-All tests run against real jsonl streams and the real ai SDK UI adapter.
+All tests run against real workflow run streams (on the local world) and the
+real ai SDK UI adapter; writes go through the world directly, as the step
+writers do in the app.
 """
 
 from __future__ import annotations
@@ -18,15 +20,52 @@ from typing import Any, cast
 import ai
 import ai.types.events as events_
 import ai.types.messages as messages_
+import vercel.workflow._internal.serialization as wf_serialization
+import vercel.workflow._internal.streams as wf_streams
+import vercel.workflow._internal.world as wf_world
 
 from agent import proto, stream
 from app import chat
 
 
-async def _write(session_id: str, *events: proto.StreamEvent) -> None:
-    writer = await stream.get_writable(session_id)
+async def _run_id(session_id: str) -> str:
+    existing = await stream.session_run_id(session_id)
+    if existing is not None:
+        return existing
+
+    world = wf_world.get_world()
+    created = await world.events_create(
+        None,
+        wf_world.RunCreatedEventData.model_validate(
+            {
+                "deployment_id": "",
+                "workflow_name": "test-chat",
+                "input": wf_serialization.dehydrate([]),
+            }
+        ).into_event(),
+    )
+    assert created.run is not None
+    run_id = created.run.run_id
+    await world.events_create(
+        run_id,
+        wf_world.HookCreatedEventData(
+            token=proto.turn_hook_token(session_id)
+        ).into_event("hook_test_" + session_id.replace(":", "_")),
+    )
+    return run_id
+
+
+async def _write_run(run_id: str, *events: proto.StreamEvent) -> None:
+    world = wf_world.get_world()
+    name = wf_streams.workflow_run_stream_id(run_id)
     for event in events:
-        await writer.write(event)
+        await world.streams_write(
+            run_id, name, wf_streams.encode_value(stream.dump_event(event))
+        )
+
+
+async def _write(session_id: str, *events: proto.StreamEvent) -> None:
+    await _write_run(await _run_id(session_id), *events)
 
 
 def _text_events(text: str, *, block: str = "b") -> list[proto.StreamEvent]:
@@ -82,7 +121,10 @@ async def test_multi_turn_run_resumes_from_run_start_not_inner_turn() -> None:
         stream.turn_started(turn_index=0),  # 1
         *_text_events("delegating"),  # 2-6
         stream.subagent_called(
-            tool_call_id="tc-1", child_session_id="s1:child:tc-1", name="helper"
+            tool_call_id="tc-1",
+            child_session_id="s1:child:tc-1",
+            child_run_id="wrun-test-child-tc-1",
+            name="helper",
         ),  # 7
         stream.subagent_completed(tool_call_id="tc-1", is_error=False),  # 8
         stream.turn_started(turn_index=1),  # 9 (inner turn, same run)
@@ -281,17 +323,18 @@ async def test_to_sse_replays_reload_marker() -> None:
 
 
 async def test_to_sse_interleaves_live_subagent_progress() -> None:
-    child_id = "s1:child:tc-1"
+    child_run_id = "wrun-test-child-tc-1"
     child_message = ai.messages.Message(
         role="assistant", parts=[messages_.TextPart(text="child says hi")]
     )
-    await _write(
-        child_id,
+    await _write_run(
+        child_run_id,
         events_.StreamStart(),
         events_.StreamEnd(message=child_message),
     )
-    child_writer = await stream.get_writable(child_id)
-    await child_writer.close()
+    await wf_world.get_world().streams_close(
+        child_run_id, wf_streams.workflow_run_stream_id(child_run_id)
+    )
 
     parent_call = messages_.ToolCallPart(
         tool_call_id="tc-1", tool_name="subagent", tool_args='{"prompt":"go"}'
@@ -307,7 +350,10 @@ async def test_to_sse_interleaves_live_subagent_progress() -> None:
             message=ai.messages.Message(role="assistant", parts=[parent_call])
         ),
         stream.subagent_called(
-            tool_call_id="tc-1", child_session_id=child_id, name="helper"
+            tool_call_id="tc-1",
+            child_session_id="s1:child:tc-1",
+            child_run_id=child_run_id,
+            name="helper",
         ),
     )
 

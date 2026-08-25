@@ -40,11 +40,12 @@ import pytest
 from conftest import MockProvider, assert_message_invariants, text_msg
 from harness import (
     InProcessWorld,
+    read_state,
     start_session,
     wait_for_lifecycle,
 )
 
-from agent import proto, session
+from agent import proto
 from app import chat, server, sessions
 
 FIXTURES_DIR = pathlib.Path(__file__).resolve().parents[2] / "common_fixtures"
@@ -101,12 +102,12 @@ async def _capture_run(
     session_id: str, prompt: str, park_event: str
 ) -> tuple[list[str], list[dict[str, Any]]]:
     """Start a session, stream it like a POST /chat would, run until parked."""
+    await start_session(session_id, prompt)
 
     async def collect() -> list[str]:
         return [line async for line in chat.to_sse(session_id, 0)]
 
     capture = asyncio.create_task(collect())
-    await start_session(session_id, prompt)
     await wait_for_lifecycle(session_id, park_event)
     sse = await asyncio.wait_for(capture, 10)
 
@@ -208,7 +209,7 @@ async def test_parallel_approvals(
     assert approvals["tc-a"].granted and not approvals["tc-b"].granted
 
     await wait_for_lifecycle("s1", proto.SESSION_WAITING)
-    state = await session.read_session("s1")
+    state = await read_state("s1")
     assert state is not None
     assert_message_invariants(state.messages)
     results = {
@@ -244,7 +245,7 @@ async def test_parallel_subagents(
         "s1", "delegate to two helpers", proto.SESSION_WAITING
     )
 
-    state = await session.read_session("s1")
+    state = await read_state("s1")
     assert state is not None
     assert_message_invariants(state.messages)
 
@@ -287,7 +288,7 @@ async def test_mixed_subagents_and_approvals(
     assert approvals["tc-cmd"].granted
 
     await wait_for_lifecycle("s1", proto.SESSION_WAITING)
-    state = await session.read_session("s1")
+    state = await read_state("s1")
     assert state is not None
     assert_message_invariants(state.messages)
     results = {

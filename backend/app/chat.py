@@ -13,7 +13,7 @@ Two lifecycle features surface to the UI:
     with ``addToolApprovalResponse`` which arrives on the next ``POST /chat`` and
     is forwarded back into the durable hook by :func:`submit_approvals`.
   * subagents — a delegated child agent runs as its own durable workflow writing
-    to its own stream. We tail that child stream concurrently and republish it as
+    to its own run's stream. We tail that child stream concurrently and republish it as
     *preliminary* nested-``UIMessage`` output on the parent's ``subagent`` tool
     call, so the user watches the subagent work live. The driver then stores the
     child's full transcript (a ``MessageBundle``) as the final tool result; both
@@ -33,7 +33,7 @@ import ai.ui.ai_sdk.outbound_stream as outbound_stream
 import ai.ui.ai_sdk.ui_events as ui_events
 import vercel.workflow
 
-from agent import driver, proto, session, stream
+from agent import driver, proto, stream
 
 _TERMINAL = {proto.SESSION_WAITING, proto.SESSION_COMPLETED, proto.SESSION_FAILED}
 
@@ -55,10 +55,13 @@ async def active_run_start_index(session_id: str) -> int | None:
 
     The run is in flight (resumable) when its opener has no terminal after it.
     """
+    run_id = await stream.session_run_id(session_id)
+    if run_id is None:
+        return None
     run_start: int | None = None
     seen_boundary = True
     index = -1
-    async for event in stream.replay(session_id):
+    async for event in stream.replay(run_id):
         index += 1
         if not isinstance(event, proto.LifecycleEvent):
             continue
@@ -77,18 +80,28 @@ async def start_or_resume(session_id: str, prompt: str) -> int:
     Returns the stream index to tail from so only the new turn reaches the
     client.
     """
-    start_index = await stream.tail_index(session_id) + 1
-
-    if await session.read_session(session_id) is None:
+    run_id = await stream.session_run_id(session_id)
+    if run_id is None:
+        # no turn hook: start the session, then wait for the workflow to publish
+        # the hook that identifies its run before the response starts tailing it.
         await vercel.workflow.start(
             driver.run_session,
             proto.SessionInput(session_id=session_id, prompt=prompt),
         )
-    else:
-        await _resume(
-            proto.session_hook_token(session_id),
-            proto.SessionHook(payload=proto.NewUserMessage(prompt=prompt)),
+        for attempt in range(40):
+            if await stream.session_run_id(session_id) is not None:
+                return 0
+            if attempt < 39:
+                await asyncio.sleep(0.05)
+        raise RuntimeError(
+            f"session workflow did not register its turn hook: {session_id}"
         )
+
+    start_index = await stream.tail_index(run_id) + 1
+    await _resume(
+        proto.session_hook_token(session_id),
+        proto.SessionHook(payload=proto.NewUserMessage(prompt=prompt)),
+    )
     return start_index
 
 
@@ -102,7 +115,9 @@ async def submit_approvals(
     resubmit carries the parked assistant message, so the client keeps streaming
     into it and the continuation (tool output + answer) folds in.
     """
-    start_index = await stream.tail_index(session_id) + 1
+    run_id = await stream.session_run_id(session_id)
+    assert run_id is not None  # approvals only park on a started run
+    start_index = await stream.tail_index(run_id) + 1
     for approval in approvals:
         await _resume(
             proto.approval_hook_token(session_id, approval.tool_call_id),
@@ -169,7 +184,9 @@ async def _turn_events(
     forwards the reload marker and continues reading, so the client can discard
     the current step before applying events from the retried step.
     """
-    async for event in stream.get_readable(session_id, start_index=start_index):
+    run_id = await stream.session_run_id(session_id)
+    assert run_id is not None  # both endpoints guarantee the run has started
+    async for event in stream.get_readable(run_id, start_index=start_index):
         if not isinstance(event, proto.LifecycleEvent):
             yield event  # ai.events.AgentEvent
             continue
@@ -232,10 +249,10 @@ async def _pump_subagent(
     ``MessageBundle`` via :func:`bundle_to_wire`.
     """
     tool_call_id = str(event.data.get("tool_call_id"))
-    child_session_id = str(event.data.get("child_session_id"))
+    child_run_id = str(event.data.get("child_run_id"))
 
     child_messages: list[ai.messages.Message] = []
-    async for child_event in stream.get_readable(child_session_id, start_index=0):
+    async for child_event in stream.get_readable(child_run_id, start_index=0):
         if isinstance(child_event, proto.LifecycleEvent):
             continue
         message = getattr(child_event, "message", None)

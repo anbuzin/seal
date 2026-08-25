@@ -1,15 +1,39 @@
+"""Session data on the workflow SDK's run streams.
+
+A session's events live on the default stream of its ``run_session`` workflow
+run (a subagent turn writes to its own run's stream), and its state snapshots
+on the same run's ``session`` namespace stream. Writes happen inside workflow
+steps through ``vercel.workflow`` writers (the owning workflow body gets a
+handle from ``vercel.workflow.get_writable()`` and passes it into its steps);
+this module owns the wire formats and the read side. Everything is keyed by
+run id; a session's long-lived turn hook maps its ``session_id`` to that run.
+"""
+
 from __future__ import annotations
 
-import asyncio
 import collections.abc
+import contextlib
 import datetime
-from typing import Literal
+from typing import Any
 
-import pydantic
+import vercel.workflow
 
-from agent import proto, storage
+from agent import proto
 
-__all__ = ["get_readable", "get_writable"]
+__all__ = [
+    "dump_event",
+    "get_readable",
+    "read_session",
+    "replay",
+    "session_run_id",
+    "tail_index",
+]
+
+# session snapshots append to this namespace stream of the session's run
+# (written by the driver's ``save_session`` step); the tail is the current
+# state. The single-writer-per-session invariant (the driver workflow body)
+# makes tail reads safe.
+SESSION_NAMESPACE = "session"
 
 
 # lifecycle event constructors
@@ -38,13 +62,14 @@ def turn_started(*, turn_index: int) -> proto.LifecycleEvent:
 
 
 def subagent_called(
-    *, tool_call_id: str, child_session_id: str, name: str
+    *, tool_call_id: str, child_session_id: str, child_run_id: str, name: str
 ) -> proto.LifecycleEvent:
     return proto.LifecycleEvent(
         type=proto.SUBAGENT_CALLED,
         data={
             "tool_call_id": tool_call_id,
             "child_session_id": child_session_id,
+            "child_run_id": child_run_id,
             "name": name,
         },
     )
@@ -69,105 +94,72 @@ def reload_requested() -> proto.LifecycleEvent:
     return proto.LifecycleEvent(type=proto.RELOAD_REQUESTED)
 
 
-DEFAULT_STREAM_NAMESPACE = "default"
-DEFAULT_STREAM_POLL_INTERVAL = 0.05
+def dump_event(event: proto.StreamEvent) -> dict[str, Any]:
+    """The JSON dict an event is written to the stream as.
 
-
-class WritableStreamHandle(pydantic.BaseModel):
-    type: Literal["seal.durable_agent.writable_stream"] = (
-        "seal.durable_agent.writable_stream"
-    )
-    stream_id: str
-    namespace: str = DEFAULT_STREAM_NAMESPACE
-
-    async def write(self, event: proto.StreamEvent) -> int:
-        data = event.model_dump(mode="json")
-
-        # stamp the dump, not the caller's event
-        if isinstance(event, proto.LifecycleEvent) and event.at is None:
-            data["at"] = datetime.datetime.now(datetime.UTC).isoformat()
-        return await storage.store().append(self.stream_id, self.namespace, data)
-
-    async def close(self) -> None:
-        await storage.store().close(self.stream_id, self.namespace)
-
-
-async def get_writable(
-    stream_id: str,
-    *,
-    namespace: str = DEFAULT_STREAM_NAMESPACE,
-) -> WritableStreamHandle:
-    """Return the writable handle for ``stream_id``."""
-    await storage.ensure_ready()
-    return WritableStreamHandle(
-        stream_id=stream_id,
-        namespace=namespace,
-    )
+    Events go on the wire as plain JSON dicts (validated back through
+    ``proto.STREAM_EVENT_ADAPTER`` on read) rather than model instances, so
+    the workflow serializer needs no registration for the ai event types.
+    """
+    data = event.model_dump(mode="json")
+    # stamp the dump, not the caller's event
+    if isinstance(event, proto.LifecycleEvent) and event.at is None:
+        data["at"] = datetime.datetime.now(datetime.UTC).isoformat()
+    return data
 
 
 async def get_readable(
-    stream_id: str,
-    *,
-    namespace: str = DEFAULT_STREAM_NAMESPACE,
-    start_index: int = 0,
-    poll_interval: float = DEFAULT_STREAM_POLL_INTERVAL,
+    run_id: str, *, start_index: int = 0
 ) -> collections.abc.AsyncIterator[proto.StreamEvent]:
-    """Yield stream events from ``start_index`` until the stream is closed."""
-    if poll_interval < 0:
-        raise ValueError("poll_interval must be non-negative")
-
-    await storage.ensure_ready()
-    backend = storage.store()
-
-    next_index = start_index
-    if next_index < 0:
-        tail_index, _ = await backend.info(stream_id, namespace)
-        next_index = max(0, tail_index + 1 + next_index)
-
-    while True:
-        records = await backend.read(stream_id, namespace, next_index)
-        for index, data in records:
-            next_index = index + 1
+    """Tail a run's event stream from ``start_index`` until it is closed."""
+    source = vercel.workflow.Run(run_id).readable(start_index=start_index)
+    async with contextlib.aclosing(source):
+        async for data in source:
             yield proto.STREAM_EVENT_ADAPTER.validate_python(data)
 
-        if records:
-            continue
 
-        _, closed = await backend.info(stream_id, namespace)
-        if closed:
-            # drain anything written between the read and the close check.
-            for index, data in await backend.read(stream_id, namespace, next_index):
-                next_index = index + 1
-                yield proto.STREAM_EVENT_ADAPTER.validate_python(data)
-            return
-
-        await asyncio.sleep(poll_interval)
+async def session_run_id(session_id: str) -> str | None:
+    """Return the session workflow run advertised by its long-lived turn hook."""
+    try:
+        hook = await vercel.workflow.get_hook_by_token(
+            proto.turn_hook_token(session_id)
+        )
+    except vercel.workflow.HookNotFoundError:
+        return None
+    return hook.run_id
 
 
-async def tail_index(
-    stream_id: str,
-    *,
-    namespace: str = DEFAULT_STREAM_NAMESPACE,
-) -> int:
+async def read_session(run_id: str) -> proto.SessionState | None:
+    """Return the latest snapshot for the session run, or ``None`` if absent."""
+    run: vercel.workflow.Run[Any] = vercel.workflow.Run(run_id)
+    tail = (await run.stream_info(namespace=SESSION_NAMESPACE)).tail_index
+    if tail < 0:
+        return None
+    source = run.readable(namespace=SESSION_NAMESPACE, start_index=tail)
+    async with contextlib.aclosing(source):
+        async for data in source:
+            return proto.SessionState.model_validate(data)
+    return None
+
+
+async def tail_index(run_id: str) -> int:
     """Return the last written index (``-1`` when the stream is empty)."""
-    await storage.ensure_ready()
-    index, _ = await storage.store().info(stream_id, namespace)
-    return index
+    info = await vercel.workflow.Run(run_id).stream_info()
+    return info.tail_index
 
 
 async def replay(
-    stream_id: str,
-    *,
-    namespace: str = DEFAULT_STREAM_NAMESPACE,
-    start_index: int = 0,
+    run_id: str, *, start_index: int = 0
 ) -> collections.abc.AsyncIterator[proto.StreamEvent]:
     """Yield already-written events once, without tailing for new ones."""
-    await storage.ensure_ready()
-    for _, data in await storage.store().read(stream_id, namespace, start_index):
-        yield proto.STREAM_EVENT_ADAPTER.validate_python(data)
-
-
-# current design implies that get_writable gets called inside a step with session_id
-# if there's encryption involved, writable handle will have to be passed all the way
-# down session -> step -> turn -> step, in order for the turn step (e.g. llm call) to
-# write to session's stream.
+    run: vercel.workflow.Run[Any] = vercel.workflow.Run(run_id)
+    remaining = (await run.stream_info()).tail_index - start_index + 1
+    if remaining <= 0:
+        return
+    source = run.readable(start_index=start_index)
+    async with contextlib.aclosing(source):
+        async for data in source:
+            yield proto.STREAM_EVENT_ADAPTER.validate_python(data)
+            remaining -= 1
+            if remaining == 0:
+                return
