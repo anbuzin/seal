@@ -25,7 +25,7 @@ _TITLE_PROMPT = (
     "Generate a concise 3-6 word title for a conversation that starts with "
     "the following message. Reply with ONLY the title, no quotes or punctuation."
 )
-_TITLE_MODEL = "anthropic/claude-sonnet-4.6"
+_TITLE_MODEL = "gateway:openai/gpt-5.6-luna"
 
 _SCHEMA = """\
 CREATE TABLE IF NOT EXISTS seal_sessions (
