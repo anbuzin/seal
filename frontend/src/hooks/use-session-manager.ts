@@ -109,8 +109,8 @@ export function useSessionManager() {
   const loadSession = useCallback(async (id: string) => {
     setIsReady(false)
     try {
-      const msgs = await fetchSessionMessages(id)
-      setInitialMessages(msgs)
+      const messages = await fetchSessionMessages(id)
+      setInitialMessages(messages)
       writeStoredSessionId(id)
       setSessionId(id)
     } finally {
@@ -145,8 +145,8 @@ export function useSessionManager() {
     // the create is too -- they converge on one row.
     writeStoredSessionId(sessionId)
     try {
-      const msgs = await fetchSessionMessages(sessionId)
-      setInitialMessages(msgs)
+      const messages = await fetchSessionMessages(sessionId)
+      setInitialMessages(messages)
     } catch {
       await createFreshSession(sessionId)
     }

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import collections.abc
 import datetime
-from typing import Literal
+from typing import Any, Literal
 
 import pydantic
 
@@ -19,9 +19,15 @@ def session_started() -> proto.LifecycleEvent:
     return proto.LifecycleEvent(type=proto.SESSION_STARTED)
 
 
-def session_waiting(*, turn_index: int) -> proto.LifecycleEvent:
+def session_waiting(
+    *, turn_index: int, active_background_tasks: int = 0
+) -> proto.LifecycleEvent:
     return proto.LifecycleEvent(
-        type=proto.SESSION_WAITING, data={"turn_index": turn_index}
+        type=proto.SESSION_WAITING,
+        data={
+            "turn_index": turn_index,
+            "active_background_tasks": active_background_tasks,
+        },
     )
 
 
@@ -31,9 +37,10 @@ def session_completed(*, is_error: bool = False) -> proto.LifecycleEvent:
     )
 
 
-def turn_started(*, turn_index: int) -> proto.LifecycleEvent:
+def turn_started(*, turn_index: int, background: bool = False) -> proto.LifecycleEvent:
     return proto.LifecycleEvent(
-        type=proto.TURN_STARTED, data={"turn_index": turn_index}
+        type=proto.TURN_STARTED,
+        data={"turn_index": turn_index, "background": background},
     )
 
 
@@ -56,10 +63,28 @@ def subagent_called(
     )
 
 
-def subagent_completed(*, tool_call_id: str, is_error: bool) -> proto.LifecycleEvent:
+def subagent_event(*, tool_call_id: str, event: dict[str, Any]) -> proto.LifecycleEvent:
+    return proto.LifecycleEvent(
+        type=proto.SUBAGENT_EVENT,
+        data={"tool_call_id": tool_call_id, "event": event},
+    )
+
+
+def subagent_completed(
+    *,
+    tool_call_id: str,
+    is_error: bool,
+    messages: list[dict[str, Any]] | None = None,
+    error: str | None = None,
+) -> proto.LifecycleEvent:
     return proto.LifecycleEvent(
         type=proto.SUBAGENT_COMPLETED,
-        data={"tool_call_id": tool_call_id, "is_error": is_error},
+        data={
+            "tool_call_id": tool_call_id,
+            "is_error": is_error,
+            "messages": messages or [],
+            "error": error,
+        },
     )
 
 

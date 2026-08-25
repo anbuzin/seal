@@ -32,7 +32,6 @@ import pathlib
 import re
 from typing import Any
 
-import ai
 import ai.types.messages as messages_
 import ai.ui.ai_sdk as ai_sdk
 import httpx
@@ -233,6 +232,7 @@ async def test_parallel_subagents(
                 ("tc-sb", "subagent", '{"prompt": "task-beta", "name": "beta"}'),
             )
         ],
+        [text_msg("both helpers are running")],
         [text_msg("combined findings")],
     ]
     scripted_model.keyed_responses = {
@@ -248,15 +248,27 @@ async def test_parallel_subagents(
     assert state is not None
     assert_message_invariants(state.messages)
 
-    # each child's transcript landed on its own tool call (no cross-wiring)
+    # Tool calls return immediately at the model layer, while the one UI response
+    # remains open through child completion and the automatic follow-up turn.
     results = {
         part.tool_call_id: part
         for message in state.messages
         for part in message.tool_results
     }
-    for tc_id, expected in [("tc-sa", "alpha report"), ("tc-sb", "beta report")]:
-        bundle = ai.agents.MessageBundle.model_validate(results[tc_id].result)
-        assert bundle.messages[-1].text == expected
+    assert set(results) == {"tc-sa", "tc-sb"}
+    assert all(
+        result.result
+        == "Subagent is running in the background and will update you later."
+        for result in results.values()
+    )
+
+    await wait_for_lifecycle("s1", proto.SUBAGENT_COMPLETED, count=2)
+    await wait_for_lifecycle("s1", proto.SESSION_WAITING, count=2)
+    state = await session.read_session("s1")
+    assert state is not None
+    assert "alpha report" in state.messages[-2].text
+    assert "beta report" in state.messages[-2].text
+    assert state.messages[-1].text == "combined findings"
 
     _check_or_update("parallel-subagents", sse, ui_messages)
 
@@ -272,6 +284,7 @@ async def test_mixed_subagents_and_approvals(
                 ("tc-cmd", "bash", '{"command": "echo gamma-out"}'),
             )
         ],
+        [text_msg("tools dispatched")],
         [text_msg("wrapped up")],
     ]
     scripted_model.keyed_responses = {"task-gamma": [text_msg("gamma report")]}
@@ -286,6 +299,7 @@ async def test_mixed_subagents_and_approvals(
     )
     assert approvals["tc-cmd"].granted
 
+    await wait_for_lifecycle("s1", proto.SUBAGENT_COMPLETED)
     await wait_for_lifecycle("s1", proto.SESSION_WAITING)
     state = await session.read_session("s1")
     assert state is not None
@@ -296,5 +310,8 @@ async def test_mixed_subagents_and_approvals(
         for part in message.tool_results
     }
     assert results["tc-cmd"].result == "gamma-out\n"
-    bundle = ai.agents.MessageBundle.model_validate(results["tc-sub"].result)
-    assert bundle.messages[-1].text == "gamma report"
+    assert results["tc-sub"].result == (
+        "Subagent is running in the background and will update you later."
+    )
+    assert "gamma report" in state.messages[-2].text
+    assert state.messages[-1].text == "wrapped up"

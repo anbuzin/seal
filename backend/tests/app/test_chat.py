@@ -3,8 +3,7 @@ regressions live.
 
 ``active_run_start_index`` decides where a reload resumes (wrong answer =
 duplicated assistant message in the UI), ``to_sse`` decides when a stream
-terminates (wrong answer = hang or truncated turn), and ``bundle_to_wire``
-is the single source of truth for the nested subagent shape.
+terminates (wrong answer = hang or truncated turn).
 
 All tests run against real jsonl streams and the real ai SDK UI adapter.
 """
@@ -75,23 +74,20 @@ async def test_in_flight_run_resumes_from_its_opener() -> None:
     assert await chat.active_run_start_index("s1") == 9
 
 
-async def test_multi_turn_run_resumes_from_run_start_not_inner_turn() -> None:
-    # a subagent round trip spans several driver turns but is ONE ui run; resuming
-    # from the inner turn.started would replay a partial message and duplicate.
+async def test_background_followup_resumes_from_the_logical_run_opener() -> None:
+    # A fast child can wake the next root turn without a quiescent wait in between;
+    # reconnect must rebuild the whole logical response from the original opener.
     await _write(
         "s1",
-        stream.session_started(),  # 0 ← run opens here
+        stream.session_started(),  # 0
         stream.turn_started(turn_index=0),  # 1
         *_text_events("delegating"),  # 2-6
         stream.turn_completed(turn_index=0, kind="suspend"),  # 7
-        stream.subagent_called(
-            tool_call_id="tc-1", child_session_id="s1:child:tc-1", name="helper"
-        ),  # 8
-        stream.subagent_completed(tool_call_id="tc-1", is_error=False),  # 9
-        stream.turn_started(turn_index=1),  # 10 (inner turn, same run)
-        events_.StreamStart(),  # 11
+        stream.subagent_completed(tool_call_id="tc-1", is_error=False),  # 8
+        stream.turn_started(turn_index=1, background=True),  # 9
+        events_.StreamStart(),  # 10
     )
-    assert await chat.active_run_start_index("s1") == 0
+    assert await chat.active_run_start_index("s1") == 1
 
 
 async def test_run_parked_on_approval_is_resumable_from_run_start() -> None:
@@ -104,40 +100,7 @@ async def test_run_parked_on_approval_is_resumable_from_run_start() -> None:
         *_text_events("need approval"),
         stream.tool_approval_requested(turn_index=0),
     )
-    assert await chat.active_run_start_index("s1") == 0
-
-
-# --- bundle_to_wire ---------------------------------------------------------------
-
-
-def test_bundle_to_wire_folds_all_assistant_turns_into_one_ui_message() -> None:
-    transcript = [
-        ai.system_message("you are a subagent"),
-        ai.user_message("task"),
-        ai.messages.Message(
-            role="assistant",
-            parts=[
-                messages_.TextPart(text="first"),
-                messages_.ToolCallPart(
-                    tool_call_id="tc-1", tool_name="web_fetch", tool_args="{}"
-                ),
-            ],
-        ),
-        ai.tool_message(tool_call_id="tc-1", tool_name="web_fetch", result="page"),
-        ai.messages.Message(
-            role="assistant", parts=[messages_.TextPart(text="second")]
-        ),
-    ]
-    nested = chat.bundle_to_wire(transcript)
-    assert nested is not None
-    assert nested["role"] == "assistant"
-    parts = cast(list[dict[str, Any]], nested["parts"])
-    texts = [part["text"] for part in parts if part.get("type") == "text"]
-    assert texts == ["first", "second"]
-
-
-def test_bundle_to_wire_with_no_assistant_message_yet() -> None:
-    assert chat.bundle_to_wire([ai.user_message("task")]) is None
+    assert await chat.active_run_start_index("s1") == 1
 
 
 # --- to_sse ----------------------------------------------------------------------
@@ -159,16 +122,20 @@ def _sse_payloads(lines: list[str]) -> list[dict[str, Any]]:
     return payloads
 
 
-async def test_to_sse_streams_one_turn_and_terminates_at_waiting() -> None:
-    # the durable stream stays OPEN (session still alive); termination must come
-    # from the session.waiting boundary — getting this wrong is a client hang.
+async def test_to_sse_streams_background_followup_in_one_ui_run() -> None:
+    # A root turn may finish while its background work is still active. The AI SDK
+    # response stays open and folds the automatic follow-up into the same message.
     await _write(
         "s1",
         stream.session_started(),
         stream.turn_started(turn_index=0),
         *_text_events("hello world"),
         stream.turn_completed(turn_index=0, kind="suspend"),
-        stream.session_waiting(turn_index=0),
+        stream.session_waiting(turn_index=0, active_background_tasks=1),
+        stream.turn_started(turn_index=1, background=True),
+        *_text_events("next turn", block="next"),
+        stream.turn_completed(turn_index=1, kind="suspend"),
+        stream.session_waiting(turn_index=1),
     )
     lines = await _collect_sse("s1")
 
@@ -177,7 +144,7 @@ async def test_to_sse_streams_one_turn_and_terminates_at_waiting() -> None:
         for payload in _sse_payloads(lines)
         if payload.get("type") == "text-delta"
     ]
-    assert [delta["delta"] for delta in deltas] == ["hello world"]
+    assert [delta["delta"] for delta in deltas] == ["hello world", "next turn"]
     assert lines[-1].startswith("data:")
     assert "[DONE]" in lines[-1]
 
@@ -218,6 +185,26 @@ async def test_to_sse_parks_at_a_deferred_approval() -> None:
     kinds = [payload.get("type") for payload in _sse_payloads(lines)]
     assert "tool-approval-request" in kinds
     assert "[DONE]" in lines[-1]
+
+
+async def test_submit_approvals_replays_events_after_the_approval_marker(
+    monkeypatch: Any,
+) -> None:
+    await _write(
+        "s1",
+        stream.turn_started(turn_index=0),
+        stream.tool_approval_requested(turn_index=0),
+        stream.subagent_completed(tool_call_id="tc-sub", is_error=False),
+    )
+
+    async def resume(_token: str, _hook: Any) -> None:
+        return None
+
+    monkeypatch.setattr(chat, "_resume", resume)
+    start_index = await chat.submit_approvals(
+        "s1", [proto.ToolApprovalResponse(tool_call_id="tc-1", granted=True)]
+    )
+    assert start_index == 2
 
 
 async def test_approval_resume_continuation_opens_id_less() -> None:
@@ -285,22 +272,52 @@ async def test_to_sse_replays_reload_marker() -> None:
     assert "[DONE]" in lines[-1]
 
 
-async def test_to_sse_interleaves_live_subagent_progress() -> None:
-    child_id = "s1:child:tc-1"
-    child_message = ai.messages.Message(
-        role="assistant", parts=[messages_.TextPart(text="child says hi")]
+def test_project_background_task_updates_original_tool_part() -> None:
+    ui_messages: list[dict[str, Any]] = [
+        {
+            "id": "a1",
+            "role": "assistant",
+            "parts": [
+                {
+                    "type": "tool-subagent",
+                    "toolCallId": "tc-1",
+                    "state": "output-available",
+                    "input": {"prompt": "go"},
+                    "output": (
+                        "Subagent is running in the background and will update you "
+                        "later."
+                    ),
+                }
+            ],
+        },
+        {"id": "u2", "role": "user", "parts": [{"type": "text", "text": "later"}]},
+    ]
+    task = proto.BackgroundTaskState(
+        task_id="tc-1",
+        child_session_id="s1:child:tc-1",
+        name="helper",
+        status="completed",
+        messages=[ai.assistant_message("child answer")],
     )
-    await _write(
-        child_id,
-        events_.StreamStart(),
-        events_.StreamEnd(message=child_message),
-    )
-    child_writer = await stream.get_writable(child_id)
-    await child_writer.close()
 
+    projected = chat.project_background_tasks(ui_messages, {"tc-1": task})
+    parts = projected[0]["parts"]
+    assert isinstance(parts, list)
+    part = cast(dict[str, Any], parts[0])
+    assert part["toolCallId"] == "tc-1"
+    output = cast(list[dict[str, Any]], part["output"])
+    output_parts = cast(list[dict[str, Any]], output[0]["parts"])
+    assert output_parts[0]["text"] == "child answer"
+    assert part["preliminary"] is False
+    user_parts = cast(list[dict[str, Any]], projected[1]["parts"])
+    assert user_parts[0]["text"] == "later"
+
+
+async def test_to_sse_stitches_background_subagent_into_the_ui_run() -> None:
     parent_call = messages_.ToolCallPart(
         tool_call_id="tc-1", tool_name="subagent", tool_args='{"prompt":"go"}'
     )
+    acknowledgement = "Subagent is running in the background and will update you later."
     await _write(
         "s1",
         stream.session_started(),
@@ -311,54 +328,56 @@ async def test_to_sse_interleaves_live_subagent_progress() -> None:
         events_.StreamEnd(
             message=ai.messages.Message(role="assistant", parts=[parent_call])
         ),
-        stream.turn_completed(turn_index=0, kind="suspend"),
         stream.subagent_called(
-            tool_call_id="tc-1", child_session_id=child_id, name="helper"
+            tool_call_id="tc-1", child_session_id="s1:child:tc-1", name="helper"
         ),
-    )
-
-    # consume until the preliminary child output arrives, then finish the turn —
-    # mirrors the live ordering (child runs while the parent turn is open).
-    gen = chat.to_sse("s1", 0)
-    lines: list[str] = []
-
-    async def read_until_preliminary() -> None:
-        async for line in gen:
-            lines.append(line)
-            if "child says hi" in line:
-                return
-
-    await asyncio.wait_for(read_until_preliminary(), timeout=5)
-
-    await _write(
-        "s1",
-        stream.subagent_completed(tool_call_id="tc-1", is_error=False),
-        stream.turn_started(turn_index=1),
-        *_text_events("all done"),
+        events_.ToolCallResult(
+            message=ai.tool_message(
+                tool_call_id="tc-1",
+                tool_name="subagent",
+                result=acknowledgement,
+            ),
+            results=[
+                ai.tool_result_part(
+                    "tc-1",
+                    tool_name="subagent",
+                    result=acknowledgement,
+                )
+            ],
+        ),
+        stream.turn_completed(turn_index=0, kind="suspend"),
+        stream.session_waiting(turn_index=0, active_background_tasks=1),
+        stream.subagent_event(
+            tool_call_id="tc-1",
+            event=events_.TextDelta(
+                block_id="child",
+                chunk="child",
+                message=ai.assistant_message("child"),
+            ).model_dump(mode="json"),
+        ),
+        stream.subagent_completed(
+            tool_call_id="tc-1",
+            is_error=False,
+            messages=[ai.assistant_message("child answer").model_dump(mode="json")],
+        ),
+        stream.turn_started(turn_index=1, background=True),
+        *_text_events("final answer", block="final"),
         stream.turn_completed(turn_index=1, kind="suspend"),
         stream.session_waiting(turn_index=1),
     )
 
-    async def drain() -> None:
-        async for line in gen:
-            lines.append(line)
-
-    await asyncio.wait_for(drain(), timeout=5)
-
+    lines = [line async for line in chat.to_sse("s1", 0)]
     payloads = _sse_payloads(lines)
-    preliminary = [
+    outputs = [
         payload
         for payload in payloads
-        if payload.get("type") == "tool-output-available" and payload.get("preliminary")
+        if payload.get("type") == "tool-output-available"
     ]
-    assert preliminary, "no preliminary subagent output reached the client"
-    nested = preliminary[-1]["output"]
-    assert nested["role"] == "assistant"
+    assert outputs[0]["output"] == acknowledgement
+    assert outputs[-1]["output"][0]["parts"][0]["text"] == "child answer"
+    assert any(payload.get("preliminary") for payload in outputs)
     assert any(
-        part.get("type") == "text" and part.get("text") == "child says hi"
-        for part in nested["parts"]
+        payload.get("type") == "text-delta" and payload.get("delta") == "final answer"
+        for payload in payloads
     )
-    # the parent turn's own text still arrives exactly once afterwards
-    deltas = [p["delta"] for p in payloads if p.get("type") == "text-delta"]
-    assert deltas.count("all done") == 1
     assert "[DONE]" in lines[-1]

@@ -38,7 +38,7 @@ from harness import (
     wait_run as _wait_run,
 )
 
-from agent import proto, session, storage
+from agent import proto, session, storage, stream
 
 
 async def test_single_turn_suspends_then_closes(
@@ -199,7 +199,7 @@ async def test_parallel_gated_tools_park_then_run(
     assert proto.TOOL_APPROVAL_REQUESTED in await _lifecycle("s2")
 
 
-async def test_subagent_result_lands_on_the_trailing_tool_message(
+async def test_subagent_returns_immediately_then_wakes_parent_with_user_message(
     world: InProcessWorld, scripted_model: MockProvider
 ) -> None:
     scripted_model.responses = [
@@ -211,12 +211,20 @@ async def test_subagent_result_lands_on_the_trailing_tool_message(
                 text="delegating",
             )
         ],
-        [text_msg("child answer")],  # the child session's single turn
-        [text_msg("final answer")],  # the parent's follow-up turn
+        [text_msg("working in the background")],
+        [text_msg("final answer")],
     ]
+    scripted_model.keyed_responses = {"say hi": [text_msg("child answer")]}
 
     await _start("s1", "delegate")
+    # The parent completes a turn without waiting for the child tool call.
     await _wait_for_lifecycle("s1", proto.SESSION_WAITING)
+    first_state = await session.read_session("s1")
+    assert first_state is not None
+    assert first_state.messages[-1].text == "working in the background"
+
+    await _wait_for_lifecycle("s1", proto.SUBAGENT_COMPLETED)
+    await _wait_for_lifecycle("s1", proto.SESSION_WAITING, count=2)
 
     state = await session.read_session("s1")
     assert state is not None
@@ -226,29 +234,46 @@ async def test_subagent_result_lands_on_the_trailing_tool_message(
         "assistant",
         "tool",
         "assistant",
+        "user",
+        "assistant",
     ]
     assert_message_invariants(state.messages)
+    assert state.messages[-2].text == (
+        'Background subagent "helper" finished:\n\nchild answer'
+    )
     assert state.messages[-1].text == "final answer"
 
-    # the child's full transcript (a MessageBundle) is the tool result
     [tool_message] = [m for m in state.messages if m.role == "tool"]
     [result] = tool_message.tool_results
     assert result.tool_call_id == "tc-sub"
-    bundle = ai.agents.MessageBundle.model_validate(result.result)
-    assert [m.role for m in bundle.messages] == ["assistant"]
-    assert bundle.messages[-1].text == "child answer"
+    assert result.result == (
+        "Subagent is running in the background and will update you later."
+    )
 
     assert await _lifecycle("s1") == [
         proto.SESSION_STARTED,
         proto.TURN_STARTED,
         proto.SUBAGENT_CALLED,
+        proto.TURN_COMPLETED,
+        proto.SESSION_WAITING,
         proto.SUBAGENT_COMPLETED,
+        proto.TURN_STARTED,
         proto.TURN_COMPLETED,
         proto.SESSION_WAITING,
     ]
-    # the child ran as a single turn on its own stream (no session wrapper)
+    # The child ran on its own stream and its progress was durably proxied onto
+    # the parent stream for the UI without changing the parent's model history.
     assert await _lifecycle("s1:child:tc-sub") == []
-    assert scripted_model.call_count == 3
+    parent_events = [event async for event in stream.replay("s1")]
+    proxied = [
+        event
+        for event in parent_events
+        if isinstance(event, proto.LifecycleEvent)
+        and event.type == proto.SUBAGENT_EVENT
+    ]
+    assert proxied
+    assert any(event.data["event"].get("kind") == "text_delta" for event in proxied)
+    assert scripted_model.call_count == 4
 
 
 async def test_generate_image_returns_multipart_result(
@@ -345,7 +370,8 @@ async def test_parallel_subagents_land_deterministically(
                 ],
             )
         ],
-        [text_msg("wrapped up")],  # parent's follow-up turn after both children
+        [text_msg("both are running")],
+        [text_msg("wrapped up")],  # parent's follow-up after both children report
     ]
     scripted_model.keyed_responses = {
         "task-alpha": [text_msg("alpha-report")],
@@ -354,6 +380,12 @@ async def test_parallel_subagents_land_deterministically(
 
     await _start(session_id, "delegate both")
     await _wait_for_lifecycle(session_id, proto.SESSION_WAITING)
+    first_state = await session.read_session(session_id)
+    assert first_state is not None
+    assert first_state.messages[-1].text == "both are running"
+
+    await _wait_for_lifecycle(session_id, proto.SUBAGENT_COMPLETED, count=2)
+    await _wait_for_lifecycle(session_id, proto.SESSION_WAITING, count=2)
 
     state = await session.read_session(session_id)
     assert state is not None
@@ -363,16 +395,22 @@ async def test_parallel_subagents_land_deterministically(
         "assistant",
         "tool",
         "assistant",
+        "user",
+        "assistant",
     ]
     assert state.messages[-1].text == "wrapped up"
+    updates = state.messages[-2].text
+    assert 'Background subagent "alpha" finished:\n\nalpha-report' in updates
+    assert 'Background subagent "beta" finished:\n\nbeta-report' in updates
     assert_message_invariants(state.messages)
 
     [tool_message] = [m for m in state.messages if m.role == "tool"]
     results = {r.tool_call_id: r for r in tool_message.tool_results}
     assert set(results) == {"tc-a", "tc-b"}
-    bundle_a = ai.agents.MessageBundle.model_validate(results["tc-a"].result)
-    bundle_b = ai.agents.MessageBundle.model_validate(results["tc-b"].result)
-    assert bundle_a.messages[-1].text == "alpha-report"
-    assert bundle_b.messages[-1].text == "beta-report"
-    # parent: 1 turn issuing both calls + 1 follow-up; each child: 1 turn
-    assert scripted_model.call_count == 4
+    assert all(
+        r.result == "Subagent is running in the background and will update you later."
+        for r in results.values()
+    )
+    # Parent issues calls, acknowledges them, then consumes the update.
+    # Each child runs once.
+    assert scripted_model.call_count == 5
