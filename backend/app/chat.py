@@ -38,6 +38,10 @@ from agent import driver, proto, session, stream
 _TERMINAL = {proto.SESSION_WAITING, proto.SESSION_COMPLETED, proto.SESSION_FAILED}
 
 
+class SessionUnavailableError(Exception):
+    """The session cannot accept a new user message right now."""
+
+
 async def active_run_start_index(session_id: str) -> int | None:
     """Return the stream index to resume the in-flight run from, else ``None``.
 
@@ -77,37 +81,44 @@ async def start_or_resume(session_id: str, prompt: str) -> int:
     Returns the stream index to tail from so only the new turn reaches the
     client.
     """
+    if await active_run_start_index(session_id) is not None:
+        raise SessionUnavailableError("A turn is already running")
+
     start_index = await stream.tail_index(session_id) + 1
 
     if await session.read_session(session_id) is None:
         await vercel.workflow.start(
             driver.run_session,
-            proto.SessionInput(session_id=session_id, prompt=prompt),
+            proto.SessionInput(session_id=session_id),
         )
-    else:
-        turn_index = await _waiting_turn_index(session_id)
-        await _resume(
-            f"seal-session:{session_id}:{turn_index}",
-            proto.SessionHook(payload=proto.NewUserMessage(prompt=prompt)),
-        )
+        await _wait_for_lifecycle(session_id, proto.SESSION_STARTED)
+
+    await _resume(
+        proto.session_inbox_token(session_id),
+        proto.SessionInboxHook(command=proto.NewUserMessage(prompt=prompt)),
+    )
     return start_index
 
 
 async def submit_approvals(
     session_id: str, approvals: list[proto.ToolApprovalResponse]
 ) -> int:
-    """Forward each UI approval decision into its own parked hook.
+    """Send each UI approval decision through the session's public inbox.
 
     Returns the stream index to tail the continuation from: the next index after
     the park, computed *before* resuming so the continuation can't outrun it. The
     resubmit carries the parked assistant message, so the client keeps streaming
     into it and the continuation (tool output + answer) folds in.
     """
+    if await active_run_start_index(session_id) is None:
+        raise SessionUnavailableError("No turn is waiting for approval")
+
     start_index = await stream.tail_index(session_id) + 1
+    token = proto.session_inbox_token(session_id)
     for approval in approvals:
         await _resume(
-            proto.approval_hook_token(session_id, approval.tool_call_id),
-            proto.ApprovalHook(response=approval),
+            token,
+            proto.SessionInboxHook(command=proto.SubmitToolApproval(response=approval)),
         )
     return start_index
 
@@ -264,6 +275,14 @@ def _upsert(messages: list[ai.messages.Message], message: ai.messages.Message) -
     messages.append(message)
 
 
+async def _wait_for_lifecycle(session_id: str, type_: str) -> None:
+    while True:
+        async for event in stream.replay(session_id):
+            if isinstance(event, proto.LifecycleEvent) and event.type == type_:
+                return
+        await asyncio.sleep(0.05)
+
+
 async def _resume(token: str, hook: vercel.workflow.BaseHook) -> None:
     """Resolve a workflow hook, retrying while the driver registers it."""
     for attempt in range(40):
@@ -274,19 +293,3 @@ async def _resume(token: str, hook: vercel.workflow.BaseHook) -> None:
             if attempt == 39:
                 raise
             await asyncio.sleep(0.05)
-
-
-async def _waiting_turn_index(session_id: str) -> int:
-    """The turn the session is currently parked on (latest ``session.waiting``).
-
-    Falls back to the latest ``tool_approval.requested`` turn, since a turn parked
-    on a gated tool emits that rather than ``session.waiting``.
-    """
-    turn_index = 0
-    async for event in stream.replay(session_id):
-        if isinstance(event, proto.LifecycleEvent) and event.type in (
-            proto.SESSION_WAITING,
-            proto.TOOL_APPROVAL_REQUESTED,
-        ):
-            turn_index = int(event.data.get("turn_index", turn_index))
-    return turn_index

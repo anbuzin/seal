@@ -120,7 +120,10 @@ async def post_chat(request: ChatRequest) -> fastapi.responses.StreamingResponse
             raise fastapi.HTTPException(
                 status_code=400, detail="No user message to run"
             )
-        start_index = await chat.start_or_resume(request.session_id, prompt)
+        try:
+            start_index = await chat.start_or_resume(request.session_id, prompt)
+        except chat.SessionUnavailableError as error:
+            raise fastapi.HTTPException(status_code=409, detail=str(error)) from None
 
     return fastapi.responses.StreamingResponse(
         chat.to_sse(request.session_id, start_index),

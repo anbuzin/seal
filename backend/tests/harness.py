@@ -119,10 +119,16 @@ class InProcessWorld(wf_local.LocalWorld):
 async def start_session(
     session_id: str, prompt: str
 ) -> vercel.workflow.Run[proto.SessionOutput]:
-    return await vercel.workflow.start(
+    run = await vercel.workflow.start(
         driver.run_session,
-        proto.SessionInput(session_id=session_id, prompt=prompt),
+        proto.SessionInput(session_id=session_id),
     )
+    await wait_for_lifecycle(session_id, proto.SESSION_STARTED)
+    await resume_session(
+        proto.session_inbox_token(session_id),
+        proto.NewUserMessage(prompt=prompt),
+    )
+    return run
 
 
 async def wait_for_lifecycle(
@@ -142,15 +148,15 @@ async def wait_for_lifecycle(
 
 
 async def resume_session(token: str, payload: proto.NewUserMessage) -> None:
-    await _resume_hook(token, proto.SessionHook(payload=payload))
+    await _resume_hook(token, proto.SessionInboxHook(command=payload))
 
 
 async def resume_approval(
     session_id: str, response: proto.ToolApprovalResponse
 ) -> None:
     await _resume_hook(
-        proto.approval_hook_token(session_id, response.tool_call_id),
-        proto.ApprovalHook(response=response),
+        proto.session_inbox_token(session_id),
+        proto.SessionInboxHook(command=proto.SubmitToolApproval(response=response)),
     )
 
 

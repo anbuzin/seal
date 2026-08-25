@@ -152,22 +152,14 @@ async def web_fetch(
 async def generate_image(prompt: str) -> ai.messages.ContentOutput:
     """Generate an image from a text prompt. Describe the desired image in
     detail, including subject, style, and composition."""
-
-    # the ai library has no direct image-generation API yet, so this
-    # runs a model that emits images inline with its response
-    # (FileParts on the message).
     model = ai.get_model(IMAGE_MODEL_ID)
     messages = [ai.system_message(IMAGE_SYSTEM_PROMPT), ai.user_message(prompt)]
     async with ai.stream(model, messages) as model_stream:
         async for _ in model_stream:
             pass
     message = model_stream.message
-
     if not message.images:
-        return ai.content_output(
-            message.text or "The image model returned no image.",
-        )
-    # keep any caption text the model emitted alongside its images
+        return ai.content_output(message.text or "The image model returned no image.")
     return ai.content_output(
         *(
             part
@@ -221,7 +213,7 @@ async def subagent(prompt: str, name: str | None = None) -> ai.agents.MessageBun
             tool_call_id=tool_call_id, child_session_id=child_session_id, name=name
         ),
     )
-    hook = proto.TurnHook.wait(token=token)
+    hook = proto.SubagentHook.wait(token=token)
     await spawn_subagent_turn(
         proto.TurnInput(
             session_id=child_session_id,
@@ -230,7 +222,7 @@ async def subagent(prompt: str, name: str | None = None) -> ai.agents.MessageBun
                 ai.user_message(prompt),
             ],
             gated=False,
-            turn_hook_token=token,
+            parent_hook_token=token,
         ),
         # the child turn's root span nests under this turn's root span.
         call.turn_span,
@@ -278,7 +270,6 @@ class DurableAgent(ai.Agent):
     async def loop(self, context: ai.Context) -> AsyncGenerator[ai.events.AgentEvent]:
         model_id = context.model.id
         session_id = self.session_id
-
         tool_token = f"seal-early-tool:{session_id}"
         live_tool_calls = {}
 
@@ -392,10 +383,15 @@ async def ship_spans(spans: list[ai.experimental_telemetry.Span]) -> None:
 
 
 @workflow.step
-async def resume_turn_hook(token: str, output: proto.TurnOutput) -> None:
-    # resume() is a side effect, so it must run in a step. the driver may not
-    # have parked on the hook yet, so retry while it is missing.
-    hook = proto.TurnHook(output=output)
+async def notify_turn_finished(
+    session_id: str, turn_index: int, output: proto.TurnOutput
+) -> None:
+    # resume() is a side effect, so it must run in a step. the session may not
+    # have suspended on its inbox again yet, so retry while it is missing.
+    hook = proto.SessionInboxHook(
+        command=proto.TurnFinished(turn_index=turn_index, output=output)
+    )
+    token = proto.session_inbox_token(session_id)
     for attempt in range(40):
         try:
             await hook.resume(token)
@@ -406,7 +402,33 @@ async def resume_turn_hook(token: str, output: proto.TurnOutput) -> None:
             await asyncio.sleep(0.05)
 
 
-# runs one agent turn, parking on a durable hook per gated tool call
+@workflow.step
+async def notify_subagent_finished(token: str, output: proto.TurnOutput) -> None:
+    hook = proto.SubagentHook(output=output)
+    for attempt in range(40):
+        try:
+            await hook.resume(token)
+            return
+        except vercel.workflow.HookNotFoundError:
+            if attempt == 39:
+                raise
+            await asyncio.sleep(0.05)
+
+
+@workflow.step
+async def notify_agent_finished(token: str, output: proto.TurnOutput) -> None:
+    hook = proto.TurnInboxHook(command=proto.AgentFinished(output=output))
+    for attempt in range(40):
+        try:
+            await hook.resume(token)
+            return
+        except vercel.workflow.HookNotFoundError:
+            if attempt == 39:
+                raise
+            await asyncio.sleep(0.05)
+
+
+# runs one agent turn; its agent task and external controls meet at one inbox
 @workflow.workflow
 # Draw message/part ids from the workflow's deterministic RNG so they're
 # stable across replay. ``vercel.workflow.random`` is a factory resolved on
@@ -428,19 +450,6 @@ async def run_turn(turn_input: proto.TurnInput) -> None:
         turn_span=turn_input.turn_span,
     )
 
-    async def mediate(approval_event: Any, hook_id: str) -> None:
-        # bridge a durable ApprovalHook back into the ai-library approval hook so
-        # the gated tool proceeds in this same agent run.
-        decision = await approval_event
-        if decision is not None:
-            ai.resolve_hook(
-                hook_id,
-                {
-                    "granted": decision.response.granted,
-                    "reason": decision.response.reason,
-                },
-            )
-
     # collect spans that happen inside the workflow body, and send them
     # once in a separate step.
     collector = (
@@ -448,63 +457,103 @@ async def run_turn(turn_input: proto.TurnInput) -> None:
         if turn_input.turn_span is not None
         else None
     )
+    inbox_token = proto.turn_inbox_token(session_id, turn_index)
+    inbox = proto.TurnInboxHook.wait(token=inbox_token)
+    output: proto.TurnOutput | None = None
+
     try:
         model = ai.get_model(MODEL_ID)
         async with (
             ai.experimental_telemetry.use_sink(collector),
             ai.experimental_telemetry.use_span(turn_input.turn_span),
-            agent.run(model, messages) as run,
             ai.util.TaskGroup() as tg,
         ):
             agent.tg = tg
+            hook_registry = ai.HookRegistry()
 
-            async for event in run:
-                if (
-                    isinstance(event, ai.events.HookEvent)
-                    and event.hook.status == "pending"
-                    and event.hook.hook_type == ai.agents.TOOL_APPROVAL_HOOK_TYPE
-                    and (tool_call_id := event.hook.tool_call_id) is not None
-                ):
-                    # HookEvents ride the runtime queue, not runner.events(),
-                    # so the loop never wrote this; write it here so the UI
-                    # gets the approval request part.
-                    await write_event(session_id, event)
-                    tg.create_task(
-                        mediate(
-                            proto.ApprovalHook.wait(
-                                token=proto.approval_hook_token(
-                                    session_id, tool_call_id
+            async def drive_agent_run() -> None:
+                try:
+                    # Open, iterate, and close the run in one task. Telemetry spans
+                    # use task-local context and cannot be closed by the parent task.
+                    async with agent.run(
+                        model, messages, hook_registry=hook_registry
+                    ) as run:
+                        async for event in run:
+                            if (
+                                isinstance(event, ai.events.HookEvent)
+                                and event.hook.status == "pending"
+                                and event.hook.hook_type
+                                == ai.agents.TOOL_APPROVAL_HOOK_TYPE
+                            ):
+                                # HookEvents ride the runtime queue, not
+                                # runner.events(), so the loop never wrote this;
+                                # write it here so the UI
+                                # gets the approval request part.
+                                await write_event(session_id, event)
+                            elif isinstance(event, ai.events.RunBlocked):
+                                await write_event(
+                                    session_id,
+                                    stream.tool_approval_requested(
+                                        turn_index=turn_index
+                                    ),
                                 )
-                            ),
-                            event.hook.hook_id,
-                        )
+                        result = proto.TurnOutput(kind="suspend", messages=run.messages)
+                except Exception as error:
+                    result = proto.TurnOutput(
+                        kind="error",
+                        messages=messages,
+                        error=f"{type(error).__name__}: {error}",
                     )
-                elif isinstance(event, ai.events.RunBlocked):
-                    # the run is blocked on approvals; tell the client we're
-                    # waiting on a human.
-                    await write_event(
-                        session_id,
-                        stream.tool_approval_requested(turn_index=turn_index),
+                    print(
+                        f"[seal] error in run_turn:\n{traceback.format_exc()}",
+                        flush=True,
                     )
+                await notify_agent_finished(inbox_token, result)
 
-            messages = run.messages
+            inbox_queue: asyncio.Queue[proto.TurnInboxHook] = asyncio.Queue()
+
+            async def pump_inbox() -> None:
+                async for received in inbox:
+                    await inbox_queue.put(received)
+
+            # Arm the durable inbox before the agent can reach RunBlocked. The
+            # pump immediately re-awaits it after every delivery, while command
+            # processing happens independently through the local queue.
+            inbox_task = tg.create_task(pump_inbox())
+            tg.create_task(drive_agent_run())
+
+            while True:
+                received = await inbox_queue.get()
+                match received.command:
+                    case proto.TurnApproval(response=response):
+                        ai.resolve_hook(
+                            f"{proto.TOOL_APPROVAL_HOOK_PREFIX}{response.tool_call_id}",
+                            {
+                                "granted": response.granted,
+                                "reason": response.reason,
+                            },
+                            registry=hook_registry,
+                        )
+                    case proto.AgentFinished(output=result):
+                        output = result
+                        inbox_task.cancel()
+                        break
     except Exception as error:
+        print(f"[seal] error in run_turn:\n{traceback.format_exc()}", flush=True)
         output = proto.TurnOutput(
             kind="error",
             messages=messages,
             error=f"{type(error).__name__}: {error}",
         )
-        print(
-            f"[seal] error in run_turn:\n{traceback.format_exc()}",
-            flush=True,
-        )
-    else:
-        output = proto.TurnOutput(kind="suspend", messages=messages)
+
+    # Do not dispose in finally: workflow suspension unwinds this invocation.
+    # The inbox must survive replay and is disposed only after AgentFinished.
+    inbox.dispose()
+    assert output is not None
 
     # deliver the body's collected spans. only complete records ship: a span
     # still open here would dangle in the shipping process's adapter.
     if collector is not None:
-        # a copy: the turn span is appended below
         finished = list(collector.finished_spans)
         if turn_input.turn_span is not None:
             # complete the turn span here (pure data ops on workflow time) so
@@ -521,5 +570,8 @@ async def run_turn(turn_input: proto.TurnInput) -> None:
         if finished:
             await ship_spans(finished)
 
-    # notify session that the turn is complete.
-    await resume_turn_hook(turn_input.turn_hook_token, output)
+    if turn_input.parent_hook_token is not None:
+        await notify_subagent_finished(turn_input.parent_hook_token, output)
+    else:
+        # root turns report back through the session's stable inbox.
+        await notify_turn_finished(session_id, turn_index, output)

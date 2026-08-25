@@ -255,7 +255,9 @@ async def test_turn_with_telemetry_suspends_then_closes(
 
     run = await start_session("s1", "hi")
     await wait_for_lifecycle("s1", proto.SESSION_WAITING)
-    await resume_session("seal-session:s1:0", proto.NewUserMessage(close=True))
+    await resume_session(
+        proto.session_inbox_token("s1"), proto.NewUserMessage(close=True)
+    )
     output = await wait_run(run)
     assert not output.is_error
 

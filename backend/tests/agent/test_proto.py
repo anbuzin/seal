@@ -34,17 +34,61 @@ def _hook_event() -> events_.HookEvent:
 
 def test_hook_payloads_round_trip() -> None:
     """Each hook's payload survives the resume serialize -> validate round trip."""
-    message = proto.NewUserMessage(prompt="hi", close=False)
-    restored = proto.NewUserMessage.model_validate(message.model_dump(mode="json"))
+    message = proto.SessionInboxHook(
+        command=proto.NewUserMessage(prompt="hi", close=False)
+    )
+    restored = proto.SessionInboxHook.model_validate(message.model_dump(mode="json"))
     assert restored == message
+    assert isinstance(restored.command, proto.NewUserMessage)
 
-    approval = proto.ApprovalHook(
-        response=proto.ToolApprovalResponse(
-            tool_call_id="tc-1", granted=False, reason="nope"
+    finished = proto.SessionInboxHook(
+        command=proto.TurnFinished(
+            turn_index=2,
+            output=proto.TurnOutput(kind="suspend", messages=[ai.user_message("hi")]),
         )
     )
-    restored_hook = proto.ApprovalHook.model_validate(approval.model_dump(mode="json"))
+    restored_finished = proto.SessionInboxHook.model_validate(
+        finished.model_dump(mode="json")
+    )
+    assert restored_finished == finished
+    assert isinstance(restored_finished.command, proto.TurnFinished)
+
+    submitted_approval = proto.SessionInboxHook(
+        command=proto.SubmitToolApproval(
+            response=proto.ToolApprovalResponse(
+                tool_call_id="tc-1", granted=False, reason="nope"
+            )
+        )
+    )
+    restored_submission = proto.SessionInboxHook.model_validate(
+        submitted_approval.model_dump(mode="json")
+    )
+    assert restored_submission == submitted_approval
+    assert isinstance(restored_submission.command, proto.SubmitToolApproval)
+
+    approval = proto.TurnInboxHook(
+        command=proto.TurnApproval(
+            response=proto.ToolApprovalResponse(
+                tool_call_id="tc-1", granted=False, reason="nope"
+            )
+        )
+    )
+    restored_hook = proto.TurnInboxHook.model_validate(approval.model_dump(mode="json"))
     assert restored_hook == approval
+    assert isinstance(restored_hook.command, proto.TurnApproval)
+
+    agent_finished = proto.TurnInboxHook(
+        command=proto.AgentFinished(
+            output=proto.TurnOutput(
+                kind="suspend", messages=[ai.assistant_message("done")]
+            )
+        )
+    )
+    restored_agent_finished = proto.TurnInboxHook.model_validate(
+        agent_finished.model_dump(mode="json")
+    )
+    assert restored_agent_finished == agent_finished
+    assert isinstance(restored_agent_finished.command, proto.AgentFinished)
 
 
 # --- stream events ---------------------------------------------------------------
