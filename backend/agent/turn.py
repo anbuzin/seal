@@ -34,17 +34,13 @@ class EagerToolHook(pydantic.BaseModel, vercel.workflow.BaseHook):
 @workflow.step
 async def llm_step(
     model_id: str,
-    messages_data: list[dict[str, object]],
-    tools_data: list[dict[str, object]],
+    messages: list[ai.messages.Message],
+    tools: list[ai.Tool],
     session_id: str | None,
     tool_token: str | None = None,
-    turn_span_data: dict[str, object] | None = None,
-) -> dict[str, object]:
+    turn_span: ai.experimental_telemetry.Span | None = None,
+) -> ai.messages.Message:
     model = ai.get_model(model_id)
-    messages = [
-        ai.messages.Message.model_validate(message) for message in messages_data
-    ]
-    tools = [ai.Tool.model_validate(tool) for tool in tools_data]
 
     writer = await stream.get_writable(session_id) if session_id else None
     metadata = vercel.workflow.get_step_metadata()
@@ -55,11 +51,6 @@ async def llm_step(
         await writer.write(stream.reload_requested())
 
     # parent this step's spans under the turn's span
-    turn_span = (
-        ai.experimental_telemetry.Span.model_validate(turn_span_data)
-        if turn_span_data
-        else None
-    )
     async with (
         ai.experimental_telemetry.use_span(turn_span),
         ai.stream(model, messages, tools=tools) as model_stream,
@@ -73,17 +64,17 @@ async def llm_step(
             if tool_token and isinstance(e, ai.types.events.ToolEnd):
                 await EagerToolHook(payload=e.tool_call).resume(tool_token)
 
-    return model_stream.message.model_dump(mode="json")
+    return model_stream.message
 
 
 @workflow.step
 async def write_event(
     # writes one stream event (agent or lifecycle) to the durable stream
     session_id: str,
-    event_data: dict[str, object],
+    event: proto.StreamEvent,
 ) -> None:
     writer = await stream.get_writable(session_id)
-    await writer.write(event_data)
+    await writer.write(event)
 
 
 # closes a durable event stream once the owning session is terminal.
@@ -156,62 +147,43 @@ async def web_fetch(
     return "\n".join(parts)
 
 
+@ai.tool
 @workflow.step
-async def image_step(prompt: str) -> dict[str, object]:
+async def generate_image(prompt: str) -> ai.messages.ContentOutput:
     """Generate an image from a text prompt. Describe the desired image in
     detail, including subject, style, and composition."""
-
-    # the ai library has no direct image-generation API yet, so this
-    # runs a model that emits images inline with its response
-    # (FileParts on the message).
     model = ai.get_model(IMAGE_MODEL_ID)
     messages = [ai.system_message(IMAGE_SYSTEM_PROMPT), ai.user_message(prompt)]
     async with ai.stream(model, messages) as model_stream:
         async for _ in model_stream:
             pass
     message = model_stream.message
-
     if not message.images:
-        return ai.content_output(
-            message.text or "The image model returned no image.",
-        ).model_dump(mode="json")
-    # keep any caption text the model emitted alongside its images
+        return ai.content_output(message.text or "The image model returned no image.")
     return ai.content_output(
         *(
             part
             for part in message.parts
             if isinstance(part, ai.messages.TextPart | ai.messages.FilePart)
         )
-    ).model_dump(mode="json")
-
-
-@ai.tool
-async def generate_image(prompt: str) -> ai.messages.ContentOutput:
-    # TODO: annoyingly we have to have a model_validate in a tool outside the step
-    return ai.messages.ContentOutput.model_validate(await image_step(prompt))
+    )
 
 
 @workflow.step(max_retries=0)
 async def spawn_subagent_turn(
-    turn_input: dict[str, object],
-    parent_span_data: dict[str, object] | None = None,
-) -> dict[str, object]:
+    turn_input: proto.TurnInput,
+    parent_span: ai.experimental_telemetry.Span | None = None,
+) -> str:
     # a subagent is just one ungated turn writing to its own stream. its span
-    payload = dict(turn_input)
     if ai.experimental_telemetry.is_enabled():
         # create and nest the span for the subagent turn
-        parent = (
-            ai.experimental_telemetry.Span.model_validate(parent_span_data)
-            if parent_span_data
-            else None
-        )
         turn_span = ai.experimental_telemetry.create_span(
-            "turn", parent=parent
+            "turn", parent=parent_span
         ).stamp_start()
         turn_span.set_attrs({"openinference.span.kind": "AGENT"})
-        payload["turn_span"] = turn_span.model_dump(mode="json")
-    started = await vercel.workflow.start(run_turn, payload)
-    return {"run_id": started.run_id}
+        turn_input = turn_input.model_copy(update={"turn_span": turn_span})
+    started = await vercel.workflow.start(run_turn, turn_input)
+    return started.run_id
 
 
 # the running tool call's context, set by the loop around each schedule so a
@@ -251,9 +223,9 @@ async def subagent(prompt: str, name: str | None = None) -> ai.agents.MessageBun
             ],
             gated=False,
             parent_hook_token=token,
-        ).model_dump(mode="json"),
+        ),
         # the child turn's root span nests under this turn's root span.
-        call.turn_span.model_dump(mode="json") if call.turn_span else None,
+        call.turn_span,
     )
     resolution = await hook
     hook.dispose()
@@ -298,10 +270,6 @@ class DurableAgent(ai.Agent):
     async def loop(self, context: ai.Context) -> AsyncGenerator[ai.events.AgentEvent]:
         model_id = context.model.id
         session_id = self.session_id
-        turn_span_data = (
-            self.turn_span.model_dump(mode="json") if self.turn_span else None
-        )
-
         tool_token = f"seal-early-tool:{session_id}"
         live_tool_calls = {}
 
@@ -338,16 +306,14 @@ class DurableAgent(ai.Agent):
         while context.keep_running():
             live_tool_calls.clear()
 
-            result = await llm_step(
+            assistant_message = await llm_step(
                 model_id,
-                [message.model_dump(mode="json") for message in context.messages],
-                [tool.model_dump(mode="json") for tool in context.tools],
+                context.messages,
+                context.tools,
                 session_id,
                 tool_token,
-                turn_span_data,
+                self.turn_span,
             )
-
-            assistant_message = ai.messages.Message.model_validate(result)
             context.add(assistant_message)
             # llm_step streamed this turn out-of-band (straight to the durable
             # stream), so yield the final StreamEnd here for run-blocked
@@ -384,7 +350,7 @@ class DurableAgent(ai.Agent):
                     # in loop order (results before the next turn's answer); run_turn
                     # only writes HookEvents, which ride the runtime queue instead.
                     if session_id is not None:
-                        await write_event(session_id, event.model_dump(mode="json"))
+                        await write_event(session_id, event)
                     yield event
 
                 tool_message = runner.get_tool_message()
@@ -411,22 +377,19 @@ class DurableAgent(ai.Agent):
 
 
 @workflow.step
-async def ship_spans(spans_data: list[dict[str, Any]]) -> None:
+async def ship_spans(spans: list[ai.experimental_telemetry.Span]) -> None:
     # re-deliver spans collected in the workflow body to the real adapters.
-    await ai.experimental_telemetry.push_all(spans_data)
+    await ai.experimental_telemetry.push_all(spans)
 
 
 @workflow.step
 async def notify_turn_finished(
-    session_id: str, turn_index: int, output_data: dict[str, Any]
+    session_id: str, turn_index: int, output: proto.TurnOutput
 ) -> None:
     # resume() is a side effect, so it must run in a step. the session may not
     # have suspended on its inbox again yet, so retry while it is missing.
     hook = proto.SessionInboxHook(
-        command=proto.TurnFinished(
-            turn_index=turn_index,
-            output=proto.TurnOutput.model_validate(output_data),
-        )
+        command=proto.TurnFinished(turn_index=turn_index, output=output)
     )
     token = proto.session_inbox_token(session_id)
     for attempt in range(40):
@@ -440,8 +403,8 @@ async def notify_turn_finished(
 
 
 @workflow.step
-async def notify_subagent_finished(token: str, output_data: dict[str, Any]) -> None:
-    hook = proto.SubagentHook(output=proto.TurnOutput.model_validate(output_data))
+async def notify_subagent_finished(token: str, output: proto.TurnOutput) -> None:
+    hook = proto.SubagentHook(output=output)
     for attempt in range(40):
         try:
             await hook.resume(token)
@@ -453,10 +416,8 @@ async def notify_subagent_finished(token: str, output_data: dict[str, Any]) -> N
 
 
 @workflow.step
-async def notify_agent_finished(token: str, output_data: dict[str, Any]) -> None:
-    hook = proto.TurnInboxHook(
-        command=proto.AgentFinished(output=proto.TurnOutput.model_validate(output_data))
-    )
+async def notify_agent_finished(token: str, output: proto.TurnOutput) -> None:
+    hook = proto.TurnInboxHook(command=proto.AgentFinished(output=output))
     for attempt in range(40):
         try:
             await hook.resume(token)
@@ -474,27 +435,26 @@ async def notify_agent_finished(token: str, output_data: dict[str, Any]) -> None
 # entry (only valid inside the workflow).
 @ai.messages.use_random(vercel.workflow.random)
 @ai.experimental_telemetry.use_time(vercel.workflow.time_ns)
-async def run_turn(turn_input: dict[str, Any]) -> None:
-    _turn_input = proto.TurnInput.model_validate(turn_input)
-    messages = _turn_input.messages
-    session_id = _turn_input.session_id
-    turn_index = _turn_input.turn_index
+async def run_turn(turn_input: proto.TurnInput) -> None:
+    messages = turn_input.messages
+    session_id = turn_input.session_id
+    turn_index = turn_input.turn_index
 
     # messages should already contain either the user message
     # or the tool result message, so no need to do anything
 
-    extra_tools = [bash, subagent] if _turn_input.gated else [bash_ungated]
+    extra_tools = [bash, subagent] if turn_input.gated else [bash_ungated]
     agent = DurableAgent(
         tools=extra_tools,
         session_id=session_id,
-        turn_span=_turn_input.turn_span,
+        turn_span=turn_input.turn_span,
     )
 
     # collect spans that happen inside the workflow body, and send them
     # once in a separate step.
     collector = (
         ai.experimental_telemetry.DictSink()
-        if _turn_input.turn_span is not None
+        if turn_input.turn_span is not None
         else None
     )
     inbox_token = proto.turn_inbox_token(session_id, turn_index)
@@ -505,7 +465,7 @@ async def run_turn(turn_input: dict[str, Any]) -> None:
         model = ai.get_model(MODEL_ID)
         async with (
             ai.experimental_telemetry.use_sink(collector),
-            ai.experimental_telemetry.use_span(_turn_input.turn_span),
+            ai.experimental_telemetry.use_span(turn_input.turn_span),
             ai.util.TaskGroup() as tg,
         ):
             agent.tg = tg
@@ -529,9 +489,7 @@ async def run_turn(turn_input: dict[str, Any]) -> None:
                                 # runner.events(), so the loop never wrote this;
                                 # write it here so the UI
                                 # gets the approval request part.
-                                await write_event(
-                                    session_id, event.model_dump(mode="json")
-                                )
+                                await write_event(session_id, event)
                             elif isinstance(event, ai.events.RunBlocked):
                                 await write_event(
                                     session_id,
@@ -550,7 +508,7 @@ async def run_turn(turn_input: dict[str, Any]) -> None:
                         f"[seal] error in run_turn:\n{traceback.format_exc()}",
                         flush=True,
                     )
-                await notify_agent_finished(inbox_token, result.model_dump(mode="json"))
+                await notify_agent_finished(inbox_token, result)
 
             inbox_queue: asyncio.Queue[proto.TurnInboxHook] = asyncio.Queue()
 
@@ -596,11 +554,11 @@ async def run_turn(turn_input: dict[str, Any]) -> None:
     # deliver the body's collected spans. only complete records ship: a span
     # still open here would dangle in the shipping process's adapter.
     if collector is not None:
-        finished = [s.model_dump(mode="json") for s in collector.finished_spans]
-        if _turn_input.turn_span is not None:
+        finished = list(collector.finished_spans)
+        if turn_input.turn_span is not None:
             # complete the turn span here (pure data ops on workflow time) so
             # it ships with the rest instead of riding the resume step.
-            turn_span = _turn_input.turn_span.stamp_end(
+            turn_span = turn_input.turn_span.stamp_end(
                 error=ai.experimental_telemetry.SpanError(
                     type="TurnError", message=output.error
                 )
@@ -608,16 +566,12 @@ async def run_turn(turn_input: dict[str, Any]) -> None:
                 else None
             )
             turn_span.set_attrs({"session.id": session_id, "turn_index": turn_index})
-            finished.append(turn_span.model_dump(mode="json"))
+            finished.append(turn_span)
         if finished:
             await ship_spans(finished)
 
-    if _turn_input.parent_hook_token is not None:
-        await notify_subagent_finished(
-            _turn_input.parent_hook_token, output.model_dump(mode="json")
-        )
+    if turn_input.parent_hook_token is not None:
+        await notify_subagent_finished(turn_input.parent_hook_token, output)
     else:
         # root turns report back through the session's stable inbox.
-        await notify_turn_finished(
-            session_id, turn_index, output.model_dump(mode="json")
-        )
+        await notify_turn_finished(session_id, turn_index, output)
