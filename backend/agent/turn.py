@@ -2,14 +2,17 @@ import asyncio
 import contextvars
 import dataclasses
 import traceback
-from collections.abc import AsyncGenerator, Sequence
+from collections.abc import (
+    AsyncGenerator,
+    Sequence,
+)
 from typing import Any, ClassVar
 
 import ai
 import pydantic
 import vercel.workflow
 
-from agent import proto, stream, util, workflow
+from agent import ai_util, proto, stream, util, workflow
 
 MODEL_ID = "gateway:openai/gpt-5.6-luna"
 IMAGE_MODEL_ID = "gateway:google/gemini-3.1-flash-image"
@@ -188,11 +191,11 @@ async def spawn_subagent_turn(
     return started.run_id
 
 
-# the running tool call's context, set by the loop around each schedule so a
-# tool can reach it without smuggling args. tasks copy the contextvars at
-# creation, so each tool sees its own call.
-tool_call_context: contextvars.ContextVar[proto.ToolCallContext] = (
-    contextvars.ContextVar("tool_call_context")
+# the agent whose turn is running, set by run_turn so a tool can reach the
+# turn's session/stream/span without smuggling args. tasks copy the
+# contextvars at creation, so every tool task under the run sees it.
+current_agent: contextvars.ContextVar["DurableAgent"] = contextvars.ContextVar(
+    "current_agent"
 )
 
 
@@ -221,12 +224,15 @@ async def subagent(
     prompt: str, name: str | None = None
 ) -> AsyncGenerator[ai.agents.MessageBundle]:
     """Delegate a focused task to a child agent and return its answer."""
-    call = tool_call_context.get()
-    session_id, tool_call_id = call.session_id, call.tool_call_id
+    agent = current_agent.get()
+    session_id = agent.session_id
+    tool_call_id = agent.current_tool_id()
+    assert tool_call_id
+
     name = name or "subagent"
     child_session_id = f"{session_id}:child:{tool_call_id}"
-    token = proto.turn_hook_token(child_session_id)
-    hook = proto.TurnHook.wait(token=token)
+    hook = proto.TurnHook.wait(token=proto.turn_hook_token(child_session_id))
+
     child_run_id = await spawn_subagent_turn(
         proto.TurnInput(
             session_id=child_session_id,
@@ -237,11 +243,11 @@ async def subagent(
             gated=False,
         ),
         # the child turn's root span nests under this turn's root span.
-        call.turn_span,
+        agent.turn_span,
     )
-    assert call.writer is not None
+    assert agent.writer is not None
     await write_event(
-        call.writer,
+        agent.writer,
         stream.subagent_called(
             tool_call_id=tool_call_id,
             child_session_id=child_session_id,
@@ -254,7 +260,7 @@ async def subagent(
     assert resolution is not None
     output = resolution.output
     await write_event(
-        call.writer,
+        agent.writer,
         stream.subagent_completed(
             tool_call_id=tool_call_id, is_error=output.kind == "error"
         ),
@@ -275,8 +281,6 @@ class DurableAgent(ai.Agent):
     # bash is gated/ungated per mode, so it is supplied via tools=, not here.
     TOOLS: ClassVar[list[ai.AgentTool]] = [web_fetch, generate_image]
 
-    tg: asyncio.TaskGroup
-
     def __init__(
         self,
         *,
@@ -289,83 +293,42 @@ class DurableAgent(ai.Agent):
         self.session_id = session_id
         self.writer = writer
         self.turn_span = turn_span
+        self.task_to_id: dict[Any, str] = {}
+
+    def current_tool_id(self) -> str | None:
+        return self.task_to_id.get(asyncio.current_task())
 
     async def loop(self, context: ai.Context) -> AsyncGenerator[ai.events.AgentEvent]:
         session_id = self.session_id
 
         tool_token = f"seal-early-tool:{session_id}"
-        live_tool_calls = {}
-
-        def launch_tool(tool_call: ai.messages.ToolCallPart) -> None:
-            # Launch a tool in a task under the right context, track
-            # it in the live call table.
-            token = tool_call_context.set(
-                proto.ToolCallContext(
-                    session_id=session_id or "",
-                    tool_call_id=tool_call.tool_call_id,
-                    writer=self.writer,
-                    turn_span=self.turn_span,
-                )
-            )
-            live_tool_calls[tool_call.tool_call_id] = self.tg.create_task(
-                context.resolve(tool_call)()
-            )
-            tool_call_context.reset(token)
-
         eager_tool_hook = EagerToolHook.wait(token=tool_token)
 
-        async def watcher() -> None:
-            # Wait on our eager tool hook. For EAGER_TOOLS, trigger
-            # them now, from the watcher thread.
-            #
-            # Once llm_step returns, the tool runner will schedule a
-            # ToolRunner task that waits on them.
-            async for ev in eager_tool_hook:
-                tool_call = ev.payload
-                if tool_call.tool_name in EAGER_TOOLS:
-                    launch_tool(tool_call)
-
-        watcher_task = self.tg.create_task(watcher())
-
         while context.keep_running():
-            live_tool_calls.clear()
+            async with ai_util.SpeculativeToolRunner(
+                eager_tools=EAGER_TOOLS,
+                resolver=context.resolve,
+                tool_stream=(ev.payload async for ev in eager_tool_hook),
+            ) as runner:
+                # Make the task->id mapping visible so tools can get their id easily
+                self.task_to_id = runner.task_to_id
 
-            assistant_message = await llm_step(
-                context,
-                self.writer,
-                tool_token,
-                self.turn_span,
-            )
-            context.add(assistant_message)
-            # llm_step streamed this turn out-of-band (straight to the durable
-            # stream), so yield the final StreamEnd here for run-blocked
-            # tracking, which counts the turn's tool calls from it.
-            yield ai.events.StreamEnd(message=assistant_message)
+                assistant_message = await llm_step(
+                    context,
+                    self.writer,
+                    tool_token,
+                    self.turn_span,
+                )
+                context.add(assistant_message)
+                # llm_step streamed this turn out-of-band (straight to the durable
+                # stream), so yield the final StreamEnd here for run-blocked
+                # tracking, which counts the turn's tool calls from it.
+                yield ai.events.StreamEnd(message=assistant_message)
 
-            async with ai.ToolRunner() as runner:
-                # Cancel eager tool calls that are not legit -- that
-                # is, ones that are from a retried llm call. They
-                # won't actually get stopped if they are steps, unless
-                # the cancellation happens before the step was
-                # launched, but it will stop us from waiting on them.
-                legit_call_ids = {
-                    tc.tool_call_id for tc in assistant_message.tool_calls
-                }
-                for id, task in list(live_tool_calls.items()):
-                    if id not in legit_call_ids:
-                        task.cancel()
-                        del live_tool_calls[id]
-
-                for tool_call in assistant_message.tool_calls:
-                    # Launch the tool if it isn't running already
-                    if tool_call.tool_call_id not in live_tool_calls:
-                        launch_tool(tool_call)
-
-                    # Wait on it
-                    async def _wait(tc: ai.messages.ToolCallPart = tool_call) -> Any:
-                        return await live_tool_calls[tc.tool_call_id]
-
-                    runner.schedule(_wait)
+                tool_calls = context.resolve(assistant_message.tool_calls)
+                runner.discard_except(tool_calls)
+                for tool_call in tool_calls:
+                    runner.schedule(tool_call)
 
                 async for event in runner.events():
                     # write tool-running events from the producer side so they land
@@ -377,7 +340,6 @@ class DurableAgent(ai.Agent):
 
                 context.add(runner.get_tool_message())
 
-        watcher_task.cancel()
         eager_tool_hook.dispose()
 
 
@@ -432,6 +394,8 @@ async def run_turn(
         writer=writer,
         turn_span=turn_input.turn_span,
     )
+    # tool tasks are created under this run's context and inherit this.
+    current_agent.set(agent)
 
     async def mediate(approval_event: Any, hook_id: str) -> None:
         # bridge a durable ApprovalHook back into the ai-library approval hook so
@@ -461,8 +425,6 @@ async def run_turn(
             agent.run(model, messages) as run,
             ai.util.TaskGroup() as tg,
         ):
-            agent.tg = tg
-
             async for event in run:
                 if (
                     isinstance(event, ai.events.HookEvent)
