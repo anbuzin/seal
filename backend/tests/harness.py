@@ -50,7 +50,7 @@ class InProcessWorld(wf_local.LocalWorld):
         # comparing), but should reduce churn when using
         # UPDATE_FIXTURES=1.
         self._ulid = itertools.count()
-        self.monotonic_ulid = self._det_ulid
+        self.monotonic_ulid = self._det_ulid  # type: ignore[assignment]
         # One seeded rng shared by every step body (see `_deliver`). Fresh per
         # world, so each test draws the same sequence.
         self._step_rng = random.Random("seal-test-step-ids")
