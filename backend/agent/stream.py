@@ -37,12 +37,6 @@ def turn_started(*, turn_index: int) -> proto.LifecycleEvent:
     )
 
 
-def turn_completed(*, turn_index: int, kind: str) -> proto.LifecycleEvent:
-    return proto.LifecycleEvent(
-        type=proto.TURN_COMPLETED, data={"turn_index": turn_index, "kind": kind}
-    )
-
-
 def subagent_called(
     *, tool_call_id: str, child_session_id: str, name: str
 ) -> proto.LifecycleEvent:

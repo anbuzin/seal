@@ -55,7 +55,6 @@ async def test_completed_run_is_not_resumable() -> None:
         stream.session_started(),
         stream.turn_started(turn_index=0),
         *_text_events("hi"),
-        stream.turn_completed(turn_index=0, kind="suspend"),
         stream.session_waiting(turn_index=0),
     )
     assert await chat.active_run_start_index("s1") is None
@@ -67,12 +66,11 @@ async def test_in_flight_run_resumes_from_its_opener() -> None:
         stream.session_started(),  # 0
         stream.turn_started(turn_index=0),  # 1
         *_text_events("hi"),  # 2-6
-        stream.turn_completed(turn_index=0, kind="suspend"),  # 7
-        stream.session_waiting(turn_index=0),  # 8
-        stream.turn_started(turn_index=1),  # 9 ← in-flight run opens here
-        events_.StreamStart(),  # 10
+        stream.session_waiting(turn_index=0),  # 7
+        stream.turn_started(turn_index=1),  # 8 ← in-flight run opens here
+        events_.StreamStart(),  # 9
     )
-    assert await chat.active_run_start_index("s1") == 9
+    assert await chat.active_run_start_index("s1") == 8
 
 
 async def test_multi_turn_run_resumes_from_run_start_not_inner_turn() -> None:
@@ -83,13 +81,12 @@ async def test_multi_turn_run_resumes_from_run_start_not_inner_turn() -> None:
         stream.session_started(),  # 0 ← run opens here
         stream.turn_started(turn_index=0),  # 1
         *_text_events("delegating"),  # 2-6
-        stream.turn_completed(turn_index=0, kind="suspend"),  # 7
         stream.subagent_called(
             tool_call_id="tc-1", child_session_id="s1:child:tc-1", name="helper"
-        ),  # 8
-        stream.subagent_completed(tool_call_id="tc-1", is_error=False),  # 9
-        stream.turn_started(turn_index=1),  # 10 (inner turn, same run)
-        events_.StreamStart(),  # 11
+        ),  # 7
+        stream.subagent_completed(tool_call_id="tc-1", is_error=False),  # 8
+        stream.turn_started(turn_index=1),  # 9 (inner turn, same run)
+        events_.StreamStart(),  # 10
     )
     assert await chat.active_run_start_index("s1") == 0
 
@@ -167,7 +164,6 @@ async def test_to_sse_streams_one_turn_and_terminates_at_waiting() -> None:
         stream.session_started(),
         stream.turn_started(turn_index=0),
         *_text_events("hello world"),
-        stream.turn_completed(turn_index=0, kind="suspend"),
         stream.session_waiting(turn_index=0),
     )
     lines = await _collect_sse("s1")
@@ -273,7 +269,6 @@ async def test_to_sse_replays_reload_marker() -> None:
         stream.turn_started(turn_index=0),
         stream.reload_requested(),
         *_text_events("done"),
-        stream.turn_completed(turn_index=0, kind="suspend"),
         stream.session_waiting(turn_index=0),
     )
     lines = await _collect_sse("s1")
@@ -311,7 +306,6 @@ async def test_to_sse_interleaves_live_subagent_progress() -> None:
         events_.StreamEnd(
             message=ai.messages.Message(role="assistant", parts=[parent_call])
         ),
-        stream.turn_completed(turn_index=0, kind="suspend"),
         stream.subagent_called(
             tool_call_id="tc-1", child_session_id=child_id, name="helper"
         ),
@@ -335,7 +329,6 @@ async def test_to_sse_interleaves_live_subagent_progress() -> None:
         stream.subagent_completed(tool_call_id="tc-1", is_error=False),
         stream.turn_started(turn_index=1),
         *_text_events("all done"),
-        stream.turn_completed(turn_index=1, kind="suspend"),
         stream.session_waiting(turn_index=1),
     )
 

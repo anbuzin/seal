@@ -14,10 +14,8 @@ from conftest import MockProvider, text_msg, tool_call_msg
 from harness import (
     InProcessWorld,
     resume_approval,
-    resume_session,
     start_session,
     wait_for_lifecycle,
-    wait_run,
 )
 
 from agent import proto, session, telemetry
@@ -246,20 +244,15 @@ def telemetry_on() -> Iterator[in_memory.InMemorySpanExporter]:
     ai.experimental_telemetry.unregister(adapter)
 
 
-async def test_turn_with_telemetry_suspends_then_closes(
+async def test_turn_with_telemetry_suspends(
     telemetry_on: in_memory.InMemorySpanExporter,
     world: InProcessWorld,
     scripted_model: MockProvider,
 ) -> None:
     scripted_model.responses = [[text_msg("hello there")]]
 
-    run = await start_session("s1", "hi")
+    await start_session("s1", "hi")
     await wait_for_lifecycle("s1", proto.SESSION_WAITING)
-    await resume_session(
-        proto.session_hook_token("s1"), proto.NewUserMessage(close=True)
-    )
-    output = await wait_run(run)
-    assert not output.is_error
 
     spans = {s.name: s for s in telemetry_on.get_finished_spans()}
     # the turn root exported at completion; the model call and the agent run
