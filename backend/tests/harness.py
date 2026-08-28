@@ -116,9 +116,7 @@ class InProcessWorld(wf_local.LocalWorld):
             self.errors.append(error)
 
 
-async def start_session(
-    session_id: str, prompt: str
-) -> vercel.workflow.Run[proto.SessionOutput]:
+async def start_session(session_id: str, prompt: str) -> vercel.workflow.Run[None]:
     return await vercel.workflow.start(
         driver.run_session,
         proto.SessionInput(session_id=session_id, prompt=prompt),
@@ -163,6 +161,17 @@ async def _resume_hook(token: str, hook: vercel.workflow.BaseHook) -> None:
             if attempt == 99:
                 raise
             await asyncio.sleep(0.05)
+
+
+async def wait_for_hook(token: str) -> vercel.workflow.Hook:
+    for attempt in range(100):
+        try:
+            return await vercel.workflow.get_hook_by_token(token)
+        except vercel.workflow.HookNotFoundError:
+            if attempt == 99:
+                raise
+            await asyncio.sleep(0.05)
+    raise AssertionError("unreachable")
 
 
 async def wait_run[T](run: vercel.workflow.Run[T], timeout: float = 20) -> T:

@@ -15,7 +15,6 @@ import os
 
 import ai
 import pytest
-import vercel.workflow
 from conftest import MockProvider, assert_message_invariants, text_msg, tool_call_msg
 from harness import (
     InProcessWorld,
@@ -33,21 +32,21 @@ from harness import (
     start_session as _start,
 )
 from harness import (
-    wait_for_lifecycle as _wait_for_lifecycle,
+    wait_for_hook as _wait_for_hook,
 )
 from harness import (
-    wait_run as _wait_run,
+    wait_for_lifecycle as _wait_for_lifecycle,
 )
 
-from agent import proto, session, storage
+from agent import proto, session
 
 
-async def test_single_turn_suspends_then_closes(
+async def test_single_turn_suspends(
     world: InProcessWorld, scripted_model: MockProvider
 ) -> None:
     scripted_model.responses = [[text_msg("hello there")]]
 
-    run = await _start("s1", "hi")
+    await _start("s1", "hi")
     await _wait_for_lifecycle("s1", proto.SESSION_WAITING)
 
     state = await session.read_session("s1")
@@ -56,20 +55,30 @@ async def test_single_turn_suspends_then_closes(
     assert state.messages[-1].text == "hello there"
     assert_message_invariants(state.messages)
 
-    await _resume(proto.session_hook_token("s1"), proto.NewUserMessage(close=True))
-    output = await _wait_run(run)
-    assert output.output == "hello there"
-    assert not output.is_error
 
-    assert await _lifecycle("s1") == [
-        proto.SESSION_STARTED,
-        proto.TURN_STARTED,
-        proto.TURN_COMPLETED,
-        proto.SESSION_WAITING,
-        proto.SESSION_COMPLETED,
+async def test_failed_turn_parks_and_accepts_another_message(
+    world: InProcessWorld, scripted_model: MockProvider
+) -> None:
+    scripted_model.responses = []
+
+    run = await _start("s1", "fail")
+    await _wait_for_lifecycle("s1", proto.SESSION_WAITING)
+    assert await run.status() not in ("completed", "failed", "cancelled")
+
+    scripted_model.responses = [[text_msg("recovered")]]
+    await _resume(proto.session_hook_token("s1"), proto.NewUserMessage(prompt="retry"))
+    await _wait_for_lifecycle("s1", proto.SESSION_WAITING, count=2)
+
+    state = await session.read_session("s1")
+    assert state is not None
+    assert [m.role for m in state.messages] == [
+        "system",
+        "user",
+        "user",
+        "assistant",
     ]
-    _, closed = await storage.store().info("s1", "default")
-    assert closed
+    assert state.messages[-1].text == "recovered"
+    assert_message_invariants(state.messages)
 
 
 async def test_resume_appends_user_message_without_duplicating_history(
@@ -79,19 +88,15 @@ async def test_resume_appends_user_message_without_duplicating_history(
 
     run = await _start("s1", "one")
     await _wait_for_lifecycle("s1", proto.SESSION_WAITING)
-    first_hook = await vercel.workflow.get_hook_by_token(proto.turn_hook_token("s1"))
-    first_session_hook = await vercel.workflow.get_hook_by_token(
-        proto.session_hook_token("s1")
-    )
+    first_hook = await _wait_for_hook(proto.turn_hook_token("s1"))
+    first_session_hook = await _wait_for_hook(proto.session_hook_token("s1"))
     assert first_hook.run_id == run.run_id
     assert first_session_hook.run_id == run.run_id
 
     await _resume(proto.session_hook_token("s1"), proto.NewUserMessage(prompt="two"))
     await _wait_for_lifecycle("s1", proto.SESSION_WAITING, count=2)
-    second_hook = await vercel.workflow.get_hook_by_token(proto.turn_hook_token("s1"))
-    second_session_hook = await vercel.workflow.get_hook_by_token(
-        proto.session_hook_token("s1")
-    )
+    second_hook = await _wait_for_hook(proto.turn_hook_token("s1"))
+    second_session_hook = await _wait_for_hook(proto.session_hook_token("s1"))
     assert second_hook.hook_id == first_hook.hook_id
     assert second_session_hook.hook_id == first_session_hook.hook_id
 
@@ -159,7 +164,6 @@ async def test_gated_tool_approval_runs_in_one_turn(
         proto.SESSION_STARTED,
         proto.TURN_STARTED,
         proto.TOOL_APPROVAL_REQUESTED,
-        proto.TURN_COMPLETED,
         proto.SESSION_WAITING,
     ]
 
@@ -256,7 +260,6 @@ async def test_subagent_result_lands_on_the_trailing_tool_message(
         proto.TURN_STARTED,
         proto.SUBAGENT_CALLED,
         proto.SUBAGENT_COMPLETED,
-        proto.TURN_COMPLETED,
         proto.SESSION_WAITING,
     ]
     # the child ran as a single turn on its own stream (no session wrapper)

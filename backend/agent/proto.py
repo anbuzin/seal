@@ -39,19 +39,12 @@ class SessionInput(pydantic.BaseModel):
     prompt: str
 
 
-class SessionOutput(pydantic.BaseModel):
-    session_id: str
-    output: str
-    is_error: bool = False
-
-
 class NewUserMessage(pydantic.BaseModel):
     kind: Literal["new_user_message"] = "new_user_message"
-    prompt: str | None = None
-    close: bool = False
+    prompt: str
 
 
-# carries the next user message (or a close) to a session parked in ``suspend``.
+# carries the next user message to a parked session.
 class SessionHook(pydantic.BaseModel, vercel.workflow.BaseHook):
     payload: NewUserMessage
 
@@ -107,7 +100,6 @@ SESSION_WAITING = "session.waiting"
 SESSION_COMPLETED = "session.completed"
 SESSION_FAILED = "session.failed"
 TURN_STARTED = "turn.started"
-TURN_COMPLETED = "turn.completed"
 SUBAGENT_CALLED = "subagent.called"
 SUBAGENT_COMPLETED = "subagent.completed"
 TOOL_APPROVAL_REQUESTED = "tool_approval.requested"

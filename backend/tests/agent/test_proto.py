@@ -34,7 +34,7 @@ def _hook_event() -> events_.HookEvent:
 
 def test_hook_payloads_round_trip() -> None:
     """Each hook's payload survives the resume serialize -> validate round trip."""
-    message = proto.NewUserMessage(prompt="hi", close=False)
+    message = proto.NewUserMessage(prompt="hi")
     restored = proto.NewUserMessage.model_validate(message.model_dump(mode="json"))
     assert restored == message
 

@@ -35,19 +35,12 @@ async def save_session(state: proto.SessionState) -> None:
     await session.write_session(state)
 
 
-def _last_text(messages: list[ai.messages.Message]) -> str:
-    for message in reversed(messages):
-        if message.role == "assistant" and message.text:
-            return message.text
-    return ""
-
-
 @workflow.workflow
 # Draw message/part ids from the workflow's deterministic RNG so they're
 # stable across replay.
 @ai.messages.use_random(vercel.workflow.random)
 @ai.experimental_telemetry.use_time(vercel.workflow.time_ns)
-async def run_session(session_input: proto.SessionInput) -> proto.SessionOutput:
+async def run_session(session_input: proto.SessionInput) -> None:
     # prepare the session
     session_id = session_input.session_id
 
@@ -85,40 +78,15 @@ async def run_session(session_input: proto.SessionInput) -> proto.SessionOutput:
         # process turn results
         state.messages = turn_result.messages
         await save_session(state)
+
+        # A failed turn should not destroy the session. Park for another user
+        # message just like a successful turn.
         await turn.write_event(
-            session_id,
-            stream.turn_completed(turn_index=turn_index, kind=turn_result.kind),
+            session_id, stream.session_waiting(turn_index=turn_index)
         )
-
-        match turn_result.kind:
-            case "suspend":
-                # we are currently in the main session. wait for the next user message.
-                await turn.write_event(
-                    session_id, stream.session_waiting(turn_index=turn_index)
-                )
-                resolution = await session_hook
-                message = resolution.payload if resolution is not None else None
-
-                if not isinstance(message, proto.NewUserMessage) or message.close:
-                    await turn.write_event(session_id, stream.session_completed())
-                    await turn.close_stream(session_id)
-                    return proto.SessionOutput(
-                        session_id=session_id,
-                        output=_last_text(state.messages),
-                    )
-
-                state.messages.append(ai.user_message(message.prompt or ""))
-
-            case "error":
-                await turn.write_event(
-                    session_id, stream.session_completed(is_error=True)
-                )
-                await turn.close_stream(session_id)
-                return proto.SessionOutput(
-                    session_id=session_id,
-                    output=turn_result.error or _last_text(state.messages),
-                    is_error=True,
-                )
+        resolution = await session_hook
+        assert resolution is not None
+        state.messages.append(ai.user_message(resolution.payload.prompt))
 
         # persist post-turn mutations (resume prompt / subagent results) so the
         # next turn resumes from the latest state after a crash.
