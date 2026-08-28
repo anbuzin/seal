@@ -214,7 +214,7 @@ async def subagent(prompt: str, name: str | None = None) -> ai.agents.MessageBun
     session_id, tool_call_id = call.session_id, call.tool_call_id
     name = name or "subagent"
     child_session_id = f"{session_id}:child:{tool_call_id}"
-    token = f"seal-turn:{child_session_id}:0"
+    token = proto.turn_hook_token(child_session_id)
     await write_event(
         session_id,
         stream.subagent_called(
@@ -230,7 +230,6 @@ async def subagent(prompt: str, name: str | None = None) -> ai.agents.MessageBun
                 ai.user_message(prompt),
             ],
             gated=False,
-            turn_hook_token=token,
         ),
         # the child turn's root span nests under this turn's root span.
         call.turn_span,
@@ -484,7 +483,7 @@ async def run_turn(turn_input: proto.TurnInput) -> None:
                     # waiting on a human.
                     await write_event(
                         session_id,
-                        stream.tool_approval_requested(turn_index=turn_index),
+                        stream.tool_approval_requested(),
                     )
 
             messages = run.messages
@@ -522,4 +521,4 @@ async def run_turn(turn_input: proto.TurnInput) -> None:
             await ship_spans(finished)
 
     # notify session that the turn is complete.
-    await resume_turn_hook(turn_input.turn_hook_token, output)
+    await resume_turn_hook(proto.turn_hook_token(session_id), output)

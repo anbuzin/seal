@@ -85,9 +85,8 @@ async def start_or_resume(session_id: str, prompt: str) -> int:
             proto.SessionInput(session_id=session_id, prompt=prompt),
         )
     else:
-        turn_index = await _waiting_turn_index(session_id)
         await _resume(
-            f"seal-session:{session_id}:{turn_index}",
+            proto.session_hook_token(session_id),
             proto.SessionHook(payload=proto.NewUserMessage(prompt=prompt)),
         )
     return start_index
@@ -274,19 +273,3 @@ async def _resume(token: str, hook: vercel.workflow.BaseHook) -> None:
             if attempt == 39:
                 raise
             await asyncio.sleep(0.05)
-
-
-async def _waiting_turn_index(session_id: str) -> int:
-    """The turn the session is currently parked on (latest ``session.waiting``).
-
-    Falls back to the latest ``tool_approval.requested`` turn, since a turn parked
-    on a gated tool emits that rather than ``session.waiting``.
-    """
-    turn_index = 0
-    async for event in stream.replay(session_id):
-        if isinstance(event, proto.LifecycleEvent) and event.type in (
-            proto.SESSION_WAITING,
-            proto.TOOL_APPROVAL_REQUESTED,
-        ):
-            turn_index = int(event.data.get("turn_index", turn_index))
-    return turn_index
