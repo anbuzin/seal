@@ -24,7 +24,7 @@ from harness import (
     lifecycle as _lifecycle,
 )
 from harness import (
-    resume_approval as _resume_approval,
+    resume_approvals as _resume_approvals,
 )
 from harness import (
     resume_session as _resume,
@@ -137,8 +137,13 @@ async def test_gated_tool_approval_runs_in_one_turn(
     await _wait_for_lifecycle("s1", proto.TOOL_APPROVAL_REQUESTED)
     assert scripted_model.call_count == 1
 
-    await _resume_approval(
-        "s1", proto.ToolApprovalResponse(tool_call_id="tc-1", granted=True)
+    await _resume_approvals(
+        "s1",
+        [
+            proto.ToolApprovalResponse(
+                hook_id="approve_tc-1", tool_call_id="tc-1", granted=True
+            )
+        ],
     )
     await _wait_for_lifecycle("s1", proto.SESSION_WAITING)
 
@@ -199,11 +204,16 @@ async def test_parallel_gated_tools_park_then_run(
     await _wait_for_lifecycle("s2", proto.TOOL_APPROVAL_REQUESTED)
     assert scripted_model.call_count == 1
 
-    await _resume_approval(
-        "s2", proto.ToolApprovalResponse(tool_call_id="tc-a", granted=True)
-    )
-    await _resume_approval(
-        "s2", proto.ToolApprovalResponse(tool_call_id="tc-b", granted=True)
+    await _resume_approvals(
+        "s2",
+        [
+            proto.ToolApprovalResponse(
+                hook_id="approve_tc-a", tool_call_id="tc-a", granted=True
+            ),
+            proto.ToolApprovalResponse(
+                hook_id="approve_tc-b", tool_call_id="tc-b", granted=True
+            ),
+        ],
     )
     await _wait_for_lifecycle("s2", proto.SESSION_WAITING)
 
