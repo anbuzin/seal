@@ -33,7 +33,7 @@ import ai.ui.ai_sdk.outbound_stream as outbound_stream
 import ai.ui.ai_sdk.ui_events as ui_events
 import vercel.workflow
 
-from agent import driver, proto, stream
+from agent import driver, proto, stream, util
 
 _TERMINAL = {proto.SESSION_WAITING, proto.SESSION_COMPLETED, proto.SESSION_FAILED}
 
@@ -88,11 +88,9 @@ async def start_or_resume(session_id: str, prompt: str) -> int:
             driver.run_session,
             proto.SessionInput(session_id=session_id, prompt=prompt),
         )
-        for attempt in range(40):
+        async for _ in util.hook_retries():
             if await stream.session_run_id(session_id) is not None:
                 return 0
-            if attempt < 39:
-                await asyncio.sleep(0.05)
         raise RuntimeError(
             f"session workflow did not register its turn hook: {session_id}"
         )
@@ -282,11 +280,10 @@ def _upsert(messages: list[ai.messages.Message], message: ai.messages.Message) -
 
 async def _resume(token: str, hook: vercel.workflow.BaseHook) -> None:
     """Resolve a workflow hook, retrying while the driver registers it."""
-    for attempt in range(40):
+    async for last_attempt in util.hook_retries():
         try:
             await hook.resume(token)
             return
         except vercel.workflow.HookNotFoundError:
-            if attempt == 39:
+            if last_attempt:
                 raise
-            await asyncio.sleep(0.05)

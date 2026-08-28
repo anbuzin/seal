@@ -26,7 +26,7 @@ import vercel.workflow._internal.runtime as wf_runtime  # noqa: E402
 import vercel.workflow._internal.worlds.local as wf_local  # noqa: E402
 
 import agent.driver as driver  # noqa: E402
-from agent import proto, stream  # noqa: E402
+from agent import proto, stream, util  # noqa: E402
 
 
 class InProcessWorld(wf_local.LocalWorld):
@@ -126,10 +126,9 @@ async def start_session(session_id: str, prompt: str) -> vercel.workflow.Run[Non
         driver.run_session,
         proto.SessionInput(session_id=session_id, prompt=prompt),
     )
-    for _ in range(100):
+    async for _ in util.hook_retries(retry_count=100):
         if await stream.session_run_id(session_id) is not None:
             return run
-        await asyncio.sleep(0.05)
     raise RuntimeError(f"session workflow did not register its turn hook: {session_id}")
 
 
@@ -173,24 +172,22 @@ async def resume_approval(
 
 
 async def _resume_hook(token: str, hook: vercel.workflow.BaseHook) -> None:
-    for attempt in range(100):
+    async for last_attempt in util.hook_retries(retry_count=100):
         try:
             await hook.resume(token)
             return
         except vercel.workflow.HookNotFoundError:
-            if attempt == 99:
+            if last_attempt:
                 raise
-            await asyncio.sleep(0.05)
 
 
 async def wait_for_hook(token: str) -> vercel.workflow.Hook:
-    for attempt in range(100):
+    async for last_attempt in util.hook_retries(retry_count=100):
         try:
             return await vercel.workflow.get_hook_by_token(token)
         except vercel.workflow.HookNotFoundError:
-            if attempt == 99:
+            if last_attempt:
                 raise
-            await asyncio.sleep(0.05)
     raise AssertionError("unreachable")
 
 

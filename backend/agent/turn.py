@@ -399,14 +399,13 @@ async def resume_turn_hook(token: str, output: proto.TurnOutput) -> None:
     # resume() is a side effect, so it must run in a step. the driver may not
     # have parked on the hook yet, so retry while it is missing.
     hook = proto.TurnHook(output=output)
-    for attempt in range(40):
+    async for last_attempt in util.hook_retries():
         try:
             await hook.resume(token)
             return
         except vercel.workflow.HookNotFoundError:
-            if attempt == 39:
+            if last_attempt:
                 raise
-            await asyncio.sleep(0.05)
 
 
 # runs one agent turn, parking on a durable hook per gated tool call
