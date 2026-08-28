@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 from typing import Any, Literal
 
 import ai
@@ -75,10 +76,14 @@ class TurnInput(pydantic.BaseModel):
 
 
 # in-process context of the running tool call, set by the agent loop around
-# each schedule so a tool can reach it without smuggling args. never journaled.
-class ToolCallContext(pydantic.BaseModel):
+# each schedule so a tool can reach it without smuggling args. never journaled
+# (and never serialized, hence a plain dataclass rather than a model).
+@dataclasses.dataclass
+class ToolCallContext:
     session_id: str
     tool_call_id: str
+    # the session event stream of the enclosing turn.
+    writer: vercel.workflow.WorkflowWritable | None = None
     # the enclosing turn's root span; a spawned child turn nests under it.
     turn_span: ai.experimental_telemetry.Span | None = None
 

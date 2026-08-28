@@ -8,13 +8,14 @@ loop internally (``run_workflow`` runs the body under ``asyncio.run``), so the
 ``loop._ready`` check stays sound without the harness managing loops itself.
 Dispatching on one shared loop also keeps cross-delivery ordering deterministic
 (cooperative FIFO), so e.g. two parallel subagents don't race. Everything else
-is real — replay, suspensions, workflow hooks, the jsonl store, the bash
+is real — replay, suspensions, workflow hooks, run streams, the bash
 subprocess.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import itertools
 import random
 from typing import Any
@@ -25,7 +26,7 @@ import vercel.workflow._internal.runtime as wf_runtime  # noqa: E402
 import vercel.workflow._internal.worlds.local as wf_local  # noqa: E402
 
 import agent.driver as driver  # noqa: E402
-from agent import proto, stream  # noqa: E402
+from agent import proto, stream, util  # noqa: E402
 
 
 class InProcessWorld(wf_local.LocalWorld):
@@ -71,9 +72,13 @@ class InProcessWorld(wf_local.LocalWorld):
     ) -> str:
         # Fire-and-forget, like send_async to the queue service: schedule the
         # delivery as a task and return the message id without awaiting it.
+        # A fresh contextvars context, because a real delivery is a fresh
+        # request: create_task would otherwise copy the enqueuing step's
+        # context (e.g. its stream-writer state) into the handler.
         message_id = f"msg_{next(self._ids)}"
         task = asyncio.create_task(
-            self._deliver(queue_name, message, delay_seconds or 0, message_id)
+            self._deliver(queue_name, message, delay_seconds or 0, message_id),
+            context=contextvars.Context(),
         )
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
@@ -117,10 +122,22 @@ class InProcessWorld(wf_local.LocalWorld):
 
 
 async def start_session(session_id: str, prompt: str) -> vercel.workflow.Run[None]:
-    return await vercel.workflow.start(
+    run = await vercel.workflow.start(
         driver.run_session,
         proto.SessionInput(session_id=session_id, prompt=prompt),
     )
+    async for _ in util.hook_retries(retry_count=100):
+        if await stream.session_run_id(session_id) is not None:
+            return run
+    raise RuntimeError(f"session workflow did not register its turn hook: {session_id}")
+
+
+async def read_state(session_id: str) -> proto.SessionState | None:
+    """The latest session snapshot, resolved through its stable turn hook."""
+    run_id = await stream.session_run_id(session_id)
+    if run_id is None:
+        return None
+    return await stream.read_session(run_id)
 
 
 async def wait_for_lifecycle(
@@ -128,12 +145,14 @@ async def wait_for_lifecycle(
 ) -> None:
     async def watch() -> None:
         while True:
-            seen = 0
-            async for event in stream.replay(session_id):
-                if isinstance(event, proto.LifecycleEvent) and event.type == type_:
-                    seen += 1
-                    if seen >= count:
-                        return
+            run_id = await stream.session_run_id(session_id)
+            if run_id is not None:
+                seen = 0
+                async for event in stream.replay(run_id):
+                    if isinstance(event, proto.LifecycleEvent) and event.type == type_:
+                        seen += 1
+                        if seen >= count:
+                            return
             await asyncio.sleep(0.02)
 
     await asyncio.wait_for(watch(), timeout)
@@ -153,24 +172,22 @@ async def resume_approval(
 
 
 async def _resume_hook(token: str, hook: vercel.workflow.BaseHook) -> None:
-    for attempt in range(100):
+    async for last_attempt in util.hook_retries(retry_count=100):
         try:
             await hook.resume(token)
             return
         except vercel.workflow.HookNotFoundError:
-            if attempt == 99:
+            if last_attempt:
                 raise
-            await asyncio.sleep(0.05)
 
 
 async def wait_for_hook(token: str) -> vercel.workflow.Hook:
-    for attempt in range(100):
+    async for last_attempt in util.hook_retries(retry_count=100):
         try:
             return await vercel.workflow.get_hook_by_token(token)
         except vercel.workflow.HookNotFoundError:
-            if attempt == 99:
+            if last_attempt:
                 raise
-            await asyncio.sleep(0.05)
     raise AssertionError("unreachable")
 
 
@@ -184,8 +201,12 @@ async def wait_run[T](run: vercel.workflow.Run[T], timeout: float = 20) -> T:
 
 
 async def lifecycle(session_id: str) -> list[str]:
+    # a completed child has already lost its hook and no longer advertises a run.
+    run_id = await stream.session_run_id(session_id)
+    if run_id is None:
+        return []
     return [
         event.type
-        async for event in stream.replay(session_id)
+        async for event in stream.replay(run_id)
         if isinstance(event, proto.LifecycleEvent)
     ]

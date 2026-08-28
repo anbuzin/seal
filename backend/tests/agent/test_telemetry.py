@@ -13,12 +13,13 @@ import pytest
 from conftest import MockProvider, text_msg, tool_call_msg
 from harness import (
     InProcessWorld,
+    read_state,
     resume_approval,
     start_session,
     wait_for_lifecycle,
 )
 
-from agent import proto, session, telemetry
+from agent import proto, telemetry
 
 
 def test_install_is_noop_without_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -300,7 +301,7 @@ async def test_gated_tool_approval_with_telemetry(
     )
     await wait_for_lifecycle("s1", proto.SESSION_WAITING)
 
-    state = await session.read_session("s1")
+    state = await read_state("s1")
     assert state is not None
     [tool_message] = [m for m in state.messages if m.role == "tool"]
     [result] = tool_message.tool_results

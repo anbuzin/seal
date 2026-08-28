@@ -18,6 +18,7 @@ import pytest
 from conftest import MockProvider, assert_message_invariants, text_msg, tool_call_msg
 from harness import (
     InProcessWorld,
+    read_state,
 )
 from harness import (
     lifecycle as _lifecycle,
@@ -38,7 +39,7 @@ from harness import (
     wait_for_lifecycle as _wait_for_lifecycle,
 )
 
-from agent import proto, session
+from agent import proto
 
 
 async def test_single_turn_suspends(
@@ -49,7 +50,7 @@ async def test_single_turn_suspends(
     await _start("s1", "hi")
     await _wait_for_lifecycle("s1", proto.SESSION_WAITING)
 
-    state = await session.read_session("s1")
+    state = await read_state("s1")
     assert state is not None
     assert [m.role for m in state.messages] == ["system", "user", "assistant"]
     assert state.messages[-1].text == "hello there"
@@ -69,7 +70,7 @@ async def test_failed_turn_parks_and_accepts_another_message(
     await _resume(proto.session_hook_token("s1"), proto.NewUserMessage(prompt="retry"))
     await _wait_for_lifecycle("s1", proto.SESSION_WAITING, count=2)
 
-    state = await session.read_session("s1")
+    state = await read_state("s1")
     assert state is not None
     assert [m.role for m in state.messages] == [
         "system",
@@ -100,7 +101,7 @@ async def test_resume_appends_user_message_without_duplicating_history(
     assert second_hook.hook_id == first_hook.hook_id
     assert second_session_hook.hook_id == first_session_hook.hook_id
 
-    state = await session.read_session("s1")
+    state = await read_state("s1")
     assert state is not None
     assert [m.role for m in state.messages] == [
         "system",
@@ -141,7 +142,7 @@ async def test_gated_tool_approval_runs_in_one_turn(
     )
     await _wait_for_lifecycle("s1", proto.SESSION_WAITING)
 
-    state = await session.read_session("s1")
+    state = await read_state("s1")
     assert state is not None
     assert [m.role for m in state.messages] == [
         "system",
@@ -206,7 +207,7 @@ async def test_parallel_gated_tools_park_then_run(
     )
     await _wait_for_lifecycle("s2", proto.SESSION_WAITING)
 
-    state = await session.read_session("s2")
+    state = await read_state("s2")
     assert state is not None
     [tool_message] = [m for m in state.messages if m.role == "tool"]
     results = {r.tool_call_id: r.result for r in tool_message.tool_results}
@@ -235,7 +236,7 @@ async def test_subagent_result_lands_on_the_trailing_tool_message(
     await _start("s1", "delegate")
     await _wait_for_lifecycle("s1", proto.SESSION_WAITING)
 
-    state = await session.read_session("s1")
+    state = await read_state("s1")
     assert state is not None
     assert [m.role for m in state.messages] == [
         "system",
@@ -296,7 +297,7 @@ async def test_generate_image_returns_multipart_result(
     await _start("s1", "draw a cat")
     await _wait_for_lifecycle("s1", proto.SESSION_WAITING)
 
-    state = await session.read_session("s1")
+    state = await read_state("s1")
     assert state is not None
     assert_message_invariants(state.messages)
     assert state.messages[-1].text == "done drawing"
@@ -371,7 +372,7 @@ async def test_parallel_subagents_land_deterministically(
     await _start(session_id, "delegate both")
     await _wait_for_lifecycle(session_id, proto.SESSION_WAITING)
 
-    state = await session.read_session(session_id)
+    state = await read_state(session_id)
     assert state is not None
     assert [m.role for m in state.messages] == [
         "system",

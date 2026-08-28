@@ -36,19 +36,18 @@ async def llm_step(
     model_id: str,
     messages: list[ai.messages.Message],
     tools: list[ai.Tool],
-    session_id: str | None,
+    writer: vercel.workflow.WorkflowWritable | None,
     tool_token: str | None = None,
     turn_span: ai.experimental_telemetry.Span | None = None,
 ) -> ai.messages.Message:
     model = ai.get_model(model_id)
 
-    writer = await stream.get_writable(session_id) if session_id else None
     metadata = vercel.workflow.get_step_metadata()
 
     # On a retry, emit a message requesting a reload. The will trigger
     # the client to drop everything from the last step.
     if writer is not None and metadata.attempt > 1:
-        await writer.write(stream.reload_requested())
+        await writer.write(stream.dump_event(stream.reload_requested()))
 
     # parent this step's spans under the turn's span
     async with (
@@ -60,7 +59,7 @@ async def llm_step(
                 continue
 
             if writer is not None:
-                await writer.write(e)
+                await writer.write(stream.dump_event(e))
             if tool_token and isinstance(e, ai.types.events.ToolEnd):
                 await EagerToolHook(payload=e.tool_call).resume(tool_token)
 
@@ -69,18 +68,17 @@ async def llm_step(
 
 @workflow.step
 async def write_event(
-    # writes one stream event (agent or lifecycle) to the durable stream
-    session_id: str,
+    # writes one stream event (agent or lifecycle) to the durable stream.
+    # the handle passed in arrives here as a live writer.
+    writer: vercel.workflow.WorkflowWritable,
     event: proto.StreamEvent,
 ) -> None:
-    writer = await stream.get_writable(session_id)
-    await writer.write(event)
+    await writer.write(stream.dump_event(event))
 
 
 # closes a durable event stream once the owning session is terminal.
 @workflow.step
-async def close_stream(session_id: str) -> None:
-    writer = await stream.get_writable(session_id)
+async def close_stream(writer: vercel.workflow.WorkflowWritable) -> None:
     await writer.close()
 
 
@@ -215,14 +213,8 @@ async def subagent(prompt: str, name: str | None = None) -> ai.agents.MessageBun
     name = name or "subagent"
     child_session_id = f"{session_id}:child:{tool_call_id}"
     token = proto.turn_hook_token(child_session_id)
-    await write_event(
-        session_id,
-        stream.subagent_called(
-            tool_call_id=tool_call_id, child_session_id=child_session_id, name=name
-        ),
-    )
     hook = proto.TurnHook.wait(token=token)
-    await spawn_subagent_turn(
+    child_run_id = await spawn_subagent_turn(
         proto.TurnInput(
             session_id=child_session_id,
             messages=[
@@ -234,17 +226,26 @@ async def subagent(prompt: str, name: str | None = None) -> ai.agents.MessageBun
         # the child turn's root span nests under this turn's root span.
         call.turn_span,
     )
+    assert call.writer is not None
+    await write_event(
+        call.writer,
+        stream.subagent_called(
+            tool_call_id=tool_call_id,
+            child_session_id=child_session_id,
+            child_run_id=child_run_id,
+            name=name,
+        ),
+    )
     resolution = await hook
     hook.dispose()
     assert resolution is not None
     output = resolution.output
     await write_event(
-        session_id,
+        call.writer,
         stream.subagent_completed(
             tool_call_id=tool_call_id, is_error=output.kind == "error"
         ),
     )
-    await close_stream(child_session_id)
     return ai.agents.MessageBundle(
         messages=tuple(m for m in output.messages if m.role in ("assistant", "tool"))
     )
@@ -268,10 +269,12 @@ class DurableAgent(ai.Agent):
         *,
         tools: Sequence[ai.AgentTool | ai.Tool] | None = None,
         session_id: str | None = None,
+        writer: vercel.workflow.WorkflowWritable | None = None,
         turn_span: ai.experimental_telemetry.Span | None = None,
     ) -> None:
         super().__init__(tools=tools)
         self.session_id = session_id
+        self.writer = writer
         self.turn_span = turn_span
 
     async def loop(self, context: ai.Context) -> AsyncGenerator[ai.events.AgentEvent]:
@@ -288,6 +291,7 @@ class DurableAgent(ai.Agent):
                 proto.ToolCallContext(
                     session_id=session_id or "",
                     tool_call_id=tool_call.tool_call_id,
+                    writer=self.writer,
                     turn_span=self.turn_span,
                 )
             )
@@ -318,7 +322,7 @@ class DurableAgent(ai.Agent):
                 model_id,
                 context.messages,
                 context.tools,
-                session_id,
+                self.writer,
                 tool_token,
                 self.turn_span,
             )
@@ -357,8 +361,8 @@ class DurableAgent(ai.Agent):
                     # write tool-running events from the producer side so they land
                     # in loop order (results before the next turn's answer); run_turn
                     # only writes HookEvents, which ride the runtime queue instead.
-                    if session_id is not None:
-                        await write_event(session_id, event)
+                    if self.writer is not None:
+                        await write_event(self.writer, event)
                     yield event
 
                 tool_message = runner.get_tool_message()
@@ -395,14 +399,13 @@ async def resume_turn_hook(token: str, output: proto.TurnOutput) -> None:
     # resume() is a side effect, so it must run in a step. the driver may not
     # have parked on the hook yet, so retry while it is missing.
     hook = proto.TurnHook(output=output)
-    for attempt in range(40):
+    async for last_attempt in util.hook_retries():
         try:
             await hook.resume(token)
             return
         except vercel.workflow.HookNotFoundError:
-            if attempt == 39:
+            if last_attempt:
                 raise
-            await asyncio.sleep(0.05)
 
 
 # runs one agent turn, parking on a durable hook per gated tool call
@@ -412,7 +415,10 @@ async def resume_turn_hook(token: str, output: proto.TurnOutput) -> None:
 # entry (only valid inside the workflow).
 @ai.messages.use_random(vercel.workflow.random)
 @ai.experimental_telemetry.use_time(vercel.workflow.time_ns)
-async def run_turn(turn_input: proto.TurnInput) -> None:
+async def run_turn(
+    turn_input: proto.TurnInput,
+    writer: vercel.workflow.WorkflowWritable | None = None,
+) -> None:
     messages = turn_input.messages
     session_id = turn_input.session_id
     turn_index = turn_input.turn_index
@@ -420,10 +426,17 @@ async def run_turn(turn_input: proto.TurnInput) -> None:
     # messages should already contain either the user message
     # or the tool result message, so no need to do anything
 
+    # main turns write to the session stream (handle passed in by the driver);
+    # a subagent turn owns its run's stream and must close it when done.
+    owns_stream = writer is None
+    if writer is None:
+        writer = vercel.workflow.get_writable()
+
     extra_tools = [bash, subagent] if turn_input.gated else [bash_ungated]
     agent = DurableAgent(
         tools=extra_tools,
         session_id=session_id,
+        writer=writer,
         turn_span=turn_input.turn_span,
     )
 
@@ -467,7 +480,7 @@ async def run_turn(turn_input: proto.TurnInput) -> None:
                     # HookEvents ride the runtime queue, not runner.events(),
                     # so the loop never wrote this; write it here so the UI
                     # gets the approval request part.
-                    await write_event(session_id, event)
+                    await write_event(writer, event)
                     tg.create_task(
                         mediate(
                             proto.ApprovalHook.wait(
@@ -482,7 +495,7 @@ async def run_turn(turn_input: proto.TurnInput) -> None:
                     # the run is blocked on approvals; tell the client we're
                     # waiting on a human.
                     await write_event(
-                        session_id,
+                        writer,
                         stream.tool_approval_requested(),
                     )
 
@@ -519,6 +532,10 @@ async def run_turn(turn_input: proto.TurnInput) -> None:
             finished.append(turn_span)
         if finished:
             await ship_spans(finished)
+
+    if owns_stream:
+        # a subagent turn ends its own stream so readers tailing it terminate.
+        await close_stream(writer)
 
     # notify session that the turn is complete.
     await resume_turn_hook(proto.turn_hook_token(session_id), output)

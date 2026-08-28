@@ -31,10 +31,6 @@ os.environ.setdefault(
     "WORKFLOW_LOCAL_DATA_DIR",
     os.path.join(_BACKEND_DIR, ".workflow-data"),
 )
-os.environ.setdefault(
-    "SEAL_STREAMS_DIR",
-    os.path.join(_BACKEND_DIR, ".seal"),
-)
 
 from agent import telemetry  # noqa: E402
 
