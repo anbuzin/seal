@@ -15,6 +15,7 @@ import os
 
 import ai
 import pytest
+import vercel.workflow
 from conftest import MockProvider, assert_message_invariants, text_msg, tool_call_msg
 from harness import (
     InProcessWorld,
@@ -55,7 +56,7 @@ async def test_single_turn_suspends_then_closes(
     assert state.messages[-1].text == "hello there"
     assert_message_invariants(state.messages)
 
-    await _resume("seal-session:s1:0", proto.NewUserMessage(close=True))
+    await _resume(proto.session_hook_token("s1"), proto.NewUserMessage(close=True))
     output = await _wait_run(run)
     assert output.output == "hello there"
     assert not output.is_error
@@ -76,11 +77,23 @@ async def test_resume_appends_user_message_without_duplicating_history(
 ) -> None:
     scripted_model.responses = [[text_msg("first answer")], [text_msg("second answer")]]
 
-    await _start("s1", "one")
+    run = await _start("s1", "one")
     await _wait_for_lifecycle("s1", proto.SESSION_WAITING)
+    first_hook = await vercel.workflow.get_hook_by_token(proto.turn_hook_token("s1"))
+    first_session_hook = await vercel.workflow.get_hook_by_token(
+        proto.session_hook_token("s1")
+    )
+    assert first_hook.run_id == run.run_id
+    assert first_session_hook.run_id == run.run_id
 
-    await _resume("seal-session:s1:0", proto.NewUserMessage(prompt="two"))
+    await _resume(proto.session_hook_token("s1"), proto.NewUserMessage(prompt="two"))
     await _wait_for_lifecycle("s1", proto.SESSION_WAITING, count=2)
+    second_hook = await vercel.workflow.get_hook_by_token(proto.turn_hook_token("s1"))
+    second_session_hook = await vercel.workflow.get_hook_by_token(
+        proto.session_hook_token("s1")
+    )
+    assert second_hook.hook_id == first_hook.hook_id
+    assert second_session_hook.hook_id == first_session_hook.hook_id
 
     state = await session.read_session("s1")
     assert state is not None

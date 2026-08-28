@@ -66,21 +66,19 @@ async def run_session(session_input: proto.SessionInput) -> proto.SessionOutput:
     await save_session(state)
     await turn.write_event(session_id, stream.session_started())
 
+    turn_hook = proto.TurnHook.wait(token=proto.turn_hook_token(session_id))
+    session_hook = proto.SessionHook.wait(token=proto.session_hook_token(session_id))
     turn_index = 0
     while True:
         # run turn workflow and suspend on a hook until it completes
         await turn.write_event(session_id, stream.turn_started(turn_index=turn_index))
-        turn_hook_token = f"seal-turn:{session_id}:{turn_index}"
-        turn_hook = proto.TurnHook.wait(token=turn_hook_token)
         turn_input = proto.TurnInput(
             session_id=session_id,
             messages=state.messages,
-            turn_hook_token=turn_hook_token,
             turn_index=turn_index,
         )
         await spawn_turn_workflow(turn_input)
         turn_resolution = await turn_hook
-        turn_hook.dispose()
         assert turn_resolution is not None
         turn_result = turn_resolution.output
 
@@ -98,11 +96,7 @@ async def run_session(session_input: proto.SessionInput) -> proto.SessionOutput:
                 await turn.write_event(
                     session_id, stream.session_waiting(turn_index=turn_index)
                 )
-                hook = proto.SessionHook.wait(
-                    token=f"seal-session:{session_id}:{turn_index}"
-                )
-                resolution = await hook
-                hook.dispose()
+                resolution = await session_hook
                 message = resolution.payload if resolution is not None else None
 
                 if not isinstance(message, proto.NewUserMessage) or message.close:

@@ -63,11 +63,9 @@ def subagent_completed(*, tool_call_id: str, is_error: bool) -> proto.LifecycleE
     )
 
 
-def tool_approval_requested(*, turn_index: int) -> proto.LifecycleEvent:
+def tool_approval_requested() -> proto.LifecycleEvent:
     # the turn parked: every scheduled tool has finished or is awaiting approval.
-    return proto.LifecycleEvent(
-        type=proto.TOOL_APPROVAL_REQUESTED, data={"turn_index": turn_index}
-    )
+    return proto.LifecycleEvent(type=proto.TOOL_APPROVAL_REQUESTED)
 
 
 def reload_requested() -> proto.LifecycleEvent:
