@@ -217,7 +217,6 @@ class SingleMessageAggregator(
 
 
 @ai.tool(aggregator=SingleMessageAggregator)
-@util.print_traceback
 async def subagent(
     prompt: str, name: str | None = None
 ) -> AsyncGenerator[ai.agents.MessageBundle]:
