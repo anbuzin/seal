@@ -196,13 +196,31 @@ tool_call_context: contextvars.ContextVar[proto.ToolCallContext] = (
 )
 
 
-# hack: the only way the library currently supports transforming a
-# tool result before sending it to the model is by using an
-# aggregator, so we use MessageAggregator without actually being a
-# generator.
-@ai.tool(aggregator=ai.agents.MessageAggregator)  # type: ignore
+# HACK: We need to support to_model_input on non-streaming tools
+class SingleMessageAggregator(
+    ai.types.events.Aggregator[ai.agents.MessageBundle, ai.agents.MessageBundle, str],
+):
+    def __init__(self) -> None:
+        self._result: ai.agents.MessageBundle | None = None
+
+    def feed(self, item: ai.agents.MessageBundle) -> None:
+        self._result = item
+
+    def snapshot(self) -> ai.agents.MessageBundle:
+        assert self._result is not None
+        return self._result
+
+    @classmethod
+    def to_model_input(cls, snapshot: ai.agents.MessageBundle | None) -> str:
+        assert snapshot
+        return ai.agents.MessageAggregator.to_model_input(snapshot)
+
+
+@ai.tool(aggregator=SingleMessageAggregator)
 @util.print_traceback
-async def subagent(prompt: str, name: str | None = None) -> ai.agents.MessageBundle:
+async def subagent(
+    prompt: str, name: str | None = None
+) -> AsyncGenerator[ai.agents.MessageBundle]:
     """Delegate a focused task to a child agent and return its answer."""
     call = tool_call_context.get()
     session_id, tool_call_id = call.session_id, call.tool_call_id
@@ -242,7 +260,7 @@ async def subagent(prompt: str, name: str | None = None) -> ai.agents.MessageBun
             tool_call_id=tool_call_id, is_error=output.kind == "error"
         ),
     )
-    return ai.agents.MessageBundle(
+    yield ai.agents.MessageBundle(
         messages=tuple(m for m in output.messages if m.role in ("assistant", "tool"))
     )
 
@@ -358,24 +376,7 @@ class DurableAgent(ai.Agent):
                         await write_event(self.writer, event)
                     yield event
 
-                tool_message = runner.get_tool_message()
-
-            if tool_message is not None:
-                # HACK: TODO(sully)
-                # the library computes aggregator model_input only for
-                # generator tools (and backfills only at run start), so a
-                # MessageBundle from the subagent hack would reach the next
-                # llm_step raw and fail JSON encoding. backfill it here.
-                for part in tool_message.tool_results:
-                    if (
-                        isinstance(part.result, ai.agents.MessageBundle)
-                        and not part.has_model_input
-                        and not part.is_error
-                    ):
-                        part.set_model_input(
-                            ai.agents.MessageAggregator.to_model_input(part.result)
-                        )
-                context.add(tool_message)
+                context.add(runner.get_tool_message())
 
         watcher_task.cancel()
         eager_tool_hook.dispose()
