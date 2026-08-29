@@ -260,7 +260,7 @@ async def test_turn_with_telemetry_suspends(
     # hang under it in one trace.
     assert "turn" in spans, f"exported: {list(spans)}"
     turn = spans["turn"]
-    chat = spans["chat mock-model"]
+    chat = next(span for name, span in spans.items() if name.startswith("chat "))
     agent_run = spans["invoke_agent DurableAgent"]
     assert turn.context is not None
     assert chat.context is not None and agent_run.context is not None

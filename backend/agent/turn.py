@@ -33,15 +33,11 @@ class EagerToolHook(pydantic.BaseModel, vercel.workflow.BaseHook):
 
 @workflow.step
 async def llm_step(
-    model_id: str,
-    messages: list[ai.messages.Message],
-    tools: list[ai.Tool],
+    context: ai.Context,
     writer: vercel.workflow.WorkflowWritable | None,
     tool_token: str | None = None,
     turn_span: ai.experimental_telemetry.Span | None = None,
 ) -> ai.messages.Message:
-    model = ai.get_model(model_id)
-
     metadata = vercel.workflow.get_step_metadata()
 
     # On a retry, emit a message requesting a reload. The will trigger
@@ -52,7 +48,7 @@ async def llm_step(
     # parent this step's spans under the turn's span
     async with (
         ai.experimental_telemetry.use_span(turn_span),
-        ai.stream(model, messages, tools=tools) as model_stream,
+        ai.stream(context=context) as model_stream,
     ):
         async for e in model_stream:
             if e.replay:
@@ -278,7 +274,6 @@ class DurableAgent(ai.Agent):
         self.turn_span = turn_span
 
     async def loop(self, context: ai.Context) -> AsyncGenerator[ai.events.AgentEvent]:
-        model_id = context.model.id
         session_id = self.session_id
 
         tool_token = f"seal-early-tool:{session_id}"
@@ -319,9 +314,7 @@ class DurableAgent(ai.Agent):
             live_tool_calls.clear()
 
             assistant_message = await llm_step(
-                model_id,
-                context.messages,
-                context.tools,
+                context,
                 self.writer,
                 tool_token,
                 self.turn_span,
