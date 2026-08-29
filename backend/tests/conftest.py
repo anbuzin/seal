@@ -182,6 +182,29 @@ async def world() -> AsyncGenerator[harness.InProcessWorld]:
 def scripted_model(
     monkeypatch: pytest.MonkeyPatch, mock_llm: MockProvider
 ) -> MockProvider:
+    # Workflow bodies run in a sandbox, so their model factory does not see
+    # this fixture's host-side monkeypatch. Patch the provider used by the
+    # serialized Context when its model step executes back on the host.
+    provider_type = type(ai.get_model("gateway:openai/gpt-5.6-luna").provider)
+
+    def stream(
+        _provider: models.Provider,
+        model: models.Model,
+        messages: list[messages_.Message],
+        *,
+        tools: Sequence[ai.tools.Tool] | None = None,
+        output_type: type[pydantic.BaseModel] | None = None,
+        params: Any = None,
+    ) -> AsyncGenerator[events_.Event]:
+        return mock_llm.stream(
+            model,
+            messages,
+            tools=tools,
+            output_type=output_type,
+            params=params,
+        )
+
+    monkeypatch.setattr(provider_type, "stream", stream)
     model = models.Model(id="mock-model", provider=mock_llm)
     monkeypatch.setattr(ai, "get_model", lambda model_id=None, **kwargs: model)
     return mock_llm
