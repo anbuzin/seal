@@ -16,7 +16,7 @@ from __future__ import annotations
 import sys
 from collections.abc import AsyncGenerator, Iterator, Sequence
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import pydantic
 import pytest
@@ -65,7 +65,7 @@ class MockProvider(models.Provider):
     # mutability and keep the scripted state out of serialization/hashing.
     model_config = pydantic.ConfigDict(frozen=False)
 
-    provider_class_id: Literal["mock"] = "mock"
+    provider_class_id: str = "mock"
     name: str = "mock"
     default_base_url: str = "http://mock.test"
 
