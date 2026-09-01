@@ -71,9 +71,7 @@ async def run_session(session_input: proto.SessionInput) -> None:
             turn_index=turn_index,
         )
         await spawn_turn_workflow(turn_input, writer)
-        turn_resolution = await turn_hook
-        assert turn_resolution is not None
-        turn_result = turn_resolution.output
+        turn_result = (await turn_hook).output
 
         # process turn results
         state.messages = turn_result.messages
@@ -83,7 +81,6 @@ async def run_session(session_input: proto.SessionInput) -> None:
         # message just like a successful turn.
         await turn.write_event(writer, stream.session_waiting(turn_index=turn_index))
         resolution = await session_hook
-        assert resolution is not None
         state.messages.append(ai.user_message(resolution.payload.prompt))
 
         # persist post-turn mutations (resume prompt / subagent results) so the
