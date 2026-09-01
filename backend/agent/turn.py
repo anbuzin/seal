@@ -199,30 +199,8 @@ current_agent: contextvars.ContextVar["DurableAgent"] = contextvars.ContextVar(
 )
 
 
-# HACK: We need to support to_model_input on non-streaming tools
-class SingleMessageAggregator(
-    ai.types.events.Aggregator[ai.agents.MessageBundle, ai.agents.MessageBundle, str],
-):
-    def __init__(self) -> None:
-        self._result: ai.agents.MessageBundle | None = None
-
-    def feed(self, item: ai.agents.MessageBundle) -> None:
-        self._result = item
-
-    def snapshot(self) -> ai.agents.MessageBundle:
-        assert self._result is not None
-        return self._result
-
-    @classmethod
-    def to_model_input(cls, snapshot: ai.agents.MessageBundle | None) -> str:
-        assert snapshot
-        return ai.agents.MessageAggregator.to_model_input(snapshot)
-
-
-@ai.tool(aggregator=SingleMessageAggregator)
-async def subagent(
-    prompt: str, name: str | None = None
-) -> AsyncGenerator[ai.agents.MessageBundle]:
+@ai.tool(to_model_input=ai.agents.MessageAggregator.to_model_input)
+async def subagent(prompt: str, name: str | None = None) -> ai.agents.MessageBundle:
     """Delegate a focused task to a child agent and return its answer."""
     agent = current_agent.get()
     session_id = agent.session_id
@@ -257,7 +235,7 @@ async def subagent(
     )
     resolution = await hook
     hook.dispose()
-    assert resolution is not None
+
     output = resolution.output
     await write_event(
         agent.writer,
@@ -265,7 +243,7 @@ async def subagent(
             tool_call_id=tool_call_id, is_error=output.kind == "error"
         ),
     )
-    yield ai.agents.MessageBundle(
+    return ai.agents.MessageBundle(
         messages=tuple(m for m in output.messages if m.role in ("assistant", "tool"))
     )
 
