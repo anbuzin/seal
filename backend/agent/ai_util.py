@@ -1,8 +1,13 @@
 import asyncio
-from collections.abc import AsyncIterable, Callable, Collection
+import contextvars
+from collections.abc import AsyncIterable, Collection
 from typing import Any, Self
 
 import ai
+
+current_tool_call_id: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "current_tool_call_id", default=None
+)
 
 
 class TrackingToolRunner(ai.ToolRunner):
@@ -30,7 +35,12 @@ class TrackingToolRunner(ai.ToolRunner):
         if id and id in self.id_to_task:
             return self.id_to_task[id]
 
-        task = super().schedule(tc)
+        async def _run() -> ai.events.ToolCallResult:
+            if id:
+                current_tool_call_id.set(id)
+            return await tc()
+
+        task = super().schedule(_run)
         if id:
             self.id_to_task[id] = task
             self.task_to_id[task] = id
@@ -41,13 +51,9 @@ class SpeculativeToolRunner(TrackingToolRunner):
     def __init__(
         self,
         *,
-        eager_tools: Collection[str] = (),
-        resolver: Callable[[ai.messages.ToolCallPart], ai.ToolCall],
-        tool_stream: AsyncIterable[ai.messages.ToolCallPart],
+        tool_stream: AsyncIterable[ai.ToolCall],
     ) -> None:
         super().__init__()
-        self.eager_tools = frozenset(eager_tools)
-        self.resolver = resolver
         self.tool_stream = tool_stream
 
     async def __aenter__(self) -> Self:
@@ -61,5 +67,4 @@ class SpeculativeToolRunner(TrackingToolRunner):
 
     async def watcher(self) -> None:
         async for tool_call in self.tool_stream:
-            if tool_call.tool_name in self.eager_tools:
-                self.schedule(self.resolver(tool_call))
+            self.schedule(tool_call)

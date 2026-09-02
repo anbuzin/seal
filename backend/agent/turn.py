@@ -204,7 +204,7 @@ async def subagent(prompt: str, name: str | None = None) -> ai.agents.MessageBun
     """Delegate a focused task to a child agent and return its answer."""
     agent = current_agent.get()
     session_id = agent.session_id
-    tool_call_id = agent.current_tool_id()
+    tool_call_id = ai_util.current_tool_call_id.get()
     assert tool_call_id
 
     name = name or "subagent"
@@ -271,10 +271,6 @@ class DurableAgent(ai.Agent):
         self.session_id = session_id
         self.writer = writer
         self.turn_span = turn_span
-        self.task_to_id: dict[Any, str] = {}
-
-    def current_tool_id(self) -> str | None:
-        return self.task_to_id.get(asyncio.current_task())
 
     async def loop(self, context: ai.Context) -> AsyncGenerator[ai.events.AgentEvent]:
         session_id = self.session_id
@@ -284,13 +280,12 @@ class DurableAgent(ai.Agent):
 
         while context.keep_running():
             async with ai_util.SpeculativeToolRunner(
-                eager_tools=EAGER_TOOLS,
-                resolver=context.resolve,
-                tool_stream=(ev.payload async for ev in eager_tool_hook),
+                tool_stream=(
+                    context.resolve(ev.payload)
+                    async for ev in eager_tool_hook
+                    if ev.payload.tool_name in EAGER_TOOLS
+                ),
             ) as runner:
-                # Make the task->id mapping visible so tools can get their id easily
-                self.task_to_id = runner.task_to_id
-
                 assistant_message = await llm_step(
                     context,
                     self.writer,
