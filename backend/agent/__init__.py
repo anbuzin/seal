@@ -1,5 +1,3 @@
-import os
-
 import vercel.workflow
 
 workflow = vercel.workflow.Workflows(
@@ -9,11 +7,6 @@ workflow = vercel.workflow.Workflows(
                 "rich",  # annoying terminal detection stuff
                 "modelsdotdev",  # sqlite database
             }
-            | (
-                {"ai"}
-                if os.environ.get("SEAL_NO_PASSTHROUGH_AI", "1") == "0"
-                else set()
-            )
         ),
         share_sandboxes=True,
     )
