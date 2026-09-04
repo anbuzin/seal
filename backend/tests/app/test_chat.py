@@ -40,7 +40,7 @@ async def _run_id(session_id: str) -> str:
             {
                 "deployment_id": "",
                 "workflow_name": "test-chat",
-                "input": wf_serialization.dehydrate([]),
+                "input": wf_serialization.PayloadEncoder().encode([]),
             }
         ).into_event(),
     )
